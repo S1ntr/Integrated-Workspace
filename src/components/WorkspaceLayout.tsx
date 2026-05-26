@@ -1,18 +1,16 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Sidebar } from "./Sidebar";
+import { Sidebar, FileEntry } from "./Sidebar";
 import { ChatPanel } from "./ChatPanel";
 import { TerminalGrid, Session } from "./TerminalGrid";
+import { ChangesViewer, ChangedFile } from "./ChangesViewer";
 import type { AgentSession } from "./Onboarding";
+import { SettingsDialog } from "./SettingsDialog";
 
 interface WorkspaceLayoutProps {
   directory: string;
   initialSessions: AgentSession[];
 }
-
-
-
-// ── Grid layout helpers moved to TerminalGrid.tsx ─────────────────────────────
 
 // ── Agent options for dialog ───────────────────────────────────────────────────
 const AGENT_OPTIONS = [
@@ -68,82 +66,27 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ onConfirm, onCancel
   );
 };
 
-// ── File Viewer ─────────────────────────────────────────────────────────────────
-interface FileViewerProps {
-  file: { path: string; name: string } | null;
-  content: string | null;
-  onClose: () => void;
-}
-
-const FileViewer: React.FC<FileViewerProps> = ({ file, content, onClose }) => {
-  if (!file || content === null) {
-    return (
-      <div className="file-viewer-empty">
-        <i className="bx bx-file-blank" />
-        <span>No file open</span>
-        <span className="file-viewer-empty-hint">Click a file in the Explorer to preview it here</span>
-      </div>
-    );
-  }
-
-  const lines = content.split("\n");
-
-  // Detect lang from extension for basic badge
-  const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
-  const langBadge: Record<string, string> = {
-    ts: "TypeScript", tsx: "TSX", js: "JavaScript", jsx: "JSX",
-    rs: "Rust", py: "Python", json: "JSON", md: "Markdown",
-    css: "CSS", html: "HTML", toml: "TOML", yaml: "YAML", yml: "YAML",
-    sh: "Shell", ps1: "PowerShell",
-  };
-
-  return (
-    <div className="file-viewer">
-      <div className="file-viewer-bar">
-        <i className="bx bx-file-blank file-viewer-icon" />
-        <span className="file-viewer-name">{file.name}</span>
-        {langBadge[ext] && <span className="file-viewer-lang">{langBadge[ext]}</span>}
-        <span className="file-viewer-lines">{lines.length} lines</span>
-        <button className="file-viewer-close" onClick={onClose} title="Close file">
-          <i className="bx bx-x" />
-        </button>
-      </div>
-      <div className="file-viewer-content">
-        <div className="file-viewer-gutter">
-          {lines.map((_, i) => (
-            <div key={i} className="file-viewer-ln">{i + 1}</div>
-          ))}
-        </div>
-        <div className="file-viewer-code">
-          {lines.map((line, i) => (
-            <div key={i} className="file-viewer-line">{line || " "}</div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-};
-
 // ── Right Panel with tabs ──────────────────────────────────────────────────────
 interface RightPanelProps {
   width: number;
-  activeFile: { path: string; name: string } | null;
-  fileContent: string | null;
-  onFileClose: () => void;
+  changedFiles: ChangedFile[];
+  baselineSnapshot: Record<string, string>;
+  onFileSelect: (path: string, name: string) => void;
+  sessions: Session[];
+  onSendPtyCommand: (sessId: string, cmd: string) => void;
+  onAddSession: (label: string, command: string) => void;
 }
 
-const RightPanel: React.FC<RightPanelProps> = ({ width, activeFile, fileContent, onFileClose }) => {
+const RightPanel: React.FC<RightPanelProps> = ({
+  width,
+  changedFiles,
+  baselineSnapshot,
+  onFileSelect,
+  sessions,
+  onSendPtyCommand,
+  onAddSession,
+}) => {
   const [tab, setTab] = useState<"chat" | "file">("chat");
-
-  // Auto-switch to file tab when a file is opened
-  useEffect(() => {
-    if (activeFile) setTab("file");
-  }, [activeFile?.path]);
-
-  // Switch to chat when file is closed
-  useEffect(() => {
-    if (!activeFile && tab === "file") setTab("chat");
-  }, [activeFile]);
 
   return (
     <div className="right-panel" style={{ width }}>
@@ -159,17 +102,27 @@ const RightPanel: React.FC<RightPanelProps> = ({ width, activeFile, fileContent,
           className={`rp-tab ${tab === "file" ? "active" : ""}`}
           onClick={() => setTab("file")}
         >
-          <i className="bx bx-file-blank" />
-          File
-          {activeFile && <span className="rp-tab-dot" />}
+          <i className="bx bx-git-branch" />
+          Changes
+          {changedFiles.length > 0 && <span className="rp-tab-badge">{changedFiles.length}</span>}
         </button>
       </div>
 
       <div className="right-panel-body">
         {tab === "chat" ? (
-          <ChatPanel width={width} embedded />
+          <ChatPanel
+            width={width}
+            embedded
+            sessions={sessions}
+            onSendPtyCommand={onSendPtyCommand}
+            onAddSession={onAddSession}
+          />
         ) : (
-          <FileViewer file={activeFile} content={fileContent} onClose={() => { onFileClose(); setTab("chat"); }} />
+          <ChangesViewer
+            changedFiles={changedFiles}
+            baselineSnapshot={baselineSnapshot}
+            onFileSelect={onFileSelect}
+          />
         )}
       </div>
     </div>
@@ -190,8 +143,92 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const [rightOpen, setRightOpen] = useState(true);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [showNewSession, setShowNewSession] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [activeFile, setActiveFile] = useState<{ path: string; name: string } | null>(null);
-  const [fileContent, setFileContent] = useState<string | null>(null);
+
+  // New States for Changes & Diff tracking
+  const [baselineSnapshot, setBaselineSnapshot] = useState<Record<string, string>>({});
+  const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([]);
+
+  // Helper to recursively collect all file entries (leaves only)
+  const collectAllFiles = (entries: FileEntry[]): FileEntry[] => {
+    const result: FileEntry[] = [];
+    const recurse = (list: FileEntry[]) => {
+      for (const entry of list) {
+        if (entry.is_dir) {
+          if (entry.children) recurse(entry.children);
+        } else {
+          result.push(entry);
+        }
+      }
+    };
+    recurse(entries);
+    return result;
+  };
+
+  // ── Baseline Snapshotting ────────────────────────────────────────────────
+  useEffect(() => {
+    if (!directory) return;
+    const takeBaseline = async () => {
+      try {
+        // Initialize secure workspace scoping in backend first
+        await invoke("set_active_workspace", { dirPath: directory });
+
+        const entries = await invoke<FileEntry[]>("list_files", { dirPath: directory });
+        const files = collectAllFiles(entries);
+        const snapshot: Record<string, string> = {};
+        for (const f of files) {
+          try {
+            const content = await invoke<string>("read_file_content", { filePath: f.path });
+            snapshot[f.path] = content;
+          } catch {
+            snapshot[f.path] = "";
+          }
+        }
+        setBaselineSnapshot(snapshot);
+      } catch (err) {
+        console.error("Failed to take baseline snapshot:", err);
+      }
+    };
+    takeBaseline();
+  }, [directory]);
+
+  // ── Periodic Files Scanner (every 2.5s) ──────────────────────────────────
+  useEffect(() => {
+    if (!directory || Object.keys(baselineSnapshot).length === 0) return;
+
+    const scan = async () => {
+      try {
+        const entries = await invoke<FileEntry[]>("list_files", { dirPath: directory });
+        const currentFiles = collectAllFiles(entries);
+        const changes: ChangedFile[] = [];
+
+        for (const f of currentFiles) {
+          if (!(f.path in baselineSnapshot)) {
+            // Created file
+            changes.push({ name: f.name, path: f.path, status: "new" });
+          } else {
+            // Modified file
+            try {
+              const currentContent = await invoke<string>("read_file_content", { filePath: f.path });
+              const baselineContent = baselineSnapshot[f.path];
+              if (currentContent !== baselineContent) {
+                changes.push({ name: f.name, path: f.path, status: "modified" });
+              }
+            } catch {}
+          }
+        }
+        setChangedFiles(changes);
+      } catch (err) {
+        console.error("Error scanning files for changes:", err);
+      }
+    };
+
+    const id = setInterval(scan, 2500);
+    return () => clearInterval(id);
+  }, [directory, baselineSnapshot]);
+
+
 
   // ── Init sessions from onboarding config ───────────────────────────────
   useEffect(() => {
@@ -201,13 +238,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     setSessions(initial);
   }, []);
 
-  // ── Load file ────────────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!activeFile) { setFileContent(null); return; }
-    invoke<string>("read_file_content", { filePath: activeFile.path })
-      .then(c => setFileContent(c))
-      .catch(() => setFileContent("// Could not read file"));
-  }, [activeFile]);
+
 
   // ── Session management ───────────────────────────────────────────────────
   const addSession = (label: string, command: string) => {
@@ -218,6 +249,20 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
 
   const closeSession = (termId: number) => {
     setSessions(prev => prev.length <= 1 ? prev : prev.filter(s => s.id !== termId));
+  };
+
+  const changeSessionAgent = (termId: number, label: string, command: string) => {
+    setSessions(prev => prev.map(s => {
+      if (s.id === termId) {
+        return {
+          ...s,
+          label,
+          command,
+          sessionId: `pty-${termId}-${Date.now()}` // Re-create session cleanly on change
+        };
+      }
+      return s;
+    }));
   };
 
   // ── Sidebar resize ───────────────────────────────────────────────────────
@@ -255,6 +300,9 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
       {showNewSession && (
         <NewSessionDialog onConfirm={addSession} onCancel={() => setShowNewSession(false)} />
       )}
+      {showSettings && (
+        <SettingsDialog onClose={() => setShowSettings(false)} />
+      )}
 
       {/* ── Header ── */}
       <header className="app-header">
@@ -279,6 +327,9 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
         <button className={`hdr-btn ${rightOpen ? "active" : ""}`} title="Right panel" onClick={() => setRightOpen(o => !o)}>
           <i className="bx bx-layout" />
         </button>
+        <button className={`hdr-btn ${showSettings ? "active" : ""}`} title="Settings" onClick={() => setShowSettings(o => !o)}>
+          <i className="bx bx-cog" />
+        </button>
       </header>
 
       {/* ── Body ── */}
@@ -300,6 +351,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
           sessions={sessions}
           workspaceDir={directory}
           onClose={closeSession}
+          onChangeAgent={changeSessionAgent}
         />
 
         {rightOpen && (
@@ -307,9 +359,14 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
             <div className="resize-handle h" onMouseDown={resizeRight} />
             <RightPanel
               width={rightW}
-              activeFile={activeFile}
-              fileContent={fileContent}
-              onFileClose={() => setActiveFile(null)}
+              changedFiles={changedFiles}
+              baselineSnapshot={baselineSnapshot}
+              onFileSelect={(path, name) => setActiveFile({ path, name })}
+              sessions={sessions}
+              onSendPtyCommand={(sessId, cmd) => {
+                invoke("pty_write", { sessionId: sessId, data: cmd + "\r" }).catch(() => {});
+              }}
+              onAddSession={addSession}
             />
           </>
         )}

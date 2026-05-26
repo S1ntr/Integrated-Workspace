@@ -12,6 +12,7 @@ interface TerminalGridProps {
   sessions: Session[];
   workspaceDir: string;
   onClose: (id: number) => void;
+  onChangeAgent: (id: number, label: string, command: string) => void;
 }
 
 // ── Snap helper ────────────────────────────────────────────────────────────────
@@ -44,10 +45,11 @@ interface ColProps {
   sessions: Session[];
   workspaceDir: string;
   onClose: (id: number) => void;
+  onChangeAgent: (id: number, label: string, command: string) => void;
   colRef: React.RefObject<HTMLDivElement | null>;
 }
 
-const SplitColumn: React.FC<ColProps> = ({ sessions, workspaceDir, onClose, colRef }) => {
+const SplitColumn: React.FC<ColProps> = ({ sessions, workspaceDir, onClose, onChangeAgent, colRef }) => {
   const [rowPct, setRowPct] = useState(50);
 
   const startDrag = useCallback((e: React.MouseEvent) => {
@@ -73,7 +75,7 @@ const SplitColumn: React.FC<ColProps> = ({ sessions, workspaceDir, onClose, colR
   if (sessions.length === 1) {
     return (
       <div className="tgrid-col-panel">
-        <TerminalPanel {...sessions[0]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} />
+        <TerminalPanel {...sessions[0]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
       </div>
     );
   }
@@ -82,7 +84,7 @@ const SplitColumn: React.FC<ColProps> = ({ sessions, workspaceDir, onClose, colR
   return (
     <>
       <div className="tgrid-col-panel" style={{ flex: `${rowPct} 1 0%` }}>
-        <TerminalPanel {...sessions[0]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} />
+        <TerminalPanel {...sessions[0]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
       </div>
 
       {/* Horizontal resize handle for THIS column only */}
@@ -92,14 +94,14 @@ const SplitColumn: React.FC<ColProps> = ({ sessions, workspaceDir, onClose, colR
 
       <div className="tgrid-col-panel" style={{ flex: `${100 - rowPct} 1 0%` }}>
         {sessions[1] && (
-          <TerminalPanel {...sessions[1]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} />
+          <TerminalPanel {...sessions[1]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
         )}
       </div>
 
       {/* Extra panels beyond 2 stacked at bottom */}
       {sessions.slice(2).map(s => (
         <div key={s.sessionId} className="tgrid-col-panel" style={{ flex: "1 1 0%" }}>
-          <TerminalPanel {...s} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} />
+          <TerminalPanel {...s} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
         </div>
       ))}
     </>
@@ -107,7 +109,7 @@ const SplitColumn: React.FC<ColProps> = ({ sessions, workspaceDir, onClose, colR
 };
 
 // ── Main TerminalGrid ──────────────────────────────────────────────────────────
-export const TerminalGrid: React.FC<TerminalGridProps> = ({ sessions, workspaceDir, onClose }) => {
+export const TerminalGrid: React.FC<TerminalGridProps> = ({ sessions, workspaceDir, onClose, onChangeAgent }) => {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const leftColRef  = useRef<HTMLDivElement>(null);
   const rightColRef = useRef<HTMLDivElement>(null);
@@ -148,6 +150,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({ sessions, workspaceD
           sessions={left}
           workspaceDir={workspaceDir}
           onClose={onClose}
+          onChangeAgent={onChangeAgent}
           colRef={leftColRef}
         />
       </div>
@@ -170,6 +173,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({ sessions, workspaceD
             sessions={right}
             workspaceDir={workspaceDir}
             onClose={onClose}
+            onChangeAgent={onChangeAgent}
             colRef={rightColRef}
           />
         </div>

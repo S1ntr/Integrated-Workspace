@@ -13,6 +13,7 @@ export interface TerminalPanelProps {
   workspaceDir: string;
   widthPercent: number;
   onClose: (id: number) => void;
+  onChangeAgent: (id: number, label: string, command: string) => void;
 }
 
 export const TerminalPanel: React.FC<TerminalPanelProps> = ({
@@ -22,6 +23,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   command,
   workspaceDir,
   onClose,
+  onChangeAgent,
 }) => {
   const containerRef  = useRef<HTMLDivElement>(null);
   const termRef       = useRef<Terminal | null>(null);
@@ -167,6 +169,30 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     };
   }, [sessionId, command, workspaceDir]);
 
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleOutsideClick = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false);
+      }
+    };
+    if (dropdownOpen) {
+      window.addEventListener("mousedown", handleOutsideClick);
+    }
+    return () => {
+      window.removeEventListener("mousedown", handleOutsideClick);
+    };
+  }, [dropdownOpen]);
+
+  const agents = [
+    { label: "Shell", command: "shell", icon: "bx-terminal" },
+    { label: "opencode", command: "opencode", icon: "bx-code-alt" },
+    { label: "Claude", command: "claude", icon: "bx-bot" },
+    { label: "Antigravity", command: "antigravity", icon: "bx-rocket" },
+  ];
+
   const dotCls   = status === "booting" ? "" : status === "exited" ? "err" : "ok";
   const dirShort = workspaceDir.split(/[\\/]/).pop() || workspaceDir;
 
@@ -179,7 +205,37 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           <div className="term-dot" />
           <div className={`term-dot ${dotCls}`} />
         </div>
-        <span className="term-title">{label}</span>
+        
+        {/* Agent Dropdown Selector */}
+        <div className="term-agent-dropdown-wrapper" ref={dropdownRef}>
+          <button
+            className="term-agent-dropdown-trigger"
+            onClick={() => setDropdownOpen(!dropdownOpen)}
+            title="Switch agent type"
+          >
+            {label}
+            <i className={`bx bx-chevron-down ${dropdownOpen ? "open" : ""}`} />
+          </button>
+          {dropdownOpen && (
+            <div className="term-agent-dropdown-menu">
+              {agents.map((ag) => (
+                <button
+                  key={ag.label}
+                  className={`term-agent-dropdown-item ${ag.label === label ? "active" : ""}`}
+                  onClick={() => {
+                    onChangeAgent(id, ag.label, ag.command);
+                    setDropdownOpen(false);
+                  }}
+                >
+                  <i className={`bx ${ag.icon}`} />
+                  <span className="term-agent-item-name">{ag.label}</span>
+                  {ag.label === label && <i className="bx bx-check term-agent-item-check" />}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
         <span className="term-badge">#{id + 1}</span>
         {status === "exited" && <span className="term-exited-label">exited</span>}
         <span className="term-path">{dirShort}</span>
