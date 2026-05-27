@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useNotify } from "./Notification";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -9,6 +10,7 @@ export interface Session {
   sessionId: string;
   label: string;
   command: string;
+  status?: "booting" | "running" | "exited";
 }
 
 interface AgentAction {
@@ -221,11 +223,12 @@ ${sessionList}
 → Terminates session
 
 ## Coordination Rules
-1. Unique descriptive labels: "Frontend", "API Handler", "DB Schema", etc.
-2. Each agent gets ONE focused task with FULL context: file names, shared types, conventions
-3. Never assign two agents to the same file
-4. If agent A defines a shared type, paste the full definition into agent B's prompt
-5. After dispatching, briefly summarize what each agent is building (visible to user)
+1. **REUSE ACTIVE SESSIONS**: ALWAYS prefer sending tasks to already active sessions. If a running active session (e.g. "HTML Builder" or "CSS Stylist") listed under "Active Sessions" above can handle the task, you MUST use \`[AGENT:send:Label]\` to send the prompt to it. DO NOT spawn a new session using \`[AGENT:spawn:...\` if a matching/compatible session already exists.
+2. Unique descriptive labels: "HTML Builder", "CSS Stylist", "JS Developer", etc.
+3. Each agent gets ONE focused task with FULL context: file names, shared types, conventions
+4. Never assign two agents to the same file
+5. If agent A defines a shared type, paste the full definition into agent B's prompt
+6. After dispatching, briefly summarize what each agent is building (visible to user)
 
 ## Current Agent Output
 ${outputBlocks || "(no output captured yet)"}`;
@@ -252,6 +255,7 @@ export const ChatPanel: React.FC<{
   onSendPtyCommand?: (sessId: string, cmd: string) => void;
   onAddSession?: (label: string, command: string) => Session;
   onCloseSession?: (id: number) => void;
+  onRestartSession?: (id: number) => string;
 }> = ({
   embedded,
   sessions: sessionsProp = [],
@@ -259,15 +263,30 @@ export const ChatPanel: React.FC<{
   onSendPtyCommand,
   onAddSession,
   onCloseSession,
+  onRestartSession,
 }) => {
   // ── Core state ───────────────────────────────────────────────────────────────
-  const [msgs, setMsgs] = useState<Msg[]>([]);
+  const [msgs, setMsgs] = useState<Msg[]>(() => {
+    try {
+      const stored = localStorage.getItem("integraded_chat_current_msgs");
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
   const [input, setInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
 
   // ── Chat history ─────────────────────────────────────────────────────────────
-  const [histories, setHistories] = useState<ChatHistory[]>([]);
+  const [histories, setHistories] = useState<ChatHistory[]>(() => {
+    try {
+      const stored = localStorage.getItem("integraded_chat_histories");
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
   const [historyOpen, setHistoryOpen] = useState(false);
   const historyRef = useRef<HTMLDivElement>(null);
 
@@ -284,6 +303,8 @@ export const ChatPanel: React.FC<{
   const [modelSearch, setModelSearch] = useState("");
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
+  const pillBtnRef = useRef<HTMLButtonElement>(null);
+  const [dropdownPos, setDropdownPos] = useState<{top:number;left:number} | null>(null);
 
   // ── Refs ─────────────────────────────────────────────────────────────────────
   const endRef = useRef<HTMLDivElement>(null);
@@ -296,11 +317,15 @@ export const ChatPanel: React.FC<{
   const onSendPtyCommandRef = useRef(onSendPtyCommand);
   const onAddSessionRef = useRef(onAddSession);
   const onCloseSessionRef = useRef(onCloseSession);
+  const onRestartSessionRef = useRef(onRestartSession);
   const sessionsRef = useRef(sessionsProp);
   const terminalOutputsRef = useRef(terminalOutputsProp);
+  const loadingHomeHistory = useRef(true);
+  
   onSendPtyCommandRef.current = onSendPtyCommand;
   onAddSessionRef.current = onAddSession;
   onCloseSessionRef.current = onCloseSession;
+  onRestartSessionRef.current = onRestartSession;
   sessionsRef.current = sessionsProp;
   terminalOutputsRef.current = terminalOutputsProp;
 
@@ -316,9 +341,15 @@ export const ChatPanel: React.FC<{
   // Close dropdowns on outside click
   useEffect(() => {
     const fn = (e: MouseEvent) => {
-      if (modelDropdownRef.current && !modelDropdownRef.current.contains(e.target as Node)) setModelDropdownOpen(false);
-      if (historyRef.current && !historyRef.current.contains(e.target as Node)) setHistoryOpen(false);
-      if (termPickerRef.current && !termPickerRef.current.contains(e.target as Node)) setTermPickerOpen(false);
+      // Model dropdown: check both the pill wrapper and the fixed dropdown itself
+      // The fixed dropdown has a data attribute to identify it
+      const target = e.target as Node;
+      const inPill = modelDropdownRef.current?.contains(target);
+      const inDropdown = (target as Element)?.closest?.('[data-model-dropdown]');
+      if (!inPill && !inDropdown) setModelDropdownOpen(false);
+
+      if (historyRef.current && !historyRef.current.contains(target)) setHistoryOpen(false);
+      if (termPickerRef.current && !termPickerRef.current.contains(target)) setTermPickerOpen(false);
     };
     window.addEventListener("mousedown", fn);
     return () => window.removeEventListener("mousedown", fn);
@@ -337,6 +368,60 @@ export const ChatPanel: React.FC<{
     loadConfig();
     window.addEventListener("__integradedConfigUpdated", loadConfig);
     return () => window.removeEventListener("__integradedConfigUpdated", loadConfig);
+  }, []);
+
+  // Load chat histories from home directory file on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const data = await invoke<string | null>("load_chat_history");
+        if (data) {
+          const parsed = JSON.parse(data);
+          if (parsed.current_msgs) {
+            setMsgs(parsed.current_msgs);
+            localStorage.setItem("integraded_chat_current_msgs", JSON.stringify(parsed.current_msgs));
+          }
+          if (parsed.histories) {
+            setHistories(parsed.histories);
+            localStorage.setItem("integraded_chat_histories", JSON.stringify(parsed.histories));
+          }
+        }
+      } catch (e) {
+        console.error("Failed to load chat history from home directory:", e);
+      } finally {
+        loadingHomeHistory.current = false;
+      }
+    })();
+  }, []);
+
+  // Persistence synchronizations
+  useEffect(() => {
+    try {
+      localStorage.setItem("integraded_chat_current_msgs", JSON.stringify(msgs));
+    } catch {}
+    if (!loadingHomeHistory.current) {
+      const payload = JSON.stringify({ current_msgs: msgs, histories });
+      invoke("save_chat_history", { jsonData: payload }).catch(() => {});
+    }
+  }, [msgs]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("integraded_chat_histories", JSON.stringify(histories));
+    } catch {}
+    if (!loadingHomeHistory.current) {
+      const payload = JSON.stringify({ current_msgs: msgs, histories });
+      invoke("save_chat_history", { jsonData: payload }).catch(() => {});
+    }
+  }, [histories]);
+
+  useEffect(() => {
+    const handleClear = () => {
+      setMsgs([]);
+      setHistories([]);
+    };
+    window.addEventListener("__integradedChatHistoryCleared", handleClear);
+    return () => window.removeEventListener("__integradedChatHistoryCleared", handleClear);
   }, []);
 
   // Poll models
@@ -384,9 +469,11 @@ export const ChatPanel: React.FC<{
     recognitionRef.current = rec;
   }, []);
 
+  const { notifyError } = useNotify();
+
   const toggleRecording = () => {
     const rec = recognitionRef.current;
-    if (!rec) { alert("Speech recognition not supported."); return; }
+    if (!rec) { notifyError("Speech recognition not supported."); return; }
     if (isRecording) rec.stop(); else { rec.lang = navigator.language || "cs-CZ"; rec.start(); }
   };
 
@@ -513,19 +600,90 @@ export const ChatPanel: React.FC<{
     return d.choices?.[0]?.message?.content || "_(no response)_";
   };
 
-  // ── Auto-dispatch agent actions ───────────────────────────────────────────────
-
   const autoDispatchActions = (actions: AgentAction[]) => {
+    const usedSessionIds = new Set<string>();
+
     for (const action of actions) {
       if (action.type === "spawn" && action.agentType && action.prompt) {
-        const s = onAddSessionRef.current?.(action.label, action.agentType);
-        if (s) {
-          const prompt = action.prompt, sessId = s.sessionId;
-          setTimeout(() => { onSendPtyCommandRef.current?.(sessId, prompt); }, 2500);
+        const promptText = action.prompt;
+        // 1. Try to find a matching active session by label (case-insensitive) that isn't already targeted
+        let existing = sessionsRef.current.find(s =>
+          !usedSessionIds.has(s.sessionId) &&
+          s.label.toLowerCase() === action.label.toLowerCase()
+        );
+
+        // 2. Fallback to finding by command/type
+        if (!existing) {
+          existing = sessionsRef.current.find(s =>
+            !usedSessionIds.has(s.sessionId) &&
+            s.command.toLowerCase() === action.agentType!.toLowerCase()
+          );
+        }
+
+        if (existing) {
+          // Reuse this active session!
+          usedSessionIds.add(existing.sessionId);
+          if (existing.status === "exited") {
+            console.log(`[autoDispatchActions] Targeted spawn session ${existing.label} has exited. Restarting...`);
+            const newSessId = onRestartSessionRef.current?.(existing.id);
+            if (newSessId) {
+              setTimeout(() => {
+                console.log(`[autoDispatchActions] Sending prompt to restarted session: ${newSessId}`);
+                onSendPtyCommandRef.current?.(newSessId, promptText);
+              }, 4000);
+            }
+          } else if (existing.status === "booting") {
+            console.log(`[autoDispatchActions] Targeted spawn session ${existing.label} is booting. Waiting...`);
+            setTimeout(() => {
+              console.log(`[autoDispatchActions] Sending prompt to booted session: ${existing.sessionId}`);
+              onSendPtyCommandRef.current?.(existing.sessionId, promptText);
+            }, 4000);
+          } else {
+            onSendPtyCommandRef.current?.(existing.sessionId, promptText);
+          }
+        } else {
+          // Spawn a new session
+          const s = onAddSessionRef.current?.(action.label, action.agentType);
+          if (s) {
+            usedSessionIds.add(s.sessionId);
+            const sessId = s.sessionId;
+            setTimeout(() => { onSendPtyCommandRef.current?.(sessId, promptText); }, 4000);
+          }
         }
       } else if (action.type === "send" && action.prompt) {
-        const t = sessionsRef.current.find(s => s.label.toLowerCase() === action.label.toLowerCase());
-        if (t) onSendPtyCommandRef.current?.(t.sessionId, action.prompt);
+        const promptText = action.prompt;
+        // 1. Try to find a matching active session by exact label (case-insensitive) that isn't already used
+        let t = sessionsRef.current.find(s =>
+          !usedSessionIds.has(s.sessionId) &&
+          s.label.toLowerCase() === action.label.toLowerCase()
+        );
+
+        // 2. Fallback to finding by sequential index (first unused session)
+        if (!t) {
+          t = sessionsRef.current.find(s => !usedSessionIds.has(s.sessionId));
+        }
+
+        if (t) {
+          usedSessionIds.add(t.sessionId);
+          if (t.status === "exited") {
+            console.log(`[autoDispatchActions] Targeted send session ${t.label} has exited. Restarting...`);
+            const newSessId = onRestartSessionRef.current?.(t.id);
+            if (newSessId) {
+              setTimeout(() => {
+                console.log(`[autoDispatchActions] Sending prompt to restarted session: ${newSessId}`);
+                onSendPtyCommandRef.current?.(newSessId, promptText);
+              }, 4000);
+            }
+          } else if (t.status === "booting") {
+            console.log(`[autoDispatchActions] Targeted send session ${t.label} is booting. Waiting...`);
+            setTimeout(() => {
+              console.log(`[autoDispatchActions] Sending prompt to booted session: ${t.sessionId}`);
+              onSendPtyCommandRef.current?.(t.sessionId, promptText);
+            }, 4000);
+          } else {
+            onSendPtyCommandRef.current?.(t.sessionId, promptText);
+          }
+        }
       } else if (action.type === "kill") {
         const t = sessionsRef.current.find(s => s.label.toLowerCase() === action.label.toLowerCase());
         if (t) onCloseSessionRef.current?.(t.id);
@@ -800,16 +958,45 @@ export const ChatPanel: React.FC<{
             <div className="chat-input-footer">
               {/* Model picker */}
               <div className="chat-model-pill" ref={modelDropdownRef}>
-                <button type="button" className="chat-pill-btn" onClick={() => setModelDropdownOpen(o => { if (!o) setModelSearch(""); return !o; })}>
+                <button
+                  ref={pillBtnRef}
+                  type="button"
+                  className="chat-pill-btn"
+                  onClick={() => {
+                    setModelDropdownOpen(o => {
+                      if (!o) {
+                        setModelSearch("");
+                        // Compute position: anchor dropdown above the button
+                        const rect = pillBtnRef.current?.getBoundingClientRect();
+                        if (rect) {
+                          // Place dropdown above the button, left-aligned
+                          setDropdownPos({
+                            top: rect.top - 8,   // will be shifted up by transform
+                            left: Math.max(8, rect.left),
+                          });
+                        }
+                      }
+                      return !o;
+                    });
+                  }}
+                >
                   <i className="bx bx-chip" />
-                  <span className="chat-model-name">{selectedModel || "select model"}</span>
-                  <i className={`bx bx-chevron-up ${modelDropdownOpen ? "open" : ""}`} />
+                  <span className="chat-model-name">{selectedModel ? selectedModel.split('/').pop() : 'model'}</span>
+                  <i className={`bx bx-chevron-up ${modelDropdownOpen ? 'open' : ''}`} />
                 </button>
-                {modelDropdownOpen && (
-                  <div className="chat-pill-dropdown chat-pill-dropdown-wide">
+                {modelDropdownOpen && dropdownPos && (
+                  <div
+                    className="chat-pill-dropdown chat-pill-dropdown-wide"
+                    data-model-dropdown="true"
+                    style={{
+                      top: dropdownPos ? dropdownPos.top : 0,
+                      left: dropdownPos ? dropdownPos.left : 0,
+                      transform: 'translateY(-100%)',
+                    }}
+                  >
                     <div className="chat-pill-search">
                       <i className="bx bx-search" />
-                      <input type="text" placeholder="Search…" value={modelSearch} onChange={e => setModelSearch(e.target.value)} autoFocus onKeyDown={e => e.stopPropagation()} />
+                      <input type="text" placeholder="Search models…" value={modelSearch} onChange={e => setModelSearch(e.target.value)} autoFocus onKeyDown={e => e.stopPropagation()} />
                     </div>
                     <div className="chat-pill-scroll">
                       {(() => {
@@ -824,9 +1011,8 @@ export const ChatPanel: React.FC<{
                           <div key={g.provider} className="chat-pill-group">
                             <div className="chat-pill-group-label">{g.providerName}</div>
                             {g.items.map(m => (
-                              <button key={m.value} type="button" className={`chat-pill-item ${m.value === selectedModel ? "active" : ""}`} onClick={() => { setSelectedModel(m.value); setSelectedCloudProvider(m.provider); setModelDropdownOpen(false); }}>
-                                <span className="chat-pill-item-text">{m.label||m.value}</span>
-                                <span className="chat-pill-item-hint">{m.value}</span>
+                              <button key={m.value} type="button" className={`chat-pill-item ${m.value === selectedModel ? 'active' : ''}`} onClick={() => { setSelectedModel(m.value); setSelectedCloudProvider(m.provider); setModelDropdownOpen(false); }}>
+                                <span className="chat-pill-item-text">{m.label || m.value.split('/').pop()}</span>
                                 {m.value === selectedModel && <i className="bx bx-check" />}
                               </button>
                             ))}

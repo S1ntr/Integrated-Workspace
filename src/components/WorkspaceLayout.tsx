@@ -7,6 +7,8 @@ import { TerminalGrid, Session } from "./TerminalGrid";
 import { ChangesViewer, ChangedFile } from "./ChangesViewer";
 import type { AgentSession } from "./Onboarding";
 import { SettingsDialog } from "./SettingsDialog";
+import { FileViewerDialog } from "./FileViewerDialog";
+import { useNotify } from "./Notification";
 
 interface WorkspaceLayoutProps {
   directory: string;
@@ -24,12 +26,14 @@ const AGENT_OPTIONS = [
 
 // ── New Session Dialog ─────────────────────────────────────────────────────────
 interface NewSessionDialogProps {
-  onConfirm: (label: string, command: string) => void;
+  remainingCount: number;
+  onConfirm: (label: string, command: string, count: number) => void;
   onCancel: () => void;
 }
 
-const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ onConfirm, onCancel }) => {
+const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onConfirm, onCancel }) => {
   const [selected, setSelected] = useState("shell");
+  const [count, setCount] = useState(1);
   const pick = AGENT_OPTIONS.find(a => a.key === selected) ?? AGENT_OPTIONS[0];
 
   return (
@@ -54,10 +58,34 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ onConfirm, onCancel
               {selected === a.key && <i className="bx bxs-check-circle dialog-check" />}
             </div>
           ))}
+
+          <div className="dialog-count-picker">
+            <span className="dialog-count-label">Instances to open:</span>
+            <div className="dialog-count-controls">
+              <button
+                type="button"
+                className="dialog-count-btn"
+                disabled={count <= 1}
+                onClick={() => setCount(c => Math.max(1, c - 1))}
+              >
+                <i className="bx bx-minus" />
+              </button>
+              <span className="dialog-count-value">{count}</span>
+              <button
+                type="button"
+                className="dialog-count-btn"
+                disabled={count >= remainingCount}
+                onClick={() => setCount(c => Math.min(remainingCount, c + 1))}
+              >
+                <i className="bx bx-plus" />
+              </button>
+            </div>
+            <span className="dialog-count-hint">(Max remaining: {remainingCount})</span>
+          </div>
         </div>
         <div className="dialog-footer">
           <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
-          <button className="btn btn-primary" onClick={() => onConfirm(pick.label, pick.command)}>
+          <button className="btn btn-primary" onClick={() => onConfirm(pick.label, pick.command, count)}>
             <i className="bx bx-play" />
             Launch
           </button>
@@ -78,6 +106,7 @@ interface RightPanelProps {
   onSendPtyCommand: (sessId: string, cmd: string) => void;
   onAddSession: (label: string, command: string) => Session;
   onCloseSession: (id: number) => void;
+  onRestartSession?: (id: number) => string;
 }
 
 const RightPanel: React.FC<RightPanelProps> = ({
@@ -90,6 +119,7 @@ const RightPanel: React.FC<RightPanelProps> = ({
   onSendPtyCommand,
   onAddSession,
   onCloseSession,
+  onRestartSession,
 }) => {
   const [tab, setTab] = useState<"chat" | "file">("chat");
 
@@ -122,6 +152,7 @@ const RightPanel: React.FC<RightPanelProps> = ({
             onSendPtyCommand={onSendPtyCommand}
             onAddSession={onAddSession}
             onCloseSession={onCloseSession}
+            onRestartSession={onRestartSession}
           />
         ) : (
           <ChangesViewer
@@ -272,12 +303,28 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
 
 
   // ── Session management ───────────────────────────────────────────────────
-  const addSession = (label: string, command: string): Session => {
+  const addSession = (label: string, command: string, count = 1): Session => {
     setShowNewSession(false);
-    const id = globalSessionCounter++;
-    const session: Session = { id, sessionId: `pty-${id}`, label, command };
-    setSessions(prev => [...prev, session]);
-    return session;
+    if (sessions.length + count > 16) {
+      notifyError(`Cannot open ${count} terminals. Maximum limit of 16 terminal sessions reached.`);
+      return { id: -1, sessionId: "", label: "", command: "" };
+    }
+
+    let lastSession: Session = { id: -1, sessionId: "", label: "", command: "" };
+
+    setSessions(prev => {
+      const next = [...prev];
+      for (let c = 0; c < count; c++) {
+        const id = globalSessionCounter++;
+        const sLabel = count > 1 ? `${label} #${c + 1}` : label;
+        const session: Session = { id, sessionId: `pty-${id}`, label: sLabel, command };
+        next.push(session);
+        lastSession = session;
+      }
+      return next;
+    });
+
+    return lastSession;
   };
 
   const closeSession = (termId: number) => {
@@ -300,6 +347,46 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     }));
   };
 
+  const swapSessions = (idA: number, idB: number) => {
+    console.log(`[swapSessions] Swapping session IDs: ${idA} <-> ${idB}`);
+    setSessions(prev => {
+      const idxA = prev.findIndex(s => s.id === idA);
+      const idxB = prev.findIndex(s => s.id === idB);
+      console.log(`[swapSessions] Found indices: ${idxA} and ${idxB}`);
+      if (idxA === -1 || idxB === -1) {
+        console.warn(`[swapSessions] Could not find session indices!`);
+        return prev;
+      }
+      const next = [...prev];
+      const temp = next[idxA];
+      next[idxA] = next[idxB];
+      next[idxB] = temp;
+      console.log(`[swapSessions] Array order updated successfully:`, next.map(s => s.id));
+      return next;
+    });
+  };
+
+  const handleStatusChange = (termId: number, status: "booting" | "running" | "exited") => {
+    setSessions(prev => prev.map(s => s.id === termId ? { ...s, status } : s));
+  };
+
+  const restartSession = (termId: number): string => {
+    const newSessId = `pty-${termId}-${Date.now()}`;
+    console.log(`[restartSession] Restarting session ID: ${termId} with new session ID: ${newSessId}`);
+    setSessions(prev => prev.map(s => {
+      if (s.id === termId) {
+        return {
+          ...s,
+          status: "booting",
+          sessionId: newSessId,
+        };
+      }
+      return s;
+    }));
+    return newSessId;
+  };
+
+
   // ── Sidebar resize ───────────────────────────────────────────────────────
   const resizeSidebar = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -320,6 +407,8 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     window.addEventListener("mouseup", onUp);
   };
 
+  const { notifyError } = useNotify();
+
   const dirShort = directory.split(/[\\/]/).pop() || directory;
 
   // Derive header pills from actual running sessions
@@ -333,10 +422,21 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   return (
     <div className="app-shell">
       {showNewSession && (
-        <NewSessionDialog onConfirm={addSession} onCancel={() => setShowNewSession(false)} />
+        <NewSessionDialog
+          remainingCount={16 - sessions.length}
+          onConfirm={addSession}
+          onCancel={() => setShowNewSession(false)}
+        />
       )}
       {showSettings && (
         <SettingsDialog onClose={() => setShowSettings(false)} />
+      )}
+      {activeFile && (
+        <FileViewerDialog
+          filePath={activeFile.path}
+          fileName={activeFile.name}
+          onClose={() => setActiveFile(null)}
+        />
       )}
 
       {/* ── Header ── */}
@@ -361,7 +461,17 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
         </div>
         <div className="header-spacer" />
         <div className="header-path"><i className="bx bx-folder" />{dirShort}</div>
-        <button className="hdr-btn" title="New terminal (Ctrl+T)" onClick={() => setShowNewSession(true)}>
+        <button
+          className="hdr-btn"
+          title="New terminal (Ctrl+T)"
+          onClick={() => {
+            if (sessions.length >= 16) {
+              notifyError("Maximum limit of 16 terminal sessions reached.");
+            } else {
+              setShowNewSession(true);
+            }
+          }}
+        >
           <i className="bx bx-plus" />
         </button>
         <button className={`hdr-btn ${sidebarOpen ? "active" : ""}`} title="Explorer" onClick={() => setSidebarOpen(o => !o)}>
@@ -389,12 +499,14 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
           </>
         )}
 
-        {/* Terminal grid — resizable panels */}
         <TerminalGrid
           sessions={sessions}
           workspaceDir={directory}
           onClose={closeSession}
           onChangeAgent={changeSessionAgent}
+          onAddSessionClick={() => setShowNewSession(true)}
+          onSwapSessions={swapSessions}
+          onStatusChange={handleStatusChange}
         />
 
         {rightOpen && (
@@ -412,6 +524,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
               }}
               onAddSession={addSession}
               onCloseSession={closeSession}
+              onRestartSession={restartSession}
             />
           </>
         )}

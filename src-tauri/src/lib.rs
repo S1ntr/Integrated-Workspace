@@ -99,20 +99,30 @@ fn pty_create(
 
     let mut cmd = if cfg!(target_os = "windows") {
         if command == "shell" || command.is_empty() {
-            // Native PowerShell session
+            // Native PowerShell session with UTF-8 support
             let mut c = CommandBuilder::new("powershell.exe");
-            c.args(&["-NoLogo", "-NoExit"]);
+            c.args(&[
+                "-NoLogo",
+                "-NoExit",
+                "-Command",
+                "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; chcp 65001 >$null"
+            ]);
             c
         } else if is_tui {
             // Launch the TUI tool directly (cmd.exe style — it finds executables in PATH)
             // Using cmd /k so the window stays open if the tool exits
             let mut c = CommandBuilder::new("cmd.exe");
-            c.args(&["/k", &command]);
+            let full_cmd = format!("chcp 65001 >nul && {}", command);
+            c.args(&["/k", &full_cmd]);
             c
         } else {
-            // Generic command through PowerShell
+            // Generic command through PowerShell with UTF-8 support
             let mut c = CommandBuilder::new("powershell.exe");
-            c.args(&["-NoLogo", "-NoExit", "-Command", &command]);
+            let full_cmd = format!(
+                "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; chcp 65001 >$null; {}",
+                command
+            );
+            c.args(&["-NoLogo", "-NoExit", "-Command", &full_cmd]);
             c
         }
     } else {
@@ -343,6 +353,99 @@ fn read_file_content(file_path: &str, state: State<'_, WorkspaceState>) -> Resul
     let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
     let canonical_file = validate_in_workspace(file_path, &ws_opt)?;
     fs::read_to_string(canonical_file).map_err(|e| e.to_string())
+}
+
+fn validate_parent_in_workspace(target_path_str: &str, workspace_opt: &Option<String>) -> Result<std::path::PathBuf, String> {
+    let ws_dir = workspace_opt.as_ref().ok_or_else(|| "Access denied: No active workspace directory selected in backend.".to_string())?;
+    let ws_path = Path::new(ws_dir).canonicalize()
+        .map_err(|e| format!("Access denied: Workspace directory invalid or not found: {}", e))?;
+    let target_path = Path::new(target_path_str);
+    let parent = target_path.parent().ok_or_else(|| "Invalid target path: no parent directory".to_string())?;
+    let canonical_parent = parent.canonicalize()
+        .map_err(|e| format!("Access denied: Parent directory does not exist or invalid path: {}", e))?;
+    if canonical_parent.starts_with(&ws_path) {
+        Ok(target_path.to_path_buf())
+    } else {
+        Err("Access denied: Parent directory lies outside the authorized workspace sandbox.".to_string())
+    }
+}
+
+#[tauri::command]
+fn create_file(file_path: String, content: Option<String>, state: State<'_, WorkspaceState>) -> Result<(), String> {
+    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
+    let path = validate_parent_in_workspace(&file_path, &ws_opt)?;
+    fs::write(path, content.unwrap_or_default().as_bytes()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_dir(dir_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
+    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
+    let path = validate_parent_in_workspace(&dir_path, &ws_opt)?;
+    fs::create_dir_all(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rename_item(old_path: String, new_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
+    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
+    let src = validate_in_workspace(&old_path, &ws_opt)?;
+    let dest = validate_parent_in_workspace(&new_path, &ws_opt)?;
+    fs::rename(src, dest).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_item(path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
+    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
+    let target = validate_in_workspace(&path, &ws_opt)?;
+    if target.is_dir() {
+        fs::remove_dir_all(target).map_err(|e| e.to_string())
+    } else {
+        fs::remove_file(target).map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn copy_item(src_path: String, dest_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
+    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
+    let src = validate_in_workspace(&src_path, &ws_opt)?;
+    let dest = validate_parent_in_workspace(&dest_path, &ws_opt)?;
+    if src.is_dir() {
+        fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+            fs::create_dir_all(dst)?;
+            for entry in fs::read_dir(src)? {
+                let entry = entry?;
+                let ty = entry.file_type()?;
+                let dest_child = dst.join(entry.file_name());
+                if ty.is_dir() {
+                    copy_dir_all(&entry.path(), &dest_child)?;
+                } else {
+                    fs::copy(entry.path(), &dest_child)?;
+                }
+            }
+            Ok(())
+        }
+        copy_dir_all(&src, &dest).map_err(|e| e.to_string())
+    } else {
+        fs::copy(src, dest).map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn save_chat_history(json_data: String, app: AppHandle) -> Result<(), String> {
+    let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
+    let file_path = home.join("integraded_chat_history.json");
+    fs::write(file_path, json_data.as_bytes()).map_err(|e| format!("Failed to write chat history: {}", e))
+}
+
+#[tauri::command]
+fn load_chat_history(app: AppHandle) -> Result<Option<String>, String> {
+    let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
+    let file_path = home.join("integraded_chat_history.json");
+    if file_path.exists() {
+        let content = fs::read_to_string(file_path).map_err(|e| format!("Failed to read chat history: {}", e))?;
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
 }
 
 #[tauri::command]
@@ -711,6 +814,13 @@ pub fn run() {
             set_active_workspace,
             list_files,
             read_file_content,
+            create_file,
+            create_dir,
+            rename_item,
+            delete_item,
+            copy_item,
+            save_chat_history,
+            load_chat_history,
             check_agent_installed,
             pty_create,
             pty_write,

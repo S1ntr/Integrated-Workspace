@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { Onboarding, OnboardingConfig } from "./components/Onboarding";
 import { WorkspaceLayout } from "./components/WorkspaceLayout";
+import { NotifyProvider } from "./components/Notification";
 
 function App() {
   const [config, setConfig] = useState<OnboardingConfig | null>(null);
 
   return (
-    <>
+    <NotifyProvider>
       {config === null ? (
         <Onboarding onComplete={(cfg) => setConfig(cfg)} />
       ) : (
@@ -15,7 +16,7 @@ function App() {
           initialSessions={config.sessions}
         />
       )}
-    </>
+    </NotifyProvider>
   );
 }
 

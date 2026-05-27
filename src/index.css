@@ -415,6 +415,9 @@ input, textarea { font-family: var(--font-ui); }
 .tgrid-col { display: flex; flex-direction: column; height: 100%; min-height: 0; min-width: 0; overflow: hidden; gap: 1px; }
 .tgrid-col-panel { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; flex-shrink: 0; background: var(--bg-base); }
 .tgrid-col > .tgrid-col-panel:only-child { height: 100% !important; }
+.tgrid-row { display: flex; flex-direction: row; width: 100%; min-height: 0; min-width: 0; overflow: hidden; gap: 1px; }
+.tgrid-row-panel { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; flex-shrink: 0; background: var(--bg-base); }
+.tgrid-row > .tgrid-row-panel:only-child { width: 100% !important; height: 100% !important; }
 
 /* Resize handles */
 .tgrid-handle { flex-shrink: 0; z-index: 20; display: flex; align-items: center; justify-content: center; background: transparent; transition: background 0.1s; }
@@ -434,7 +437,22 @@ input, textarea { font-family: var(--font-ui); }
    ║  TERMINAL PANE                            ║
    ╚════════════════════════════════════════════╝ */
 
-.term-pane { display: flex; flex-direction: column; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg-base); flex: 1; }
+.term-pane { display: flex; flex-direction: column; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg-base); flex: 1; transition: opacity 0.15s, outline 0.15s; }
+.term-pane.dragging {
+  opacity: 0.4;
+}
+.term-pane.drag-over {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  background: var(--accent-subtle);
+}
+
+/* Ensure child elements do not intercept drag and drop events during a drag operation */
+.tgrid-wrapper:has(.term-pane.dragging) .term-pane * {
+  pointer-events: none !important;
+}
+
+
 
 .term-bar {
   height: 30px; flex-shrink: 0;
@@ -442,7 +460,13 @@ input, textarea { font-family: var(--font-ui); }
   padding: 0 10px;
   background: var(--bg-1);
   border-bottom: 1px solid var(--bg-4);
+  cursor: grab;
+  user-select: none;
 }
+.term-pane.dragging .term-bar {
+  cursor: grabbing;
+}
+
 
 /* macOS-style traffic dots — subtle, no macOS colors */
 .term-traffic { display: flex; gap: 4px; align-items: center; }
@@ -883,24 +907,36 @@ input, textarea { font-family: var(--font-ui); }
 .chat-send-btn.stop { background: var(--err); color: #fff; }
 .chat-send-btn.stop:hover { opacity: 0.85; }
 
-/* Model selector */
-.chat-agent-pill, .chat-model-pill { position: relative; }
+/* Model selector — responsive, won't overflow */
+.chat-agent-pill, .chat-model-pill {
+  position: relative;
+  min-width: 0; /* allow flex shrink */
+  max-width: 100%;
+  overflow: visible; /* needed so dropdown can escape */
+}
 .chat-pill-btn {
   display: flex; align-items: center; gap: 3px;
   padding: 2px 6px; border: none; border-radius: 2px;
   background: transparent; color: var(--text-3);
   font-family: var(--font-mono); font-size: 9px; font-weight: 400;
   cursor: pointer; transition: all 0.1s;
+  max-width: 100%; min-width: 0;
+  overflow: hidden;
 }
 .chat-pill-btn:hover { color: var(--text-1); background: var(--bg-3); }
-.chat-pill-btn .bx { font-size: 10px; }
+.chat-pill-btn .bx { font-size: 10px; flex-shrink: 0; }
 
+/* Dropdown renders above the composer, anchored to the pill */
 .chat-pill-dropdown {
-  position: absolute; bottom: calc(100% + 4px); left: 0;
+  position: fixed; /* escape overflow:hidden parents */
   background: var(--bg-2); border: 1px solid var(--bg-5);
   border-radius: var(--radius-sm); box-shadow: var(--shadow-lg);
-  min-width: 200px; max-height: 260px;
-  display: flex; flex-direction: column; z-index: 300; animation: slideDown 0.1s ease;
+  width: 240px; max-width: min(240px, calc(100vw - 24px));
+  max-height: 280px;
+  display: flex; flex-direction: column;
+  z-index: 9999;
+  animation: scaleIn 0.1s ease;
+  /* JS sets top/left via inline style in ChatPanel — see note below */
 }
 .chat-pill-search {
   padding: 7px 8px; border-bottom: 1px solid var(--bg-4); flex-shrink: 0;
@@ -1183,7 +1219,14 @@ input, textarea { font-family: var(--font-ui); }
    ╚════════════════════════════════════════════╝ */
 
 /* Chat model pill extras */
-.chat-model-name { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Model name pill — always truncates, never wraps */
+.chat-model-name {
+  display: inline-block;
+  max-width: clamp(60px, 20vw, 130px); /* responsive: small on narrow, wider on big */
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  vertical-align: middle;
+}
+
 .chat-pill-dropdown-wide { min-width: 230px; }
 .chat-pill-scroll { overflow-y: auto; flex: 1; padding: 3px; max-height: 210px; }
 .chat-pill-group { display: flex; flex-direction: column; }
@@ -1197,3 +1240,440 @@ input, textarea { font-family: var(--font-ui); }
 
 /* Utility */
 .bx-spin { animation: spin 0.8s linear infinite; }
+
+/* ── Terminal Grid Placeholder ── */
+.tgrid-placeholder-container {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-base);
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tgrid-placeholder-card {
+  max-width: 380px;
+  text-align: center;
+  padding: 40px 24px;
+  border: 1px solid var(--bg-4);
+  background: var(--bg-1);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.tgrid-placeholder-icon {
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--bg-4);
+  background: var(--bg-base);
+  color: var(--text-2);
+  font-size: 24px;
+  margin-bottom: 20px;
+}
+
+.tgrid-placeholder-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-1);
+  margin: 0 0 10px 0;
+  font-family: var(--font-ui);
+  letter-spacing: 0.3px;
+}
+
+.tgrid-placeholder-text {
+  font-size: 11.5px;
+  color: var(--text-2);
+  line-height: 1.6;
+  margin: 0 0 24px 0;
+  font-family: var(--font-ui);
+}
+
+.tgrid-placeholder-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--text-1);
+  color: var(--bg-base);
+  border: none;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.12s;
+  font-family: var(--font-ui);
+}
+
+.tgrid-placeholder-btn:hover {
+  opacity: 0.9;
+}
+
+/* ── Dialog Count Picker ── */
+.dialog-count-picker {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 8px 8px 8px;
+  border-top: 1px solid var(--bg-4);
+  margin-top: 16px;
+}
+
+.dialog-count-label {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-2);
+  font-family: var(--font-ui);
+}
+
+.dialog-count-controls {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--bg-4);
+  background: var(--bg-base);
+}
+
+.dialog-count-btn {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--text-1);
+  border: none;
+  font-size: 14px;
+  cursor: pointer;
+  transition: opacity 0.1s;
+}
+
+.dialog-count-btn:disabled {
+  color: var(--text-3);
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.dialog-count-btn:not(:disabled):hover {
+  background: var(--bg-3);
+}
+
+.dialog-count-value {
+  width: 32px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  border-left: 1px solid var(--bg-4);
+  border-right: 1px solid var(--bg-4);
+  height: 28px;
+  line-height: 28px;
+}
+
+.dialog-count-hint {
+  font-size: 9.5px;
+  color: var(--text-3);
+  font-family: var(--font-ui);
+}
+
+/* ── Absolute Panels for independent resizes ── */
+.tgrid-absolute-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-base);
+}
+
+/* Beautiful morph and slide transition during swaps or window additions/removals */
+.tgrid-wrapper:not(.resizing) .tgrid-absolute-panel {
+  transition: top 0.25s cubic-bezier(0.16, 1, 0.3, 1),
+              left 0.25s cubic-bezier(0.16, 1, 0.3, 1),
+              width 0.25s cubic-bezier(0.16, 1, 0.3, 1),
+              height 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ── Drag source item ── */
+.dragging-source {
+  opacity: 0.4;
+}
+
+/* ── Drag over folder highlight ── */
+.drag-over-folder {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  background: var(--accent-subtle);
+}
+
+/* ── Sidebar Context Menu ── */
+.sidebar-context-menu {
+  position: fixed;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius-sm);
+  padding: 4px;
+  min-width: 140px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: transparent;
+  border: none;
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-family: var(--font-ui);
+  text-align: left;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  width: 100%;
+  transition: background 0.1s, color 0.1s;
+}
+
+.context-menu-item:hover:not(:disabled) {
+  background: var(--bg-3);
+  color: var(--text-1);
+}
+
+.context-menu-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.context-menu-item.danger {
+  color: #f87171;
+}
+
+.context-menu-item.danger:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.12);
+  color: #f87171;
+}
+
+.context-menu-item i {
+  font-size: 14px;
+}
+
+/* ── File Viewer Modal ── */
+.file-viewer-dialog {
+  animation: fileViewerFadeIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes fileViewerFadeIn {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.file-viewer-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.file-viewer-scroll::-webkit-scrollbar-track {
+  background: var(--bg-1);
+}
+
+.file-viewer-scroll::-webkit-scrollbar-thumb {
+  background: var(--bg-4);
+  border-radius: var(--radius-sm);
+}
+
+.file-viewer-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3);
+}
+
+/* ── Editor Search Box Overlay ── */
+.editor-search-box {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 10;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-5);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-lg);
+  padding: 8px 10px;
+  min-width: 280px;
+  animation: slideDown 0.1s ease;
+}
+
+.editor-search-box input {
+  font-family: var(--font-mono);
+}
+
+/* ── Live Overlay Code Editor ── */
+.code-editor-viewport {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-1);
+}
+
+.editor-textarea,
+.editor-underlay-pre {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 16px 16px 16px 56px !important;
+  border: none;
+  background: transparent;
+  font-family: 'IBM Plex Mono', 'Fira Code', monospace !important;
+  font-size: 13px !important;
+  line-height: 1.55 !important;
+  letter-spacing: 0.1px;
+  white-space: pre !important;
+  word-wrap: normal !important;
+  overflow: auto !important;
+  box-sizing: border-box !important;
+  tab-size: 4;
+  -moz-tab-size: 4;
+}
+
+.editor-textarea {
+  color: transparent !important;
+  caret-color: var(--text-1) !important;
+  resize: none;
+  outline: none;
+  z-index: 2;
+}
+
+.editor-underlay-pre {
+  color: var(--text-2);
+  z-index: 1;
+  pointer-events: none;
+  overflow: hidden !important;
+}
+
+/* Align absolute line numbers perfectly with the textarea scroll */
+.editor-line-numbers {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 44px;
+  height: 100%;
+  background: var(--bg-2);
+  border-right: 1px solid var(--bg-4);
+  padding: 16px 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  z-index: 3;
+  pointer-events: none;
+  user-select: none;
+  text-align: right;
+}
+
+.editor-line-number-item {
+  display: block;
+  padding: 0 10px;
+  font-size: 13px !important;
+  font-family: 'IBM Plex Mono', monospace !important;
+  line-height: 20.15px !important;
+  color: var(--text-3);
+  height: 20.15px;
+}
+
+/* Syntax Highlighting Colors */
+.hl-keyword {
+  color: var(--accent) !important;
+  font-weight: 600;
+}
+
+.hl-string {
+  color: #4ade80 !important; /* warm green */
+}
+
+.hl-comment {
+  color: #71717a !important; /* muted gray */
+  font-style: italic;
+}
+
+.hl-number {
+  color: #fbbf24 !important; /* bright amber/orange */
+}
+
+.hl-type {
+  color: #38bdf8 !important; /* sky blue */
+  font-weight: 500;
+}
+
+.hl-tag {
+  color: #f87171 !important; /* soft red */
+  font-weight: 600;
+}
+
+.hl-attr {
+  color: #c4b5fd !important; /* soft purple */
+}
+
+/* ── In-App Notifications ── */
+.notify-container {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 99999;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: none;
+  max-width: 380px;
+}
+
+.notify-toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+  box-shadow: var(--shadow-lg);
+  animation: slideDown 0.15s ease;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.notify-toast:hover {
+  opacity: 0.85;
+}
+
+.notify-icon {
+  flex-shrink: 0;
+  font-size: 16px;
+  display: flex;
+}
+
+.notify-message {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.notify-info    { background: var(--bg-2); border: 1px solid var(--bg-5); color: var(--text-1); }
+.notify-info .notify-icon { color: var(--text-2); }
+
+.notify-success { background: var(--ok-dim); border: 1px solid var(--ok-border); color: var(--ok); }
+.notify-success .notify-icon { color: var(--ok); }
+
+.notify-warning { background: var(--warn-dim); border: 1px solid rgba(251,191,36,0.2); color: var(--warn); }
+.notify-warning .notify-icon { color: var(--warn); }
+
+.notify-error   { background: var(--err-dim); border: 1px solid var(--err-border); color: var(--err); }
+.notify-error .notify-icon { color: var(--err); }
+

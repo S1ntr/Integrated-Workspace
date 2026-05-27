@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { listen } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -14,6 +14,8 @@ export interface TerminalPanelProps {
   widthPercent: number;
   onClose: (id: number) => void;
   onChangeAgent: (id: number, label: string, command: string) => void;
+  onSwapSessions?: (idA: number, idB: number) => void;
+  onStatusChange?: (id: number, status: "booting" | "running" | "exited") => void;
 }
 
 export const TerminalPanel: React.FC<TerminalPanelProps> = ({
@@ -24,19 +26,26 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   workspaceDir,
   onClose,
   onChangeAgent,
+  onSwapSessions,
+  onStatusChange,
 }) => {
   const containerRef  = useRef<HTMLDivElement>(null);
   const termRef       = useRef<Terminal | null>(null);
   const fitRef        = useRef<FitAddon | null>(null);
   const rafRef        = useRef<number>(0);
-  const unlistenData  = useRef<UnlistenFn | null>(null);
-  const unlistenExit  = useRef<UnlistenFn | null>(null);
   const ptyReady      = useRef(false);
   const destroyed     = useRef(false);
 
   const [status, setStatus] = useState<"booting" | "running" | "exited">("booting");
 
+  const updateStatus = (newStatus: "booting" | "running" | "exited") => {
+    setStatus(newStatus);
+    onStatusChange?.(id, newStatus);
+  };
+
+
   useEffect(() => {
+    updateStatus("booting");
     const el = containerRef.current;
     if (!el) return;
 
@@ -79,8 +88,10 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     termRef.current = term;
     fitRef.current  = fit;
 
-    // ── 2. Fit helper: debounced with double-RAF ──────────────────────────────
-    // Double RAF ensures browser has recalculated layout before we measure.
+    // ── 2. Fit helper: debounced with double-RAF & backend resize throttling ────
+    // FitAddon is called immediately so canvas feels super responsive, but
+    // backend PTY resizing is throttled/debounced to keep ConPTY stable.
+    let resizeTimeout: any = null;
     const doFit = () => {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = requestAnimationFrame(() => {
@@ -89,11 +100,15 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           try {
             fit.fit();
             if (ptyReady.current) {
-              invoke("pty_resize", {
-                sessionId,
-                rows: term.rows,
-                cols: term.cols,
-              }).catch(() => {});
+              if (resizeTimeout) clearTimeout(resizeTimeout);
+              resizeTimeout = setTimeout(() => {
+                if (destroyed.current || !ptyReady.current) return;
+                invoke("pty_resize", {
+                  sessionId,
+                  rows: term.rows,
+                  cols: term.cols,
+                }).catch(() => {});
+              }, 100);
             }
           } catch {}
         });
@@ -102,18 +117,33 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
 
     // Initial fit
     doFit();
+    let active = true;
+    let cleanupData: (() => void) | null = null;
+    let cleanupExit: (() => void) | null = null;
 
     // ── 3. PTY events ─────────────────────────────────────────────────────────
     listen<string>(`pty-data-${sessionId}`, (e) => {
-      if (!destroyed.current) term.write(e.payload);
-    }).then(fn => { unlistenData.current = fn; });
+      if (active && !destroyed.current) term.write(e.payload);
+    }).then(fn => {
+      if (active) {
+        cleanupData = fn;
+      } else {
+        fn();
+      }
+    });
 
     listen(`pty-exit-${sessionId}`, () => {
-      if (!destroyed.current) {
-        setStatus("exited");
+      if (active && !destroyed.current) {
+        updateStatus("exited");
         term.writeln("\r\n\x1b[38;2;82;82;91m── process exited ──\x1b[0m");
       }
-    }).then(fn => { unlistenExit.current = fn; });
+    }).then(fn => {
+      if (active) {
+        cleanupExit = fn;
+      } else {
+        fn();
+      }
+    });
 
     // ── 4. Keyboard → PTY ─────────────────────────────────────────────────────
     term.onData((data) => {
@@ -126,22 +156,26 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     ro.observe(el);
 
     // ── 6. Launch PTY after initial fit settles ───────────────────────────────
-    // We wait ~3 frames so FitAddon has set rows/cols before we spawn
-    let frameCount = 0;
+    // We wait 400ms so CSS animations and layouts have fully settled before we measure dimensions
     const waitForFit = () => {
       if (destroyed.current) return;
-      frameCount++;
-      if (frameCount < 3) {
-        requestAnimationFrame(waitForFit);
-        return;
-      }
+      
+      // Ensure FitAddon runs a final fit right before we measure and spawn
+      try { fit.fit(); } catch {}
+      
       const rows = term.rows > 0 ? term.rows : 24;
       const cols = term.cols > 0 ? term.cols : 80;
+      
       invoke("pty_create", { sessionId, command, cwd: workspaceDir, rows, cols })
         .then(() => {
           if (!destroyed.current) {
             ptyReady.current = true;
-            setStatus("running");
+            // Let the TUI or shell warm up for 3.5 seconds before transitioning to "running"
+            setTimeout(() => {
+              if (!destroyed.current) {
+                updateStatus("running");
+              }
+            }, 3500);
             term.focus();
           } else {
             invoke("pty_kill", { sessionId }).catch(() => {});
@@ -152,19 +186,23 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
             term.writeln(`\x1b[31m✖ Cannot start '${command}': ${err}\x1b[0m`);
             term.writeln(`\x1b[33m  Make sure '${command}' is installed and in PATH.\x1b[0m`);
             term.writeln(`\x1b[2m  Type 'exit' or close this panel.\x1b[0m`);
-            setStatus("exited");
+            updateStatus("exited");
           }
         });
     };
-    requestAnimationFrame(waitForFit);
+    
+    const mountTimeout = setTimeout(waitForFit, 400);
 
     return () => {
+      active = false;
       destroyed.current = true;
       ptyReady.current  = false;
+      clearTimeout(mountTimeout);
+      if (resizeTimeout) clearTimeout(resizeTimeout);
       cancelAnimationFrame(rafRef.current);
       ro.disconnect();
-      unlistenData.current?.();
-      unlistenExit.current?.();
+      if (cleanupData) cleanupData();
+      if (cleanupExit) cleanupExit();
       invoke("pty_kill", { sessionId }).catch(() => {});
       try { term.dispose(); } catch {}
     };
@@ -194,11 +232,85 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     { label: "Antigravity", command: "antigravity", icon: "bx-rocket" },
   ];
 
+  const dragCounter = useRef(0);
+
+  const handleDragStart = (e: React.DragEvent) => {
+    // Only allow dragging if the user initiated the drag from the term-bar (or its children)
+    const target = e.target as HTMLElement;
+    if (!target.closest(".term-bar") || target.closest("button") || target.closest(".term-agent-dropdown-menu")) {
+      e.preventDefault();
+      return;
+    }
+
+    console.log(`[DragStart] Panel ID: ${id}`);
+    e.dataTransfer.setData("text/plain", id.toString());
+    e.dataTransfer.effectAllowed = "move";
+    (window as any).draggedTerminalId = id;
+    
+    // Add dragging class natives to parent panel
+    e.currentTarget.closest(".term-pane")?.classList.add("dragging");
+  };
+
+  const handleDragEnd = (e: React.DragEvent) => {
+    console.log(`[DragEnd] Panel ID: ${id}`);
+    (window as any).draggedTerminalId = null;
+    e.currentTarget.closest(".term-pane")?.classList.remove("dragging");
+  };
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current++;
+    if (dragCounter.current === 1) {
+      e.currentTarget.closest(".term-pane")?.classList.add("drag-over");
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current--;
+    if (dragCounter.current === 0) {
+      e.currentTarget.closest(".term-pane")?.classList.remove("drag-over");
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current = 0;
+    e.currentTarget.closest(".term-pane")?.classList.remove("drag-over");
+    
+    const draggedId = (window as any).draggedTerminalId;
+    console.log(`[Drop] Target Panel ID: ${id}, Dragged Panel ID from window: ${draggedId}`);
+    if (draggedId !== undefined && draggedId !== null && draggedId !== id) {
+      console.log(`[Drop] Triggering swap: ${draggedId} <-> ${id}`);
+      onSwapSessions?.(draggedId, id);
+    } else {
+      const draggedIdStr = e.dataTransfer.getData("text/plain");
+      const draggedIdNum = parseInt(draggedIdStr, 10);
+      console.log(`[Drop] Dragged Panel ID from dataTransfer: ${draggedIdNum}`);
+      if (!isNaN(draggedIdNum) && draggedIdNum !== id) {
+        console.log(`[Drop] Triggering swap from dataTransfer: ${draggedIdNum} <-> ${id}`);
+        onSwapSessions?.(draggedIdNum, id);
+      }
+    }
+  };
+
   const dotCls   = status === "booting" ? "" : status === "exited" ? "err" : "ok";
   const dirShort = workspaceDir.split(/[\\/]/).pop() || workspaceDir;
 
   return (
-    <div className="term-pane">
+    <div
+      className="term-pane"
+      draggable={true}
+      onDragStart={handleDragStart}
+      onDragEnd={handleDragEnd}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+      }}
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       {/* Tab bar */}
       <div className="term-bar">
         <div className="term-traffic">

@@ -158,6 +158,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
   const [keyStatus, setKeyStatus] = useState<Record<string, "ok" | "err" | null>>({});
   const [testingLocal, setTestingLocal] = useState<string | null>(null);
   const [localStatus, setLocalStatus] = useState<Record<string, "ok" | "err" | null>>({});
+  const [confirmClear, setConfirmClear] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -468,6 +469,96 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                     checked={config.streaming}
                     onChange={v => setConfig(prev => ({ ...prev, streaming: v }))}
                   />
+                </div>
+              </div>
+
+              <div className="stng-section">
+                <div className="stng-section-header">
+                  <i className="bx bx-trash" />
+                  <span>Data Management</span>
+                </div>
+                <div className="stng-section-body">
+                  <div className="stng-clear-history-container" style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                    <p className="stng-section-desc" style={{ margin: 0 }}>
+                      Permanently delete all saved chats, current conversation, and cached messages.
+                    </p>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "4px" }}>
+                      <input
+                        type="checkbox"
+                        id="confirmClearHistory"
+                        checked={confirmClear}
+                        onChange={e => setConfirmClear(e.target.checked)}
+                        style={{
+                          width: "15px",
+                          height: "15px",
+                          accentColor: "#f87171",
+                          cursor: "pointer"
+                        }}
+                      />
+                      <label
+                        htmlFor="confirmClearHistory"
+                        style={{
+                          fontSize: "12px",
+                          color: "var(--text-2)",
+                          cursor: "pointer",
+                          userSelect: "none"
+                        }}
+                      >
+                        Are you sure you want to delete all your history?
+                      </label>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "4px" }}>
+                      <button
+                        type="button"
+                        className="stng-btn"
+                        disabled={!confirmClear}
+                        style={{
+                          padding: "8px 16px",
+                          background: confirmClear ? "rgba(248, 113, 113, 0.15)" : "var(--bg-3)",
+                          color: confirmClear ? "#f87171" : "var(--text-3)",
+                          border: confirmClear ? "1px solid rgba(248, 113, 113, 0.3)" : "1px solid var(--bg-4)",
+                          borderRadius: "var(--radius-sm)",
+                          cursor: confirmClear ? "pointer" : "not-allowed",
+                          fontWeight: 600,
+                          fontSize: "12px",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          transition: "all 0.15s ease",
+                          opacity: confirmClear ? 1 : 0.5,
+                        }}
+                        onMouseEnter={e => {
+                          if (confirmClear) {
+                            e.currentTarget.style.background = "rgba(248, 113, 113, 0.25)";
+                            e.currentTarget.style.borderColor = "rgba(248, 113, 113, 0.5)";
+                          }
+                        }}
+                        onMouseLeave={e => {
+                          if (confirmClear) {
+                            e.currentTarget.style.background = "rgba(248, 113, 113, 0.15)";
+                            e.currentTarget.style.borderColor = "rgba(248, 113, 113, 0.3)";
+                          }
+                        }}
+                        onClick={() => {
+                          if (!confirmClear) return;
+                          try {
+                            localStorage.removeItem("integraded_chat_current_msgs");
+                            localStorage.removeItem("integraded_chat_histories");
+                            window.dispatchEvent(new CustomEvent("__integradedChatHistoryCleared"));
+                            setConfirmClear(false);
+                            setSuccess("Chat history cleared successfully.");
+                            setError(null);
+                          } catch (e) {
+                            setError("Failed to clear chat history.");
+                            setSuccess(null);
+                          }
+                        }}
+                      >
+                        <i className="bx bx-trash" />
+                        Clear History
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
