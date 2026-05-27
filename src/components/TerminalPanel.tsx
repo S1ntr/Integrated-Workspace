@@ -29,12 +29,13 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   onSwapSessions,
   onStatusChange,
 }) => {
-  const containerRef  = useRef<HTMLDivElement>(null);
-  const termRef       = useRef<Terminal | null>(null);
-  const fitRef        = useRef<FitAddon | null>(null);
-  const rafRef        = useRef<number>(0);
-  const ptyReady      = useRef(false);
-  const destroyed     = useRef(false);
+  const containerRef   = useRef<HTMLDivElement>(null);
+  const termRef        = useRef<Terminal | null>(null);
+  const fitRef         = useRef<FitAddon | null>(null);
+  const rafRef         = useRef<number>(0);
+  const ptyReady       = useRef(false);
+  const destroyed      = useRef(false);
+  const lastSentSize   = useRef({ rows: 0, cols: 0 });
 
   const [status, setStatus] = useState<"booting" | "running" | "exited">("booting");
 
@@ -53,6 +54,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     ptyReady.current  = false;
 
     // ── 1. Create Terminal ────────────────────────────────────────────────────
+    // Uses canvas renderer by default (no WebGL addon loaded — avoids texture atlas bugs in WebView2)
     const term = new Terminal({
       theme: {
         background:          "#080808",
@@ -70,10 +72,15 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
         white:               "#d4d4d4",   brightWhite:   "#f0f0f0",
       },
       // IMPORTANT: no cols/rows — FitAddon computes them from container
-      fontFamily:        "'IBM Plex Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace",
+      // System fonts first: Cascadia Code and Consolas are always available on
+      // Windows with no CDN round-trip. IBM Plex Mono loads from Google Fonts
+      // CDN asynchronously — if it's first, FitAddon measures with the fallback
+      // font on first paint (~7.2px vs 7.8px), computes wrong cols, and the PTY
+      // is spawned with wrong dimensions causing text to overflow xterm's width.
+      fontFamily:        "'Cascadia Code', 'Cascadia Mono', 'Consolas', 'Courier New', monospace",
       fontSize:          13,
       lineHeight:        1.45,
-      letterSpacing:     0.2,
+      letterSpacing:     0,
       cursorBlink:       true,
       cursorStyle:       "block",
       scrollback:        5000,
@@ -83,99 +90,169 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
 
     const fit = new FitAddon();
     term.loadAddon(fit);
-    term.open(el);  // attaches to DOM — must happen before first fit()
 
     termRef.current = term;
     fitRef.current  = fit;
 
-    // ── 2. Fit helper: debounced with double-RAF & backend resize throttling ────
-    // FitAddon is called immediately so canvas feels super responsive, but
-    // backend PTY resizing is throttled/debounced to keep ConPTY stable.
+    // ── 2. Fit helper ────────────────────────────────────────────────────────
+    // Synchronous fit (no RAF) used when we need the result immediately.
+    const fitSync = () => {
+      try { fit.fit(); } catch {}
+    };
+
+    // RAF-debounced fit used by ResizeObserver and font observers.
     let resizeTimeout: any = null;
     const doFit = () => {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (destroyed.current) return;
-          try {
-            fit.fit();
-            if (ptyReady.current) {
-              if (resizeTimeout) clearTimeout(resizeTimeout);
-              resizeTimeout = setTimeout(() => {
-                if (destroyed.current || !ptyReady.current) return;
-                invoke("pty_resize", {
-                  sessionId,
-                  rows: term.rows,
-                  cols: term.cols,
-                }).catch(() => {});
-              }, 100);
-            }
-          } catch {}
-        });
+        if (destroyed.current) return;
+        try {
+          fit.fit();
+          if (ptyReady.current) {
+            if (resizeTimeout) clearTimeout(resizeTimeout);
+            resizeTimeout = setTimeout(() => {
+              if (destroyed.current || !ptyReady.current) return;
+              const rows = term.rows;
+              const cols = term.cols;
+              if (rows === lastSentSize.current.rows && cols === lastSentSize.current.cols) return;
+              lastSentSize.current = { rows, cols };
+              invoke("pty_resize", { sessionId, rows, cols }).catch(() => {});
+            }, 200);
+          }
+        } catch {}
       });
     };
 
-    // Initial fit
-    doFit();
     let active = true;
     let cleanupData: (() => void) | null = null;
     let cleanupExit: (() => void) | null = null;
 
-    // ── 3. PTY events ─────────────────────────────────────────────────────────
-    listen<string>(`pty-data-${sessionId}`, (e) => {
-      if (active && !destroyed.current) term.write(e.payload);
-    }).then(fn => {
-      if (active) {
-        cleanupData = fn;
-      } else {
-        fn();
+    // ── 3. Full terminal initialization ────────────────────────────────────
+    const initTerminal = async () => {
+
+      // ─ 3a. Wait until the container has stable, non-zero pixel dimensions. ──
+      await new Promise<void>(resolve => {
+        let lastWidth = -1;
+        let lastHeight = -1;
+        const poll = () => {
+          const container = containerRef.current;
+          if (!container || destroyed.current) { resolve(); return; }
+          const w = container.clientWidth;
+          const h = container.clientHeight;
+          if (w >= 100 && h >= 50 && w === lastWidth && h === lastHeight) {
+            resolve();
+          } else {
+            lastWidth = w;
+            lastHeight = h;
+            requestAnimationFrame(poll);
+          }
+        };
+        poll();
+      });
+
+      if (destroyed.current || !containerRef.current) return;
+
+      // ─ 3b. Open xterm, then wait for FitAddon cols to stabilize. ──────────
+      // We use only system fonts (Cascadia Code / Consolas) so char width is
+      // known immediately. This loop runs fitSync each frame until term.cols
+      // stays the same for 3 consecutive frames — belt-and-suspenders guard
+      // against any late layout passes that could change the container width.
+      term.open(el);
+      {
+        let prevCols = -1;
+        let stable = 0;
+        for (let i = 0; i < 10 && stable < 3; i++) {
+          fitSync();
+          await new Promise<void>(r => requestAnimationFrame(() => r()));
+          if (destroyed.current) return;
+          if (term.cols === prevCols) { stable++; } else { prevCols = term.cols; stable = 0; }
+        }
       }
-    });
 
-    listen(`pty-exit-${sessionId}`, () => {
-      if (active && !destroyed.current) {
-        updateStatus("exited");
-        term.writeln("\r\n\x1b[38;2;82;82;91m── process exited ──\x1b[0m");
-      }
-    }).then(fn => {
-      if (active) {
-        cleanupExit = fn;
-      } else {
-        fn();
-      }
-    });
+      // ── 4. PTY events ─────────────────────────────────────────────────────
+      listen<string>(`pty-data-${sessionId}`, (e) => {
+        if (active && !destroyed.current) term.write(e.payload);
+      }).then(fn => {
+        if (active) {
+          cleanupData = fn;
+        } else {
+          fn();
+        }
+      });
 
-    // ── 4. Keyboard → PTY ─────────────────────────────────────────────────────
-    term.onData((data) => {
-      if (!ptyReady.current || destroyed.current) return;
-      invoke("pty_write", { sessionId, data }).catch(() => {});
-    });
+      listen(`pty-exit-${sessionId}`, () => {
+        if (active && !destroyed.current) {
+          updateStatus("exited");
+          term.writeln("\r\n\x1b[38;2;82;82;91m── process exited ──\x1b[0m");
+        }
+      }).then(fn => {
+        if (active) {
+          cleanupExit = fn;
+        } else {
+          fn();
+        }
+      });
 
-    // ── 5. ResizeObserver — refit on any container size change ───────────────
-    const ro = new ResizeObserver(doFit);
-    ro.observe(el);
+      // ── 5. Keyboard → PTY ─────────────────────────────────────────────────
+      term.onData((data) => {
+        if (!ptyReady.current || destroyed.current) return;
+        invoke("pty_write", { sessionId, data }).catch(() => {});
+      });
 
-    // ── 6. Launch PTY after initial fit settles ───────────────────────────────
-    // We wait 400ms so CSS animations and layouts have fully settled before we measure dimensions
-    const waitForFit = () => {
-      if (destroyed.current) return;
-      
-      // Ensure FitAddon runs a final fit right before we measure and spawn
-      try { fit.fit(); } catch {}
-      
-      const rows = term.rows > 0 ? term.rows : 24;
-      const cols = term.cols > 0 ? term.cols : 80;
-      
+      // ── 5a. Self-Healing Focus Observer ───────────────────────────────────
+      // Forces a synchronous fit and PTY resize whenever the terminal is focused.
+      // This acts as a self-healing mechanism if layout shifts or shell initialization
+      // somehow leaves the PTY out of sync with xterm.js.
+      const handleFocus = () => {
+        if (destroyed.current || !ptyReady.current) return;
+        fitSync();
+        const rows = term.rows;
+        const cols = term.cols;
+        if (rows === lastSentSize.current.rows && cols === lastSentSize.current.cols) return;
+        lastSentSize.current = { rows, cols };
+        invoke("pty_resize", { sessionId, rows, cols }).catch(() => {});
+      };
+      term.textarea?.addEventListener("focus", handleFocus);
+      cleanupFns.push(() => term.textarea?.removeEventListener("focus", handleFocus));
+
+      // ── 5b. ResizeObserver — refit whenever container changes size ────────
+      const ro = new ResizeObserver(doFit);
+      ro.observe(el);
+      cleanupFns.push(() => ro.disconnect());
+
+      // ── 6. Spawn PTY ──────────────────────────────────────────────────────
+      // One final fit to lock in the definitive cols/rows.
+      fitSync();
+
+      // Enforce a safe minimum size of 40 cols and 10 rows when launching ConPTY
+      const rows = Math.max(10, term.rows > 0 ? term.rows : 24);
+      const cols = Math.max(40, term.cols > 0 ? term.cols : 80);
+
+      lastSentSize.current = { rows, cols };
       invoke("pty_create", { sessionId, command, cwd: workspaceDir, rows, cols })
         .then(() => {
           if (!destroyed.current) {
             ptyReady.current = true;
-            // Let the TUI or shell warm up for 3.5 seconds before transitioning to "running"
+
+            // ── 6a. Staggered resize check after PTY initializes ──────────────
+            // Fires once at 250ms. Only sends pty_resize if cols/rows actually
+            // differ from what was used at spawn — skips if already correct so
+            // ResizePseudoConsole doesn't emit a spurious SIGWINCH mid-stream.
             setTimeout(() => {
-              if (!destroyed.current) {
-                updateStatus("running");
-              }
+              if (destroyed.current || !ptyReady.current) return;
+              fitSync();
+              const r = Math.max(10, term.rows > 0 ? term.rows : 24);
+              const c = Math.max(40, term.cols > 0 ? term.cols : 80);
+              if (r === lastSentSize.current.rows && c === lastSentSize.current.cols) return;
+              lastSentSize.current = { rows: r, cols: c };
+              invoke("pty_resize", { sessionId, rows: r, cols: c }).catch(() => {});
+            }, 250);
+
+            // Transition to "running" after TUI boot warmup.
+            setTimeout(() => {
+              if (!destroyed.current) updateStatus("running");
             }, 3500);
+
             term.focus();
           } else {
             invoke("pty_kill", { sessionId }).catch(() => {});
@@ -190,17 +267,17 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           }
         });
     };
-    
-    const mountTimeout = setTimeout(waitForFit, 400);
+
+    const cleanupFns: (() => void)[] = [];
+    initTerminal();
 
     return () => {
       active = false;
       destroyed.current = true;
       ptyReady.current  = false;
-      clearTimeout(mountTimeout);
       if (resizeTimeout) clearTimeout(resizeTimeout);
       cancelAnimationFrame(rafRef.current);
-      ro.disconnect();
+      cleanupFns.forEach(fn => fn());
       if (cleanupData) cleanupData();
       if (cleanupExit) cleanupExit();
       invoke("pty_kill", { sessionId }).catch(() => {});

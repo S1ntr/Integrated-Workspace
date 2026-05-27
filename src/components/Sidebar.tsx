@@ -493,7 +493,15 @@ export const Sidebar: React.FC<SidebarProps> = ({ directory, activeFilePath, onF
           className="dialog-overlay"
           onClick={() => setShowDeletePrompt({ visible: false, path: "", name: "", isDir: false })}
         >
-          <div className="dialog-box" onClick={e => e.stopPropagation()} style={{ width: "320px" }}>
+          <div
+            className="dialog-box"
+            onClick={e => e.stopPropagation()}
+            style={{ width: "320px" }}
+            onKeyDown={e => {
+              if (e.key === "Enter") handleDeleteSubmit();
+              if (e.key === "Escape") setShowDeletePrompt({ visible: false, path: "", name: "", isDir: false });
+            }}
+          >
             <div className="dialog-header">
               <span className="dialog-title">Delete {showDeletePrompt.isDir ? "Folder" : "File"}</span>
               <button

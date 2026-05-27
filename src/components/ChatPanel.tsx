@@ -266,14 +266,7 @@ export const ChatPanel: React.FC<{
   onRestartSession,
 }) => {
   // ── Core state ───────────────────────────────────────────────────────────────
-  const [msgs, setMsgs] = useState<Msg[]>(() => {
-    try {
-      const stored = localStorage.getItem("integraded_chat_current_msgs");
-      return stored ? JSON.parse(stored) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -298,6 +291,8 @@ export const ChatPanel: React.FC<{
   const [config, setConfig] = useState<any>(null);
   const [models, setModels] = useState<ModelEntry[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
+  const selectedModelRef = useRef(selectedModel);
+  selectedModelRef.current = selectedModel;
   const [selectedCloudProvider, setSelectedCloudProvider] = useState("openai");
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [modelSearch, setModelSearch] = useState("");
@@ -320,7 +315,6 @@ export const ChatPanel: React.FC<{
   const onRestartSessionRef = useRef(onRestartSession);
   const sessionsRef = useRef(sessionsProp);
   const terminalOutputsRef = useRef(terminalOutputsProp);
-  const loadingHomeHistory = useRef(true);
   
   onSendPtyCommandRef.current = onSendPtyCommand;
   onAddSessionRef.current = onAddSession;
@@ -362,6 +356,7 @@ export const ChatPanel: React.FC<{
       setConfig(loaded);
       setStreamingEnabled(loaded.streaming ?? true);
       if (loaded.cloud_provider) setSelectedCloudProvider(loaded.cloud_provider);
+      if (loaded.active_model) setSelectedModel(loaded.active_model);
     } catch {}
   };
   useEffect(() => {
@@ -370,49 +365,21 @@ export const ChatPanel: React.FC<{
     return () => window.removeEventListener("__integradedConfigUpdated", loadConfig);
   }, []);
 
-  // Load chat histories from home directory file on mount
-  useEffect(() => {
-    (async () => {
-      try {
-        const data = await invoke<string | null>("load_chat_history");
-        if (data) {
-          const parsed = JSON.parse(data);
-          if (parsed.current_msgs) {
-            setMsgs(parsed.current_msgs);
-            localStorage.setItem("integraded_chat_current_msgs", JSON.stringify(parsed.current_msgs));
-          }
-          if (parsed.histories) {
-            setHistories(parsed.histories);
-            localStorage.setItem("integraded_chat_histories", JSON.stringify(parsed.histories));
-          }
-        }
-      } catch (e) {
-        console.error("Failed to load chat history from home directory:", e);
-      } finally {
-        loadingHomeHistory.current = false;
-      }
-    })();
-  }, []);
-
   // Persistence synchronizations
   useEffect(() => {
     try {
       localStorage.setItem("integraded_chat_current_msgs", JSON.stringify(msgs));
     } catch {}
-    if (!loadingHomeHistory.current) {
-      const payload = JSON.stringify({ current_msgs: msgs, histories });
-      invoke("save_chat_history", { jsonData: payload }).catch(() => {});
-    }
+    const payload = JSON.stringify({ current_msgs: msgs, histories });
+    invoke("save_chat_history", { jsonData: payload }).catch(() => {});
   }, [msgs]);
 
   useEffect(() => {
     try {
       localStorage.setItem("integraded_chat_histories", JSON.stringify(histories));
     } catch {}
-    if (!loadingHomeHistory.current) {
-      const payload = JSON.stringify({ current_msgs: msgs, histories });
-      invoke("save_chat_history", { jsonData: payload }).catch(() => {});
-    }
+    const payload = JSON.stringify({ current_msgs: msgs, histories });
+    invoke("save_chat_history", { jsonData: payload }).catch(() => {});
   }, [histories]);
 
   useEffect(() => {
@@ -446,7 +413,8 @@ export const ChatPanel: React.FC<{
         for (const m of d.models) result.push({ value: m.name, provider: "ollama", providerName: "Ollama", type: "local" });
       } catch {}
       setModels(result);
-      if (!result.some(m => m.value === selectedModel) && result.length > 0) {
+      // Use ref to avoid stale closure — selectedModelRef.current always has the latest value
+      if (!result.some(m => m.value === selectedModelRef.current) && result.length > 0) {
         setSelectedModel(result[0].value);
         setSelectedCloudProvider(result[0].provider);
       }
@@ -467,6 +435,10 @@ export const ChatPanel: React.FC<{
     rec.onend = () => setIsRecording(false);
     rec.onresult = (e: any) => setInput(p => p + (p ? " " : "") + e.results[0][0].transcript);
     recognitionRef.current = rec;
+    return () => {
+      try { rec.abort(); } catch {}
+      try { rec.stop(); } catch {}
+    };
   }, []);
 
   const { notifyError } = useNotify();

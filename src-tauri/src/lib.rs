@@ -109,11 +109,13 @@ fn pty_create(
             ]);
             c
         } else if is_tui {
-            // Launch the TUI tool directly (cmd.exe style — it finds executables in PATH)
-            // Using cmd /k so the window stays open if the tool exits
+            // Use cmd /c (not /k) to launch TUI tools.
+            // /k keeps cmd.exe alive as a host process that can reset the console
+            // screen buffer dimensions; /c makes cmd.exe exit immediately after
+            // the TUI starts, leaving the TUI as the sole console owner.
+            // No chcp 65001: it resets the ConPTY buffer to 80 cols.
             let mut c = CommandBuilder::new("cmd.exe");
-            let full_cmd = format!("chcp 65001 >nul && {}", command);
-            c.args(&["/k", &full_cmd]);
+            c.args(&["/c", &command]);
             c
         } else {
             // Generic command through PowerShell with UTF-8 support
@@ -176,16 +178,58 @@ fn pty_create(
     let app_clone = app.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        let mut partial: Vec<u8> = Vec::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let event_name = format!("pty-data-{}", sid);
-                    let _ = app_clone.emit(&event_name, data);
+                    // Prepend any bytes left from previous incomplete UTF-8 sequence
+                    if partial.is_empty() {
+                        match String::from_utf8(buf[..n].to_vec()) {
+                            Ok(s) => {
+                                let event_name = format!("pty-data-{}", sid);
+                                let _ = app_clone.emit(&event_name, s);
+                            }
+                            Err(e) => {
+                                let valid = e.utf8_error().valid_up_to();
+                                if valid > 0 {
+                                    if let Ok(s) = String::from_utf8(buf[..valid].to_vec()) {
+                                        let event_name = format!("pty-data-{}", sid);
+                                        let _ = app_clone.emit(&event_name, s);
+                                    }
+                                }
+                                partial = buf[valid..n].to_vec();
+                            }
+                        }
+                    } else {
+                        partial.extend_from_slice(&buf[..n]);
+                        match String::from_utf8(std::mem::take(&mut partial)) {
+                            Ok(s) => {
+                                let event_name = format!("pty-data-{}", sid);
+                                let _ = app_clone.emit(&event_name, s);
+                            }
+                            Err(e) => {
+                                let valid = e.utf8_error().valid_up_to();
+                                let bytes = e.into_bytes();
+                                if valid > 0 {
+                                    if let Ok(s) = String::from_utf8(bytes[..valid].to_vec()) {
+                                        let event_name = format!("pty-data-{}", sid);
+                                        let _ = app_clone.emit(&event_name, s);
+                                    }
+                                }
+                                partial = bytes[valid..].to_vec();
+                            }
+                        }
+                    }
                 }
                 Err(_) => break,
             }
+        }
+        // Flush any remaining partial bytes
+        if !partial.is_empty() {
+            let s = String::from_utf8_lossy(&partial).to_string();
+            let event_name = format!("pty-data-{}", sid);
+            let _ = app_clone.emit(&event_name, s);
         }
         // Emit exit event
         let _ = app_clone.emit(&format!("pty-exit-{}", sid), ());
@@ -432,14 +476,16 @@ fn copy_item(src_path: String, dest_path: String, state: State<'_, WorkspaceStat
 #[tauri::command]
 fn save_chat_history(json_data: String, app: AppHandle) -> Result<(), String> {
     let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
-    let file_path = home.join("integraded_chat_history.json");
+    let dir = home.join(".integraded-workspace");
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create chat history dir: {}", e))?;
+    let file_path = dir.join("chat_history.json");
     fs::write(file_path, json_data.as_bytes()).map_err(|e| format!("Failed to write chat history: {}", e))
 }
 
 #[tauri::command]
 fn load_chat_history(app: AppHandle) -> Result<Option<String>, String> {
     let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
-    let file_path = home.join("integraded_chat_history.json");
+    let file_path = home.join(".integraded-workspace").join("chat_history.json");
     if file_path.exists() {
         let content = fs::read_to_string(file_path).map_err(|e| format!("Failed to read chat history: {}", e))?;
         Ok(Some(content))

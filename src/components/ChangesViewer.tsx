@@ -133,7 +133,7 @@ export const ChangesViewer: React.FC<ChangesViewerProps> = ({
                     <span className="change-file-path">{file.path.split(/[\\/]/).pop()}</span>
                   </div>
                   <span className={`change-badge ${file.status}`}>
-                    {file.status === "new" ? "NEW" : "MODIFIED"}
+                    {file.status === "new" ? "CREATED" : "EDITED"}
                   </span>
                   <i className={`bx bx-chevron-${isExpanded ? "down" : "right"} change-chevron`} />
                 </div>

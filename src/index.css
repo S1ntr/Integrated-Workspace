@@ -253,6 +253,30 @@ input, textarea { font-family: var(--font-ui); }
   border-radius: var(--radius-xs);
 }
 .ob-total-hint i { color: var(--accent); font-size: 13px; }
+.ob-total-hint.ob-total-full { background: var(--err-dim); border-color: var(--err-border); color: var(--err); }
+.ob-total-hint.ob-total-full i { color: var(--err); }
+
+.ob-claude-skip {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px;
+  margin-top: 2px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-2);
+  border: 1px solid var(--bg-4);
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--text-2);
+  transition: background 0.15s;
+}
+.ob-claude-skip:hover { background: var(--bg-3); }
+.ob-claude-skip input[type="checkbox"] { accent-color: var(--accent); }
+.ob-claude-skip code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-3);
+  margin-left: 4px;
+}
 .ob-warn  { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--warn); }
 .ob-ready { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ok); }
 .ob-footer {
@@ -490,8 +514,8 @@ input, textarea { font-family: var(--font-ui); }
 .term-path { font-family: var(--font-mono); font-size: 9px; color: var(--text-3); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .term-exited-label { font-family: var(--font-mono); font-size: 9px; color: var(--err); flex-shrink: 0; }
 
-.term-xterm-container { flex: 1; min-height: 0; min-width: 0; overflow: hidden; background: #080808; }
-.term-xterm-container .xterm { height: 100%; overflow: hidden; }
+.term-xterm-container { flex: 1; min-height: 0; min-width: 0; overflow: hidden; background: #080808; letter-spacing: normal !important; }
+.term-xterm-container .xterm { height: 100%; overflow: hidden; letter-spacing: normal !important; }
 .term-xterm-container .xterm-viewport { background: transparent !important; overflow-y: auto !important; overflow-x: hidden !important; }
 .term-xterm-container .xterm-viewport::-webkit-scrollbar { width: 3px; }
 .term-xterm-container .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
@@ -1088,6 +1112,36 @@ input, textarea { font-family: var(--font-ui); }
 .stng-btn-ghost:hover { background: var(--bg-3); color: var(--text-1); }
 .stng-btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
 .stng-btn-sm { height: 28px; padding: 0 9px; font-size: 11px; }
+.stng-btn-danger { background: transparent; color: var(--err); border: 1px solid var(--err-border); }
+.stng-btn-danger:hover { background: var(--err-dim); }
+.stng-btn-danger:disabled { opacity: 0.4; cursor: not-allowed; }
+.stng-btn-danger-solid { background: var(--err); color: #fff; border: 1px solid var(--err-border); }
+.stng-btn-danger-solid:hover { background: #dc2626; }
+.stng-btn-danger-solid:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Clear history */
+.stng-clear-history { display: flex; flex-direction: column; gap: 12px; }
+.stng-clear-history .stng-section-desc { margin: 0; }
+.stng-clear-confirm {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text-3);
+  padding: 8px 10px;
+  background: var(--bg-2); border: 1px solid var(--bg-4);
+  border-radius: var(--radius-xs);
+}
+.stng-clear-confirm i { color: var(--err); font-size: 14px; }
+.stng-clear-final {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--err);
+  padding: 8px 10px;
+  background: var(--err-dim); border: 1px solid var(--err-border);
+  border-radius: var(--radius-xs);
+  animation: stngFadeIn 0.2s ease;
+}
+.stng-clear-final i { font-size: 14px; }
+.stng-clear-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+@keyframes stngFadeIn { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: translateY(0); } }
 
 /* Toggle */
 .stng-toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; }
@@ -1380,6 +1434,34 @@ input, textarea { font-family: var(--font-ui); }
   font-family: var(--font-ui);
 }
 
+.dialog-claude-skip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin-top: 4px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-2);
+  border: 1px solid var(--bg-4);
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--text-2);
+  transition: background 0.15s;
+}
+.dialog-claude-skip:hover {
+  background: var(--bg-3);
+}
+.dialog-claude-skip input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+.dialog-claude-skip-label code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-3);
+  margin-left: 4px;
+}
+
 /* ── Absolute Panels for independent resizes ── */
 .tgrid-absolute-panel {
   display: flex;
@@ -1390,12 +1472,9 @@ input, textarea { font-family: var(--font-ui); }
   background: var(--bg-base);
 }
 
-/* Beautiful morph and slide transition during swaps or window additions/removals */
+/* Morph and slide transition disabled to prevent terminal size out-of-sync bugs during animations */
 .tgrid-wrapper:not(.resizing) .tgrid-absolute-panel {
-  transition: top 0.25s cubic-bezier(0.16, 1, 0.3, 1),
-              left 0.25s cubic-bezier(0.16, 1, 0.3, 1),
-              width 0.25s cubic-bezier(0.16, 1, 0.3, 1),
-              height 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  /* instant sizing */
 }
 
 /* ── Drag source item ── */

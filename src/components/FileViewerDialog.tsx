@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { computeLineDiff, DiffLine } from "./ChangesViewer";
 
 interface FileViewerDialogProps {
   filePath: string;
   fileName: string;
   onClose: () => void;
+  baselineContent?: string;
 }
 
 // ─── High-Performance Regex Syntax Highlighter (Placeholder-Based to avoid Double-Highlighting) ───
@@ -168,11 +170,15 @@ export function highlightCode(
   return result;
 }
 
-export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fileName, onClose }) => {
+export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fileName, onClose, baselineContent }) => {
+  const isDiffMode = baselineContent !== undefined;
   const [content, setContent] = useState<string>("");
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   
+  // Diff-specific state
+  const [diffLines, setDiffLines] = useState<DiffLine[] | null>(null);
+
   // Implicitly always editable
   const [editedContent, setEditedContent] = useState<string>("");
   const [saving, setSaving] = useState<boolean>(false);
@@ -192,6 +198,7 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
   const underlayRef = useRef<HTMLPreElement>(null);
   const linesRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const diffScrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let active = true;
@@ -204,6 +211,9 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
         if (active) {
           setContent(text);
           setEditedContent(text);
+          if (isDiffMode && baselineContent !== undefined) {
+            setDiffLines(computeLineDiff(baselineContent, text));
+          }
         }
       } catch (err) {
         if (active) {
@@ -219,6 +229,12 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
       active = false;
     };
   }, [filePath]);
+
+  const handleDiffScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    if (linesRef.current) {
+      linesRef.current.scrollTop = e.currentTarget.scrollTop;
+    }
+  };
 
   const handleScroll = (e: React.UIEvent<HTMLTextAreaElement>) => {
     const textarea = e.currentTarget;
@@ -272,6 +288,7 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
 
   // Keyboard shortcut listener (Ctrl+S, Ctrl+F, Ctrl+H, Escape)
   useEffect(() => {
+    if (isDiffMode) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
@@ -383,6 +400,90 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
     setEditedContent(newText);
     setActiveMatchIndex(0);
   };
+
+  if (isDiffMode) {
+    return (
+      <div className="dialog-overlay" onClick={onClose}>
+        <div
+          className="stng-dialog file-viewer-dialog"
+          onClick={e => e.stopPropagation()}
+          style={{
+            width: "95vw",
+            height: "90vh",
+            maxWidth: "1800px",
+            display: "flex",
+            flexDirection: "column",
+            paddingBottom: "16px",
+          }}
+        >
+          <div className="stng-header" style={{ padding: "16px 20px" }}>
+            <div className="stng-header-left">
+              <div className="stng-header-icon" style={{ background: "var(--accent-subtle)", color: "var(--accent)" }}>
+                <i className="bx bx-git-compare" />
+              </div>
+              <div style={{ display: "flex", alignItems: "baseline", gap: "10px" }}>
+                <span className="stng-header-title">{fileName}</span>
+                {!loading && !error && diffLines && (
+                  <span style={{ fontSize: "11px", color: "var(--text-3)" }}>
+                    <span style={{ color: "var(--ok)" }}>+{diffLines.filter(l => l.type === "added").length}</span>
+                    {" "}
+                    <span style={{ color: "var(--err)" }}>-{diffLines.filter(l => l.type === "removed").length}</span>
+                    {" · "}
+                    {diffLines.length} lines
+                  </span>
+                )}
+              </div>
+            </div>
+            <button className="stng-close" onClick={onClose}>
+              <i className="bx bx-x" />
+            </button>
+          </div>
+
+          <div className="stng-body" style={{ flex: 1, padding: 0, overflow: "hidden", display: "flex", flexDirection: "column", background: "var(--bg-1)" }}>
+            {error && (
+              <div className="stng-alert err" style={{ margin: "12px 16px" }}>
+                <i className="bx bx-error-circle" />
+                <span>{error}</span>
+              </div>
+            )}
+
+            {loading ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: "10px", alignItems: "center", justifyContent: "center", flex: 1 }}>
+                <i className="bx bx-loader-alt bx-spin" style={{ fontSize: "24px", color: "var(--accent)" }} />
+                <span style={{ fontSize: "12px", color: "var(--text-3)" }}>Loading diff...</span>
+              </div>
+            ) : diffLines ? (
+              <div className="code-editor-viewport" style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+                <div className="editor-line-numbers" ref={linesRef} style={{ overflow: "hidden", paddingTop: "8px" }}>
+                  {diffLines.map((_, i) => (
+                    <span key={i} className="editor-line-number-item">{i + 1}</span>
+                  ))}
+                </div>
+                <div className="diff-scroll" ref={diffScrollRef} onScroll={handleDiffScroll} style={{ flex: 1, overflow: "auto", fontFamily: "var(--font-mono)", fontSize: "13px", lineHeight: "1.55", padding: "8px 0" }}>
+                  {diffLines.map((line, i) => (
+                    <div
+                      key={i}
+                      style={{
+                        display: "flex",
+                        height: "20.15px",
+                        alignItems: "center",
+                        background: line.type === "added" ? "rgba(52,211,89,0.08)" : line.type === "removed" ? "rgba(248,113,113,0.08)" : "transparent",
+                      }}
+                    >
+                      <span style={{ width: "18px", flexShrink: 0, textAlign: "center", color: line.type === "added" ? "var(--ok)" : line.type === "removed" ? "var(--err)" : "var(--text-3)", fontSize: "12px", userSelect: "none" }}>
+                        {line.type === "added" ? "+" : line.type === "removed" ? "−" : " "}
+                      </span>
+                      <span style={{ whiteSpace: "pre", color: "var(--text-1)", paddingRight: "16px" }}>{line.text || " "}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const lines = editedContent.split("\n");
   const highlighted = highlightCode(editedContent, fileName, searchQuery, activeMatchIndex);

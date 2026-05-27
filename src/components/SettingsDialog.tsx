@@ -12,7 +12,7 @@ interface AppConfig {
   cloud_provider: string;
   active_model: string;
   streaming: boolean;
-  api_keys: Record<string, string>;
+  api_keys?: Record<string, string>;
 }
 
 // ── Provider validation defs ──
@@ -333,7 +333,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                     Keys are encrypted at rest. Click <strong>Verify</strong> to test a key before saving.
                   </p>
                   {CLOUD_PROVIDERS.map(prov => {
-                    const keyVal = config.api_keys[prov.id] || "";
+                    const keyVal = (config.api_keys ?? {})[prov.id] || "";
                     const status = keyStatus[prov.id];
                     return (
                       <div key={prov.id} className="stng-api-key-row">
@@ -356,7 +356,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                             type="button"
                             className="stng-btn stng-btn-ghost stng-btn-sm"
                             onClick={() => {
-                              const k = config.api_keys[prov.id] || "";
+                              const k = (config.api_keys ?? {})[prov.id] || "";
                               if (k.trim()) validateKey(prov.id, k);
                             }}
                             disabled={!keyVal.trim() || validating === prov.id}
@@ -463,7 +463,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                   <span>Response Behavior</span>
                 </div>
                 <div className="stng-section-body">
-                  <Toggle
+                   <Toggle
                     label="Streaming responses"
                     desc="Show AI responses word-by-word as they generate instead of waiting for the full response"
                     checked={config.streaming}
@@ -478,85 +478,64 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                   <span>Data Management</span>
                 </div>
                 <div className="stng-section-body">
-                  <div className="stng-clear-history-container" style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-                    <p className="stng-section-desc" style={{ margin: 0 }}>
+                  <div className="stng-clear-history">
+                    <p className="stng-section-desc">
                       Permanently delete all saved chats, current conversation, and cached messages.
                     </p>
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "4px" }}>
-                      <input
-                        type="checkbox"
-                        id="confirmClearHistory"
-                        checked={confirmClear}
-                        onChange={e => setConfirmClear(e.target.checked)}
-                        style={{
-                          width: "15px",
-                          height: "15px",
-                          accentColor: "#f87171",
-                          cursor: "pointer"
-                        }}
-                      />
-                      <label
-                        htmlFor="confirmClearHistory"
-                        style={{
-                          fontSize: "12px",
-                          color: "var(--text-2)",
-                          cursor: "pointer",
-                          userSelect: "none"
-                        }}
-                      >
-                        Are you sure you want to delete all your history?
-                      </label>
+
+                    <div className="stng-clear-confirm">
+                      <i className="bx bx-error-circle" />
+                      <span>This action cannot be undone.</span>
                     </div>
-                    <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "4px" }}>
-                      <button
-                        type="button"
-                        className="stng-btn"
-                        disabled={!confirmClear}
-                        style={{
-                          padding: "8px 16px",
-                          background: confirmClear ? "rgba(248, 113, 113, 0.15)" : "var(--bg-3)",
-                          color: confirmClear ? "#f87171" : "var(--text-3)",
-                          border: confirmClear ? "1px solid rgba(248, 113, 113, 0.3)" : "1px solid var(--bg-4)",
-                          borderRadius: "var(--radius-sm)",
-                          cursor: confirmClear ? "pointer" : "not-allowed",
-                          fontWeight: 600,
-                          fontSize: "12px",
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: "6px",
-                          transition: "all 0.15s ease",
-                          opacity: confirmClear ? 1 : 0.5,
-                        }}
-                        onMouseEnter={e => {
-                          if (confirmClear) {
-                            e.currentTarget.style.background = "rgba(248, 113, 113, 0.25)";
-                            e.currentTarget.style.borderColor = "rgba(248, 113, 113, 0.5)";
-                          }
-                        }}
-                        onMouseLeave={e => {
-                          if (confirmClear) {
-                            e.currentTarget.style.background = "rgba(248, 113, 113, 0.15)";
-                            e.currentTarget.style.borderColor = "rgba(248, 113, 113, 0.3)";
-                          }
-                        }}
-                        onClick={() => {
-                          if (!confirmClear) return;
-                          try {
-                            localStorage.removeItem("integraded_chat_current_msgs");
-                            localStorage.removeItem("integraded_chat_histories");
-                            window.dispatchEvent(new CustomEvent("__integradedChatHistoryCleared"));
-                            setConfirmClear(false);
-                            setSuccess("Chat history cleared successfully.");
-                            setError(null);
-                          } catch (e) {
-                            setError("Failed to clear chat history.");
-                            setSuccess(null);
-                          }
-                        }}
-                      >
-                        <i className="bx bx-trash" />
-                        Clear History
-                      </button>
+
+                    {confirmClear ? (
+                      <div className="stng-clear-final">
+                        <i className="bx bxs-trash-alt" />
+                        <span>Are you sure? All chat history will be permanently deleted.</span>
+                      </div>
+                    ) : null}
+
+                    <div className="stng-clear-actions">
+                      {!confirmClear ? (
+                        <button
+                          type="button"
+                          className="stng-btn stng-btn-danger"
+                          onClick={() => setConfirmClear(true)}
+                        >
+                          <i className="bx bx-trash" />
+                          Clear History
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            className="stng-btn stng-btn-ghost"
+                            onClick={() => setConfirmClear(false)}
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            className="stng-btn stng-btn-danger-solid"
+                            onClick={() => {
+                              try {
+                                localStorage.removeItem("integraded_chat_current_msgs");
+                                localStorage.removeItem("integraded_chat_histories");
+                                window.dispatchEvent(new CustomEvent("__integradedChatHistoryCleared"));
+                                setConfirmClear(false);
+                                setSuccess("Chat history cleared successfully.");
+                                setError(null);
+                              } catch (e) {
+                                setError("Failed to clear chat history.");
+                                setSuccess(null);
+                              }
+                            }}
+                          >
+                            <i className="bx bx-trash" />
+                            Clear History
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback, useRef } from "react";
+import React, { createContext, useContext, useState, useCallback, useRef, useEffect } from "react";
 
 // ─── Types ──────────────────────────────────────────────────────────────────────
 
@@ -36,13 +36,23 @@ const MAX_VISIBLE = 5;
 export const NotifyProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const counterRef = useRef(0);
+  const timeoutsRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
 
   const add = useCallback((message: string, type: NotifyType) => {
     const id = ++counterRef.current;
     setNotifications(prev => [...prev.slice(-(MAX_VISIBLE - 1)), { id, type, message }]);
-    setTimeout(() => {
+    const timeoutId = setTimeout(() => {
+      timeoutsRef.current.delete(id);
       setNotifications(prev => prev.filter(n => n.id !== id));
     }, AUTO_DISMISS_MS);
+    timeoutsRef.current.set(id, timeoutId);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      for (const tid of timeoutsRef.current.values()) clearTimeout(tid);
+      timeoutsRef.current.clear();
+    };
   }, []);
 
   const notify = useCallback((message: string, type: NotifyType = "info") => add(message, type), [add]);

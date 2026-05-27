@@ -33,6 +33,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
     codex:       0,
     claude:      0,
   });
+  const [skipClaudePerms, setSkipClaudePerms] = useState(true);
 
   const pickDir = async () => {
     try {
@@ -50,10 +51,14 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
 
   const changeCount = (key: AgentKey, delta: number, e: React.MouseEvent) => {
     e.stopPropagation(); // don't toggle when clicking + / -
-    setCounts(prev => ({
-      ...prev,
-      [key]: Math.max(0, Math.min(16, prev[key] + delta)),
-    }));
+    setCounts(prev => {
+      const otherTotal = AGENTS.reduce((s, a) => s + (a.key === key ? 0 : prev[a.key]), 0);
+      const maxAdd = Math.max(0, 16 - otherTotal);
+      return {
+        ...prev,
+        [key]: Math.max(0, Math.min(maxAdd, prev[key] + delta)),
+      };
+    });
   };
 
   // Build flat ordered session list
@@ -62,7 +67,8 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
     for (const agent of AGENTS) {
       const n = counts[agent.key];
       for (let i = 0; i < n; i++) {
-        list.push({ label: agent.label, command: agent.command });
+        const command = agent.key === "claude" && skipClaudePerms ? "claude --dangerously-skip-permissions" : agent.command;
+        list.push({ label: agent.label, command });
       }
     }
     return list;
@@ -136,7 +142,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
                       <button
                         className="agent-count-btn"
                         onClick={e => changeCount(a.key, +1, e)}
-                        disabled={counts[a.key] >= 4}
+                        disabled={totalCount >= 16}
                       >+</button>
                     </div>
                   )}
@@ -152,12 +158,26 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
           </div>
 
           {totalCount > 0 && (
-            <div className="ob-total-hint">
-              <i className="bx bx-grid-alt" />
-              {totalCount} terminal{totalCount !== 1 ? "s" : ""} total
+            <div className={`ob-total-hint ${totalCount >= 16 ? "ob-total-full" : ""}`}>
+              <i className={`bx ${totalCount >= 16 ? "bxs-error" : "bx-grid-alt"}`} />
+              {totalCount} / 16 terminal{totalCount !== 1 ? "s" : ""}
+              {totalCount >= 16 && " (max reached)"}
               {" — "}
               {sessions.map(s => s.label).join(", ")}
             </div>
+          )}
+
+          {counts.claude > 0 && (
+            <label className="ob-claude-skip" onClick={e => e.stopPropagation()}>
+              <input
+                type="checkbox"
+                checked={skipClaudePerms}
+                onChange={e => setSkipClaudePerms(e.target.checked)}
+              />
+              <span>
+                Skip permissions <code>--dangerously-skip-permissions</code>
+              </span>
+            </label>
           )}
         </section>
 

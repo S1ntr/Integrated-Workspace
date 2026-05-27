@@ -34,6 +34,7 @@ interface NewSessionDialogProps {
 const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onConfirm, onCancel }) => {
   const [selected, setSelected] = useState("shell");
   const [count, setCount] = useState(1);
+  const [skipPerms, setSkipPerms] = useState(localStorage.getItem("__integraded_claude_skip_permissions") !== "0");
   const pick = AGENT_OPTIONS.find(a => a.key === selected) ?? AGENT_OPTIONS[0];
 
   return (
@@ -82,10 +83,29 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onC
             </div>
             <span className="dialog-count-hint">(Max remaining: {remainingCount})</span>
           </div>
+
+          {selected === "claude" && (
+            <label className="dialog-claude-skip" onClick={e => e.stopPropagation()}>
+              <input
+                type="checkbox"
+                checked={skipPerms}
+                onChange={e => {
+                  setSkipPerms(e.target.checked);
+                  localStorage.setItem("__integraded_claude_skip_permissions", e.target.checked ? "1" : "0");
+                }}
+              />
+              <span className="dialog-claude-skip-label">
+                Skip permissions <code>--dangerously-skip-permissions</code>
+              </span>
+            </label>
+          )}
         </div>
         <div className="dialog-footer">
           <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
-          <button className="btn btn-primary" onClick={() => onConfirm(pick.label, pick.command, count)}>
+          <button className="btn btn-primary" onClick={() => {
+            const cmd = selected === "claude" && skipPerms ? "claude --dangerously-skip-permissions" : pick.command;
+            onConfirm(pick.label, cmd, count);
+          }}>
             <i className="bx bx-play" />
             Launch
           </button>
@@ -174,6 +194,11 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   directory,
   initialSessions,
 }) => {
+  // Default Claude bypass ON
+  if (localStorage.getItem("__integraded_claude_skip_permissions") === null) {
+    localStorage.setItem("__integraded_claude_skip_permissions", "1");
+  }
+
   const [sidebarW, setSidebarW] = useState(220);
   const [rightW, setRightW] = useState(300);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -181,7 +206,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const [sessions, setSessions] = useState<Session[]>([]);
   const [showNewSession, setShowNewSession] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [activeFile, setActiveFile] = useState<{ path: string; name: string } | null>(null);
+  const [activeFile, setActiveFile] = useState<{ path: string; name: string; baselineContent?: string } | null>(null);
 
   // New States for Changes & Diff tracking
   const [baselineSnapshot, setBaselineSnapshot] = useState<Record<string, string>>({});
@@ -310,6 +335,12 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
       return { id: -1, sessionId: "", label: "", command: "" };
     }
 
+    // If Claude and skip-permissions toggle is on, append the flag
+    let finalCommand = command;
+    if (command === "claude" && localStorage.getItem("__integraded_claude_skip_permissions") !== "0") {
+      finalCommand = "claude --dangerously-skip-permissions";
+    }
+
     let lastSession: Session = { id: -1, sessionId: "", label: "", command: "" };
 
     setSessions(prev => {
@@ -317,7 +348,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
       for (let c = 0; c < count; c++) {
         const id = globalSessionCounter++;
         const sLabel = count > 1 ? `${label} #${c + 1}` : label;
-        const session: Session = { id, sessionId: `pty-${id}`, label: sLabel, command };
+        const session: Session = { id, sessionId: `pty-${id}`, label: sLabel, command: finalCommand };
         next.push(session);
         lastSession = session;
       }
@@ -327,17 +358,33 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     return lastSession;
   };
 
+  // Ctrl+T / Cmd+T → new terminal
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 't') {
+        e.preventDefault();
+        addSession("shell", "shell");
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
   const closeSession = (termId: number) => {
     setSessions(prev => prev.filter(s => s.id !== termId));
   };
 
   const changeSessionAgent = (termId: number, label: string, command: string, restart = true) => {
+    let finalCommand = command;
+    if (command === "claude" && localStorage.getItem("__integraded_claude_skip_permissions") !== "0") {
+      finalCommand = "claude --dangerously-skip-permissions";
+    }
     setSessions(prev => prev.map(s => {
       if (s.id === termId) {
         return {
           ...s,
           label,
-          command,
+          command: finalCommand,
           // Only generate new sessionId (= PTY restart) when explicitly requested.
           // Keeping the same sessionId preserves agent context.
           sessionId: restart ? `pty-${termId}-${Date.now()}` : s.sessionId,
@@ -436,6 +483,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
           filePath={activeFile.path}
           fileName={activeFile.name}
           onClose={() => setActiveFile(null)}
+          baselineContent={activeFile.baselineContent}
         />
       )}
 
@@ -518,7 +566,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
               terminalOutputs={terminalOutputs}
               changedFiles={changedFiles}
               baselineSnapshot={baselineSnapshot}
-              onFileSelect={(path, name) => setActiveFile({ path, name })}
+              onFileSelect={(path, name) => setActiveFile({ path, name, baselineContent: baselineSnapshot[path] })}
               onSendPtyCommand={(sessId, cmd) => {
                 invoke("pty_write", { sessionId: sessId, data: cmd + "\r" }).catch(() => {});
               }}
