@@ -75,7 +75,7 @@ const SplitColumn: React.FC<ColProps> = ({ sessions, workspaceDir, onClose, onCh
   if (sessions.length === 1) {
     return (
       <div className="tgrid-col-panel">
-        <TerminalPanel {...sessions[0]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
+        <TerminalPanel key={sessions[0].id} {...sessions[0]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
       </div>
     );
   }
@@ -84,7 +84,7 @@ const SplitColumn: React.FC<ColProps> = ({ sessions, workspaceDir, onClose, onCh
   return (
     <>
       <div className="tgrid-col-panel" style={{ flex: `${rowPct} 1 0%` }}>
-        <TerminalPanel {...sessions[0]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
+        <TerminalPanel key={sessions[0].id} {...sessions[0]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
       </div>
 
       {/* Horizontal resize handle for THIS column only */}
@@ -94,14 +94,14 @@ const SplitColumn: React.FC<ColProps> = ({ sessions, workspaceDir, onClose, onCh
 
       <div className="tgrid-col-panel" style={{ flex: `${100 - rowPct} 1 0%` }}>
         {sessions[1] && (
-          <TerminalPanel {...sessions[1]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
+          <TerminalPanel key={sessions[1].id} {...sessions[1]} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
         )}
       </div>
 
       {/* Extra panels beyond 2 stacked at bottom */}
       {sessions.slice(2).map(s => (
-        <div key={s.sessionId} className="tgrid-col-panel" style={{ flex: "1 1 0%" }}>
-          <TerminalPanel {...s} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
+        <div key={s.id} className="tgrid-col-panel" style={{ flex: "1 1 0%" }}>
+          <TerminalPanel key={s.id} {...s} workspaceDir={workspaceDir} widthPercent={100} onClose={onClose} onChangeAgent={onChangeAgent} />
         </div>
       ))}
     </>

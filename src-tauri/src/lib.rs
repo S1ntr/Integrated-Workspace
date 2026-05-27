@@ -5,6 +5,8 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
 
+use tokio::io::AsyncBufReadExt;
+
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -31,6 +33,10 @@ struct PtySession {
 
 #[derive(Default)]
 pub struct PtyState(Mutex<HashMap<String, PtySession>>);
+
+// ─── Stream State for canceling active curl streams ───────────────────────────
+#[derive(Default)]
+pub struct StreamState(Mutex<HashMap<String, u32>>);
 
 // ─── Workspace State for Sandboxing (Remediation for Path Traversal) ─────────
 #[derive(Default)]
@@ -363,6 +369,7 @@ pub struct AppConfig {
     pub ollama_url: String,
     pub cloud_provider: String,
     pub active_model: String,
+    pub streaming: bool,
     pub api_keys: HashMap<String, String>,
 }
 
@@ -488,6 +495,7 @@ fn load_config() -> Result<AppConfig, String> {
             ollama_url: "http://localhost:11434".to_string(),
             cloud_provider: "openai".to_string(),
             active_model: "".to_string(),
+            streaming: true,
             api_keys: HashMap::new(),
         });
     }
@@ -521,7 +529,12 @@ fn validate_url(url: &str) -> Result<(), String> {
         || parsed_url.starts_with("http://127.0.0.1:")
         || parsed_url.starts_with("https://api.openai.com/")
         || parsed_url.starts_with("https://api.anthropic.com/")
-        || parsed_url.starts_with("https://api.deepseek.com/");
+        || parsed_url.starts_with("https://api.deepseek.com/")
+        || parsed_url.starts_with("https://api.mistral.ai/")
+        || parsed_url.starts_with("https://generativelanguage.googleapis.com/")
+        || parsed_url.starts_with("https://api.x.ai/")
+        || parsed_url.starts_with("https://api.together.xyz/")
+        || parsed_url.starts_with("https://openrouter.ai/");
         
     if is_allowed {
         Ok(())
@@ -531,13 +544,18 @@ fn validate_url(url: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn curl_get(url: String) -> Result<String, String> {
+async fn curl_get(url: String) -> Result<String, String> {
     validate_url(&url)?;
     
-    let output = Command::new("curl")
-        .args(&["-s", "-N", &url])
-        .output()
-        .map_err(|e| format!("Failed to execute curl: {}", e))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new("curl")
+            .args(&["-s", "-N", &url])
+            .output(),
+    )
+    .await
+    .map_err(|_| "Request timed out after 30 seconds.".to_string())?
+    .map_err(|e| format!("Failed to execute curl: {}", e))?;
     
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -549,10 +567,10 @@ fn curl_get(url: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn curl_post(url: String, body: String, headers: Vec<Vec<String>>) -> Result<String, String> {
+async fn curl_post(url: String, body: String, headers: Vec<Vec<String>>) -> Result<String, String> {
     validate_url(&url)?;
     
-    let mut cmd = Command::new("curl");
+    let mut cmd = tokio::process::Command::new("curl");
     cmd.args(&["-s", "-N", "-X", "POST", "-d", &body, &url]);
     for h in headers {
         if h.len() >= 2 {
@@ -560,8 +578,13 @@ fn curl_post(url: String, body: String, headers: Vec<Vec<String>>) -> Result<Str
         }
     }
     
-    let output = cmd.output()
-        .map_err(|e| format!("Failed to execute curl: {}", e))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(300), // 5 min timeout for LLM responses
+        cmd.output(),
+    )
+    .await
+    .map_err(|_| "Request timed out after 5 minutes.".to_string())?
+    .map_err(|e| format!("Failed to execute curl: {}", e))?;
     
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -570,6 +593,99 @@ fn curl_post(url: String, body: String, headers: Vec<Vec<String>>) -> Result<Str
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         Err(format!("curl error: {}", stderr))
     }
+}
+
+// ─── Stream cancellation ──────────────────────────────────────────────────────
+
+#[tauri::command]
+fn cancel_stream(session_id: String, state: State<'_, StreamState>) -> Result<(), String> {
+    let mut streams = state.0.lock().map_err(|e| format!("Lock failed: {}", e))?;
+    if let Some(pid) = streams.remove(&session_id) {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(&["/F", "/PID", &pid.to_string()])
+                .output();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(&pid.to_string())
+                .output();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn curl_post_stream(
+    url: String,
+    body: String,
+    headers: Vec<Vec<String>>,
+    session_id: String,
+    app: AppHandle,
+    state: State<'_, StreamState>,
+) -> Result<(), String> {
+    validate_url(&url)?;
+    
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args(&["-s", "-N", "-X", "POST", "-d", &body, &url]);
+    for h in &headers {
+        if h.len() >= 2 {
+            cmd.args(&["-H", &format!("{}: {}", h[0], h[1])]);
+        }
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn curl: {}", e))?;
+    let pid = child.id().unwrap_or(0);
+    
+    // Register the stream PID
+    {
+        let mut streams = state.0.lock().map_err(|e| format!("Lock failed: {}", e))?;
+        streams.insert(session_id.clone(), pid);
+    }
+    
+    let stdout = child.stdout.take().ok_or_else(|| "Failed to capture stdout".to_string())?;
+    
+    let reader = tokio::io::BufReader::new(stdout);
+    let mut lines = reader.lines();
+    
+    let sid = session_id.clone();
+    let app_clone = app.clone();
+    
+    loop {
+        let timeout_result = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            lines.next_line(),
+        ).await;
+        
+        match timeout_result {
+            Ok(Ok(Some(line))) => {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    let _ = app_clone.emit(&format!("stream-chunk-{}", sid), &trimmed);
+                }
+            }
+            Ok(Ok(None)) => break, // EOF
+            Ok(Err(_)) => break,   // read error
+            Err(_) => break,       // timeout
+        }
+    }
+    
+    // Unregister and emit done
+    {
+        let mut streams = state.0.lock().map_err(|e| format!("Lock failed: {}", e))?;
+        streams.remove(&session_id);
+    }
+    let _ = app.emit(&format!("stream-done-{}", session_id), ());
+    
+    // Wait for curl to finish (ignore errors – we already got the data)
+    let _ = child.wait().await;
+    
+    Ok(())
 }
 
 // ─── App entry point ──────────────────────────────────────────────────────────
@@ -580,6 +696,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(PtyState::default())
         .manage(WorkspaceState::default())
+        .manage(StreamState::default())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 if let Some(icon) = app.default_window_icon() {
@@ -603,6 +720,8 @@ pub fn run() {
             load_config,
             curl_get,
             curl_post,
+            curl_post_stream,
+            cancel_stream,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

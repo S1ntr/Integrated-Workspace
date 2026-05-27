@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Sidebar, FileEntry } from "./Sidebar";
 import { ChatPanel } from "./ChatPanel";
 import { TerminalGrid, Session } from "./TerminalGrid";
@@ -69,22 +70,26 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ onConfirm, onCancel
 // ── Right Panel with tabs ──────────────────────────────────────────────────────
 interface RightPanelProps {
   width: number;
+  sessions: Session[];
+  terminalOutputs: Record<string, string>;
   changedFiles: ChangedFile[];
   baselineSnapshot: Record<string, string>;
   onFileSelect: (path: string, name: string) => void;
-  sessions: Session[];
   onSendPtyCommand: (sessId: string, cmd: string) => void;
-  onAddSession: (label: string, command: string) => void;
+  onAddSession: (label: string, command: string) => Session;
+  onCloseSession: (id: number) => void;
 }
 
 const RightPanel: React.FC<RightPanelProps> = ({
   width,
+  sessions,
+  terminalOutputs,
   changedFiles,
   baselineSnapshot,
   onFileSelect,
-  sessions,
   onSendPtyCommand,
   onAddSession,
+  onCloseSession,
 }) => {
   const [tab, setTab] = useState<"chat" | "file">("chat");
 
@@ -111,11 +116,12 @@ const RightPanel: React.FC<RightPanelProps> = ({
       <div className="right-panel-body">
         {tab === "chat" ? (
           <ChatPanel
-            width={width}
             embedded
             sessions={sessions}
+            terminalOutputs={terminalOutputs}
             onSendPtyCommand={onSendPtyCommand}
             onAddSession={onAddSession}
+            onCloseSession={onCloseSession}
           />
         ) : (
           <ChangesViewer
@@ -149,6 +155,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   // New States for Changes & Diff tracking
   const [baselineSnapshot, setBaselineSnapshot] = useState<Record<string, string>>({});
   const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([]);
+  const [terminalOutputs, setTerminalOutputs] = useState<Record<string, string>>({});
 
   // Helper to recursively collect all file entries (leaves only)
   const collectAllFiles = (entries: FileEntry[]): FileEntry[] => {
@@ -230,6 +237,30 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
 
 
 
+  // ── Collect terminal output for orchestrator context ────────────────────
+  useEffect(() => {
+    if (sessions.length === 0) return;
+    const unlisteners: (() => void)[] = [];
+
+    for (const session of sessions) {
+      listen<string>(`pty-data-${session.sessionId}`, (event) => {
+        // Strip ANSI escape codes so LLM gets readable text
+        const cleaned = event.payload
+          .replace(/\x1b\[[0-9;]*[mGKHFJA-Za-z]/g, "")
+          .replace(/\x1b\][^\x07]*\x07/g, "")
+          .replace(/\r/g, "");
+        setTerminalOutputs(prev => {
+          const current = prev[session.sessionId] || "";
+          const updated = (current + cleaned).slice(-4000);
+          return { ...prev, [session.sessionId]: updated };
+        });
+      }).then(unlisten => unlisteners.push(unlisten));
+    }
+
+    return () => { for (const u of unlisteners) u(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions.map(s => s.sessionId).join(",")]);
+
   // ── Init sessions from onboarding config ───────────────────────────────
   useEffect(() => {
     if (sessions.length > 0) return;
@@ -241,24 +272,28 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
 
 
   // ── Session management ───────────────────────────────────────────────────
-  const addSession = (label: string, command: string) => {
+  const addSession = (label: string, command: string): Session => {
     setShowNewSession(false);
     const id = globalSessionCounter++;
-    setSessions(prev => [...prev, { id, sessionId: `pty-${id}`, label, command }]);
+    const session: Session = { id, sessionId: `pty-${id}`, label, command };
+    setSessions(prev => [...prev, session]);
+    return session;
   };
 
   const closeSession = (termId: number) => {
-    setSessions(prev => prev.length <= 1 ? prev : prev.filter(s => s.id !== termId));
+    setSessions(prev => prev.filter(s => s.id !== termId));
   };
 
-  const changeSessionAgent = (termId: number, label: string, command: string) => {
+  const changeSessionAgent = (termId: number, label: string, command: string, restart = true) => {
     setSessions(prev => prev.map(s => {
       if (s.id === termId) {
         return {
           ...s,
           label,
           command,
-          sessionId: `pty-${termId}-${Date.now()}` // Re-create session cleanly on change
+          // Only generate new sessionId (= PTY restart) when explicitly requested.
+          // Keeping the same sessionId preserves agent context.
+          sessionId: restart ? `pty-${termId}-${Date.now()}` : s.sessionId,
         };
       }
       return s;
@@ -310,12 +345,20 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
           <img src="/logo.svg" className="header-logo" alt="" />
           <span className="header-name">Integraded</span>
         </div>
-        {sessionPills.map(p => (
-          <div key={p.label} className="agent-pill running">
-            <i className="bx bx-terminal" />
-            {p.label}{p.count > 1 ? ` ×${p.count}` : ""}
-          </div>
-        ))}
+        <div className="header-pills-row">
+          {sessionPills.slice(0, 3).map(p => (
+            <div key={p.label} className="agent-pill running">
+              <i className="bx bx-terminal" />
+              <span className="agent-pill-label">{p.label}</span>
+              {p.count > 1 && <span className="agent-pill-count">×{p.count}</span>}
+            </div>
+          ))}
+          {sessionPills.length > 3 && (
+            <div className="agent-pill running agent-pill-more">
+              +{sessionPills.slice(3).reduce((n, p) => n + p.count, 0)}
+            </div>
+          )}
+        </div>
         <div className="header-spacer" />
         <div className="header-path"><i className="bx bx-folder" />{dirShort}</div>
         <button className="hdr-btn" title="New terminal (Ctrl+T)" onClick={() => setShowNewSession(true)}>
@@ -359,14 +402,16 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
             <div className="resize-handle h" onMouseDown={resizeRight} />
             <RightPanel
               width={rightW}
+              sessions={sessions}
+              terminalOutputs={terminalOutputs}
               changedFiles={changedFiles}
               baselineSnapshot={baselineSnapshot}
               onFileSelect={(path, name) => setActiveFile({ path, name })}
-              sessions={sessions}
               onSendPtyCommand={(sessId, cmd) => {
                 invoke("pty_write", { sessionId: sessId, data: cmd + "\r" }).catch(() => {});
               }}
               onAddSession={addSession}
+              onCloseSession={closeSession}
             />
           </>
         )}

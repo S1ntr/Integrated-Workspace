@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 interface SettingsDialogProps {
@@ -11,219 +11,253 @@ interface AppConfig {
   ollama_url: string;
   cloud_provider: string;
   active_model: string;
+  streaming: boolean;
   api_keys: Record<string, string>;
 }
 
-// ── Custom Segmented Select Dropdown for Settings ───────────────────────────
-interface CustomSelectProps {
-  label: string;
-  value: string;
-  options: { value: string; label: string }[];
-  onChange: (val: string) => void;
+// ── Provider validation defs ──
+interface CloudProviderDef {
+  id: string;
+  name: string;
+  icon: string;
+  baseUrl: string;
+  keyPlaceholder: string;
+  docsUrl: string;
+  authScheme: "bearer" | "anthropic" | "gemini";
 }
 
-const CustomSelect: React.FC<CustomSelectProps> = ({ label, value, options, onChange }) => {
-  const [isOpen, setIsOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
+const CLOUD_PROVIDERS: CloudProviderDef[] = [
+  {
+    id: "openai", name: "OpenAI", icon: "bxl-openai",
+    baseUrl: "https://api.openai.com/v1/chat/completions",
+    keyPlaceholder: "sk-proj-...",
+    docsUrl: "https://platform.openai.com/api-keys",
+    authScheme: "bearer",
+  },
+  {
+    id: "anthropic", name: "Anthropic", icon: "bxl-tailwind-css",
+    baseUrl: "https://api.anthropic.com/v1/messages",
+    keyPlaceholder: "sk-ant-...",
+    docsUrl: "https://console.anthropic.com/settings/keys",
+    authScheme: "anthropic",
+  },
+  {
+    id: "deepseek", name: "DeepSeek", icon: "bx-chip",
+    baseUrl: "https://api.deepseek.com/chat/completions",
+    keyPlaceholder: "sk-...",
+    docsUrl: "https://platform.deepseek.com/api-keys",
+    authScheme: "bearer",
+  },
+  {
+    id: "mistral", name: "Mistral", icon: "bx-wind",
+    baseUrl: "https://api.mistral.ai/v1/chat/completions",
+    keyPlaceholder: "MISTRAL_...",
+    docsUrl: "https://console.mistral.ai/api-keys",
+    authScheme: "bearer",
+  },
+  {
+    id: "google", name: "Google Gemini", icon: "bxl-google",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    keyPlaceholder: "AIza...",
+    docsUrl: "https://aistudio.google.com/apikey",
+    authScheme: "gemini",
+  },
+  {
+    id: "grok", name: "Grok (xAI)", icon: "bx-bolt",
+    baseUrl: "https://api.x.ai/v1/chat/completions",
+    keyPlaceholder: "xai-...",
+    docsUrl: "https://console.x.ai",
+    authScheme: "bearer",
+  },
+  {
+    id: "together", name: "Together AI", icon: "bx-group",
+    baseUrl: "https://api.together.xyz/v1/chat/completions",
+    keyPlaceholder: "tgp_...",
+    docsUrl: "https://api.together.xyz/settings/api-keys",
+    authScheme: "bearer",
+  },
+  {
+    id: "openrouter", name: "OpenRouter", icon: "bx-git-branch",
+    baseUrl: "https://openrouter.ai/api/v1/chat/completions",
+    keyPlaceholder: "sk-or-...",
+    docsUrl: "https://openrouter.ai/keys",
+    authScheme: "bearer",
+  },
+];
 
-  useEffect(() => {
-    const clickOutside = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setIsOpen(false);
-      }
-    };
-    if (isOpen) window.addEventListener("mousedown", clickOutside);
-    return () => window.removeEventListener("mousedown", clickOutside);
-  }, [isOpen]);
+// ── Toggle Switch ──
+interface ToggleProps {
+  label: string;
+  desc: string;
+  checked: boolean;
+  onChange: (val: boolean) => void;
+}
 
-  const activeOption = options.find((o) => o.value === value) || options[0];
-
-  return (
-    <div className="settings-field custom-select-container" ref={ref}>
-      <label className="settings-label">{label}</label>
-      <button
-        type="button"
-        className="custom-select-trigger"
-        onClick={() => setIsOpen(!isOpen)}
-      >
-        <span>{activeOption ? activeOption.label : value}</span>
-        <i className={`bx bx-chevron-down ${isOpen ? "open" : ""}`} />
-      </button>
-      {isOpen && (
-        <div className="custom-select-dropdown">
-          {options.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              className={`custom-select-item ${opt.value === value ? "active" : ""}`}
-              onClick={() => {
-                onChange(opt.value);
-                setIsOpen(false);
-              }}
-            >
-              <span className="custom-select-item-text">{opt.label}</span>
-              {opt.value === value && <i className="bx bx-check" />}
-            </button>
-          ))}
-        </div>
-      )}
+const Toggle: React.FC<ToggleProps> = ({ label, desc, checked, onChange }) => (
+  <div className="stng-toggle-row">
+    <div className="stng-toggle-info">
+      <span className="stng-toggle-label">{label}</span>
+      <span className="stng-toggle-desc">{desc}</span>
     </div>
-  );
-};
+    <button
+      type="button"
+      className={`stng-toggle ${checked ? "on" : "off"}`}
+      onClick={() => onChange(!checked)}
+      role="switch"
+      aria-checked={checked}
+    >
+      <span className="stng-toggle-track">
+        <span className="stng-toggle-thumb" />
+      </span>
+    </button>
+  </div>
+);
+
+type ThemeMode = "dark" | "light" | "auto";
+
+function applyTheme(mode: ThemeMode) {
+  const root = document.documentElement;
+  if (mode === "dark")  root.setAttribute("data-theme", "dark");
+  else if (mode === "light") root.setAttribute("data-theme", "light");
+  else root.removeAttribute("data-theme");
+  try { localStorage.setItem("__integraded_theme", mode); } catch {}
+}
+
+const TABS = [
+  { id: "keys",       label: "API Keys",   icon: "bx-key" },
+  { id: "behavior",   label: "Behavior",   icon: "bx-slider" },
+  { id: "appearance", label: "Appearance", icon: "bx-palette" },
+];
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
-  const [activeTab, setActiveTab] = useState<"general" | "keys">("general");
+  const [activeTab, setActiveTab] = useState("keys");
   const [config, setConfig] = useState<AppConfig>({
     provider: "cloud",
     lmstudio_url: "http://localhost:1234",
     ollama_url: "http://localhost:11434",
     cloud_provider: "openai",
     active_model: "",
+    streaming: true,
     api_keys: {},
   });
 
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    try { return (localStorage.getItem("__integraded_theme") as ThemeMode) || "dark"; } catch { return "dark"; }
+  });
+
+  const changeTheme = (mode: ThemeMode) => {
+    setThemeMode(mode);
+    applyTheme(mode);
+  };
+
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [validationError, setValidationError] = useState<string | null>(null);
-  const [validationSuccess, setValidationSuccess] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [validating, setValidating] = useState<string | null>(null);
+  const [keyStatus, setKeyStatus] = useState<Record<string, "ok" | "err" | null>>({});
+  const [testingLocal, setTestingLocal] = useState<string | null>(null);
+  const [localStatus, setLocalStatus] = useState<Record<string, "ok" | "err" | null>>({});
 
   useEffect(() => {
-    const load = async () => {
+    (async () => {
       try {
         const loaded = await invoke<AppConfig>("load_config");
-        // Ensure defaults are populated
         setConfig({
           provider: loaded.provider || "cloud",
           lmstudio_url: loaded.lmstudio_url || "http://localhost:1234",
           ollama_url: loaded.ollama_url || "http://localhost:11434",
           cloud_provider: loaded.cloud_provider || "openai",
           active_model: loaded.active_model || "",
+          streaming: loaded.streaming ?? true,
           api_keys: loaded.api_keys || {},
         });
+        Object.entries(loaded.api_keys || {}).forEach(([k, v]) => {
+          if (v && v.length > 5) setKeyStatus(prev => ({ ...prev, [k]: "ok" }));
+        });
       } catch (err) {
-        console.error("Failed to load settings config:", err);
+        console.error("Failed to load config:", err);
       } finally {
         setLoading(false);
       }
-    };
-    load();
+    })();
   }, []);
 
-  const handleChange = (field: keyof AppConfig, value: string) => {
-    setConfig((prev) => ({ ...prev, [field]: value }));
-  };
-
-  const handleKeyChange = (providerKey: string, value: string) => {
-    setConfig((prev) => ({
+  const updateKey = (provider: string, val: string) => {
+    setConfig(prev => ({
       ...prev,
-      api_keys: { ...prev.api_keys, [providerKey]: value },
+      api_keys: { ...prev.api_keys, [provider]: val },
     }));
+    setKeyStatus(prev => ({ ...prev, [provider]: null }));
   };
 
-  // ── API Key Validation Helper ──────────────────────────────────────────────
-  const validateApiKey = async (cloudProv: string, key: string): Promise<boolean> => {
-    if (!key.trim() || key === "••••••••••••••••") return true; // empty or masked keys are skipped/valid
-
+  const validateKey = async (cloudProv: string, key: string): Promise<boolean> => {
+    if (!key.trim()) { setError("Please enter an API key."); return false; }
+    setValidating(cloudProv);
+    setError(null);
     try {
-      if (cloudProv === "openai") {
-        const body = JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: [{ role: "user", content: "ping" }],
-          max_tokens: 1,
-        });
-        const headers = [
-          ["Authorization", `Bearer ${key}`],
-          ["Content-Type", "application/json"],
-        ];
-        const resStr = await invoke<string>("curl_post", {
-          url: "https://api.openai.com/v1/chat/completions",
-          body,
-          headers,
-        });
-        const res = JSON.parse(resStr);
-        if (res.error) {
-          throw new Error(res.error.message || "Invalid OpenAI API Key");
-        }
-        return true;
-      } else if (cloudProv === "anthropic") {
-        const body = JSON.stringify({
-          model: "claude-3-5-sonnet-20241022",
-          max_tokens: 1,
-          messages: [{ role: "user", content: "ping" }],
-        });
-        const headers = [
-          ["x-api-key", key],
-          ["anthropic-version", "2023-06-01"],
-          ["Content-Type", "application/json"],
-        ];
-        const resStr = await invoke<string>("curl_post", {
-          url: "https://api.anthropic.com/v1/messages",
-          body,
-          headers,
-        });
-        const res = JSON.parse(resStr);
-        if (res.error) {
-          throw new Error(res.error.message || "Invalid Anthropic API Key");
-        }
-        return true;
-      } else if (cloudProv === "deepseek") {
-        const body = JSON.stringify({
-          model: "deepseek-chat",
-          messages: [{ role: "user", content: "ping" }],
-          max_tokens: 1,
-        });
-        const headers = [
-          ["Authorization", `Bearer ${key}`],
-          ["Content-Type", "application/json"],
-        ];
-        const resStr = await invoke<string>("curl_post", {
-          url: "https://api.deepseek.com/chat/completions",
-          body,
-          headers,
-        });
-        const res = JSON.parse(resStr);
-        if (res.error) {
-          throw new Error(res.error.message || "Invalid DeepSeek API Key");
-        }
-        return true;
+      const provDef = CLOUD_PROVIDERS.find(d => d.id === cloudProv);
+      if (!provDef) return true;
+
+      const body = JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "ping" }], max_tokens: 1 });
+
+      let url: string;
+      let headers: string[][];
+
+      if (provDef.authScheme === "anthropic") {
+        url = provDef.baseUrl;
+        headers = [["x-api-key", key], ["anthropic-version", "2023-06-01"], ["Content-Type", "application/json"]];
+      } else if (provDef.authScheme === "gemini") {
+        url = `${provDef.baseUrl}?key=${key}`;
+        headers = [["Content-Type", "application/json"]];
+      } else {
+        url = provDef.baseUrl;
+        headers = [["Authorization", `Bearer ${key}`], ["Content-Type", "application/json"]];
       }
+
+      const res = await invoke<string>("curl_post", { url, body, headers });
+      const data = JSON.parse(res);
+      if (data.error) throw new Error(data.error.message || "Invalid key");
+      setKeyStatus(prev => ({ ...prev, [cloudProv]: "ok" }));
+      return true;
     } catch (err: any) {
-      console.error("API Key validation error:", err);
-      setValidationError(err.message || `Validation failed for ${cloudProv}`);
+      setKeyStatus(prev => ({ ...prev, [cloudProv]: "err" }));
+      setError(err.message || `Validation failed for ${cloudProv}`);
       return false;
+    } finally {
+      setValidating(null);
     }
-    return true;
+  };
+
+  const testLocalConnection = async (type: "lmstudio" | "ollama") => {
+    const url = type === "lmstudio" ? config.lmstudio_url : config.ollama_url;
+    if (!url.trim()) { setError("Please enter a URL."); return; }
+    setTestingLocal(type);
+    setError(null);
+    try {
+      const endpoint = type === "lmstudio" ? `${url.replace(/\/+$/, "")}/v1/models` : `${url.replace(/\/+$/, "")}/api/tags`;
+      await invoke<string>("curl_get", { url: endpoint });
+      setLocalStatus(prev => ({ ...prev, [type]: "ok" }));
+    } catch (err: any) {
+      setLocalStatus(prev => ({ ...prev, [type]: "err" }));
+      setError(typeof err === "string" ? err : `Connection failed for ${type}`);
+    } finally {
+      setTestingLocal(null);
+    }
   };
 
   const handleSave = async () => {
     setSaving(true);
-    setValidationError(null);
-    setValidationSuccess(null);
-
-    // Validate active provider keys if in cloud mode
-    if (config.provider === "cloud") {
-      const activeKey = config.api_keys[config.cloud_provider] || "";
-      if (activeKey.trim()) {
-        const isValid = await validateApiKey(config.cloud_provider, activeKey);
-        if (!isValid) {
-          setSaving(false);
-          return;
-        }
-      }
-    }
+    setError(null);
+    setSuccess(null);
 
     try {
       await invoke("save_config", { config });
-      setValidationSuccess("Settings saved successfully!");
-      
-      // Dispatch custom update event so ChatPanel re-polls
+      setSuccess("Settings saved");
       window.dispatchEvent(new CustomEvent("__integradedConfigUpdated"));
-
-      setTimeout(() => {
-        onClose();
-      }, 1000);
+      setTimeout(onClose, 800);
     } catch (err: any) {
-      setValidationError(err || "Failed to save configuration");
+      setError(err || "Failed to save");
     } finally {
       setSaving(false);
     }
@@ -232,10 +266,10 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
   if (loading) {
     return (
       <div className="dialog-overlay">
-        <div className="dialog-box settings-dialog glassmorphic">
-          <div className="settings-loading">
+        <div className="stng-dialog">
+          <div className="stng-loading">
             <i className="bx bx-loader-alt bx-spin" />
-            <span>Loading Workspace Config...</span>
+            <span>Loading configuration...</span>
           </div>
         </div>
       </div>
@@ -244,165 +278,253 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
 
   return (
     <div className="dialog-overlay" onClick={onClose}>
-      <div className="dialog-box settings-dialog glassmorphic" onClick={(e) => e.stopPropagation()}>
-        <div className="dialog-header">
-          <div className="settings-header-title">
-            <i className="bx bx-cog" />
-            <span className="dialog-title">Integraded Workspace Settings</span>
+      <div className="stng-dialog" onClick={e => e.stopPropagation()}>
+        {/* ── Header ── */}
+        <div className="stng-header">
+          <div className="stng-header-left">
+            <div className="stng-header-icon"><i className="bx bx-cog" /></div>
+            <div>
+              <span className="stng-header-title">Settings</span>
+              <span className="stng-header-sub">Integraded Workspace</span>
+            </div>
           </div>
-          <button className="dialog-close" onClick={onClose}>
-            <i className="bx bx-x" />
-          </button>
+          <button className="stng-close" onClick={onClose}><i className="bx bx-x" /></button>
         </div>
 
-        {/* Tab Selection */}
-        <div className="settings-tabs">
-          <button
-            className={`settings-tab-btn ${activeTab === "general" ? "active" : ""}`}
-            onClick={() => setActiveTab("general")}
-          >
-            <i className="bx bx-slider" />
-            General & Providers
-          </button>
-          <button
-            className={`settings-tab-btn ${activeTab === "keys" ? "active" : ""}`}
-            onClick={() => setActiveTab("keys")}
-          >
-            <i className="bx bx-key" />
-            API Keys Security
-          </button>
+        {/* ── Tabs ── */}
+        <div className="stng-tabs">
+          {TABS.map(tab => (
+            <button
+              key={tab.id}
+              type="button"
+              className={`stng-tab ${activeTab === tab.id ? "active" : ""}`}
+              onClick={() => { setActiveTab(tab.id); setError(null); setSuccess(null); }}
+            >
+              <i className={`bx ${tab.icon}`} />
+              <span>{tab.label}</span>
+            </button>
+          ))}
         </div>
 
-        <div className="dialog-body settings-body">
-          {validationError && (
-            <div className="settings-alert error">
-              <i className="bx bx-error-circle" />
-              <span>{validationError}</span>
+        {/* ── Body ── */}
+        <div className="stng-body">
+          {error && (
+            <div className="stng-alert err">
+              <i className="bx bx-error-circle" /><span>{error}</span>
+            </div>
+          )}
+          {success && (
+            <div className="stng-alert ok">
+              <i className="bx bx-check-circle" /><span>{success}</span>
             </div>
           )}
 
-          {validationSuccess && (
-            <div className="settings-alert success">
-              <i className="bx bx-check-circle" />
-              <span>{validationSuccess}</span>
+          {/* ─── TAB: API Keys ─── */}
+          {activeTab === "keys" && (
+            <div className="stng-tab-content">
+              <div className="stng-section">
+                <div className="stng-section-header">
+                  <i className="bx bx-key" />
+                  <span>API Keys</span>
+                </div>
+                <div className="stng-section-body">
+                  <p className="stng-section-desc">
+                    Keys are encrypted at rest. Click <strong>Verify</strong> to test a key before saving.
+                  </p>
+                  {CLOUD_PROVIDERS.map(prov => {
+                    const keyVal = config.api_keys[prov.id] || "";
+                    const status = keyStatus[prov.id];
+                    return (
+                      <div key={prov.id} className="stng-api-key-row">
+                        <div className="stng-api-key-header">
+                          <i className={`bx ${prov.icon}`} />
+                          <span>{prov.name}</span>
+                          {status === "ok" && <span className="stng-key-badge ok"><i className="bx bx-check" /></span>}
+                          {status === "err" && <span className="stng-key-badge err"><i className="bx bx-x" /></span>}
+                          {!keyVal && !status && <span className="stng-key-badge none">Not set</span>}
+                        </div>
+                        <div className="stng-api-key-input-row">
+                          <input
+                            type="password"
+                            className="stng-input"
+                            value={keyVal}
+                            onChange={e => updateKey(prov.id, e.target.value)}
+                            placeholder={prov.keyPlaceholder}
+                          />
+                          <button
+                            type="button"
+                            className="stng-btn stng-btn-ghost stng-btn-sm"
+                            onClick={() => {
+                              const k = config.api_keys[prov.id] || "";
+                              if (k.trim()) validateKey(prov.id, k);
+                            }}
+                            disabled={!keyVal.trim() || validating === prov.id}
+                          >
+                            {validating === prov.id ? (
+                              <i className="bx bx-loader-alt bx-spin" />
+                            ) : (
+                              "Verify"
+                            )}
+                          </button>
+                        </div>
+                        <a className="stng-key-docs" href={prov.docsUrl} target="_blank" rel="noopener noreferrer">
+                          <i className="bx bx-link-external" /> Get API key
+                        </a>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* ── Local Providers ── */}
+              <div className="stng-section">
+                <div className="stng-section-header">
+                  <i className="bx bx-desktop" />
+                  <span>Local Providers</span>
+                </div>
+                <div className="stng-section-body">
+                  <p className="stng-section-desc">
+                    Configure custom endpoints for local servers. Changes take effect immediately.
+                  </p>
+
+                  {/* LM Studio */}
+                  <div className="stng-api-key-row">
+                    <div className="stng-api-key-header">
+                      <i className="bx bx-desktop" />
+                      <span>LM Studio</span>
+                      {localStatus.lmstudio === "ok" && <span className="stng-key-badge ok">Online</span>}
+                      {localStatus.lmstudio === "err" && <span className="stng-key-badge err">Offline</span>}
+                    </div>
+                    <div className="stng-api-key-input-row">
+                      <input
+                        type="text"
+                        className="stng-input"
+                        value={config.lmstudio_url}
+                        onChange={e => setConfig(prev => ({ ...prev, lmstudio_url: e.target.value }))}
+                        placeholder="http://localhost:1234"
+                      />
+                      <button
+                        type="button"
+                        className="stng-btn stng-btn-ghost stng-btn-sm"
+                        onClick={() => testLocalConnection("lmstudio")}
+                        disabled={testingLocal === "lmstudio"}
+                      >
+                        {testingLocal === "lmstudio" ? (
+                          <i className="bx bx-loader-alt bx-spin" />
+                        ) : (
+                          "Test"
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Ollama */}
+                  <div className="stng-api-key-row">
+                    <div className="stng-api-key-header">
+                      <i className="bx bx-data" />
+                      <span>Ollama</span>
+                      {localStatus.ollama === "ok" && <span className="stng-key-badge ok">Online</span>}
+                      {localStatus.ollama === "err" && <span className="stng-key-badge err">Offline</span>}
+                    </div>
+                    <div className="stng-api-key-input-row">
+                      <input
+                        type="text"
+                        className="stng-input"
+                        value={config.ollama_url}
+                        onChange={e => setConfig(prev => ({ ...prev, ollama_url: e.target.value }))}
+                        placeholder="http://localhost:11434"
+                      />
+                      <button
+                        type="button"
+                        className="stng-btn stng-btn-ghost stng-btn-sm"
+                        onClick={() => testLocalConnection("ollama")}
+                        disabled={testingLocal === "ollama"}
+                      >
+                        {testingLocal === "ollama" ? (
+                          <i className="bx bx-loader-alt bx-spin" />
+                        ) : (
+                          "Test"
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
 
-          {activeTab === "general" ? (
-            <div className="settings-section">
-              {/* Custom Selector for Provider Selection */}
-              <CustomSelect
-                label="Primary AI Provider"
-                value={config.provider}
-                onChange={(val) => handleChange("provider", val)}
-                options={[
-                  { value: "cloud", label: "Cloud Provider (OpenAI, Anthropic, DeepSeek)" },
-                  { value: "lmstudio", label: "LM Studio (Local Server)" },
-                  { value: "ollama", label: "Ollama (Local Server)" },
-                ]}
-              />
-
-              {/* Custom Selector for Cloud Coordinator */}
-              {config.provider === "cloud" && (
-                <CustomSelect
-                  label="Cloud Coordinator"
-                  value={config.cloud_provider}
-                  onChange={(val) => handleChange("cloud_provider", val)}
-                  options={[
-                    { value: "openai", label: "OpenAI (GPT-4o, GPT-4o-Mini)" },
-                    { value: "anthropic", label: "Anthropic (Claude 3.5 Sonnet)" },
-                    { value: "deepseek", label: "DeepSeek (DeepSeek V3, R1)" },
-                  ]}
-                />
-              )}
-
-              {config.provider === "lmstudio" && (
-                <div className="settings-field">
-                  <label className="settings-label">LM Studio Base URL</label>
-                  <input
-                    type="text"
-                    className="settings-input"
-                    value={config.lmstudio_url}
-                    onChange={(e) => handleChange("lmstudio_url", e.target.value)}
-                    placeholder="http://localhost:1234"
-                  />
-                  <span className="settings-help">Custom endpoint base address for local LM Studio instances.</span>
+          {/* ─── TAB: Behavior ─── */}
+          {activeTab === "behavior" && (
+            <div className="stng-tab-content">
+              <div className="stng-section">
+                <div className="stng-section-header">
+                  <i className="bx bx-slider" />
+                  <span>Response Behavior</span>
                 </div>
-              )}
-
-              {config.provider === "ollama" && (
-                <div className="settings-field">
-                  <label className="settings-label">Ollama Base URL</label>
-                  <input
-                    type="text"
-                    className="settings-input"
-                    value={config.ollama_url}
-                    onChange={(e) => handleChange("ollama_url", e.target.value)}
-                    placeholder="http://localhost:11434"
+                <div className="stng-section-body">
+                  <Toggle
+                    label="Streaming responses"
+                    desc="Show AI responses word-by-word as they generate instead of waiting for the full response"
+                    checked={config.streaming}
+                    onChange={v => setConfig(prev => ({ ...prev, streaming: v }))}
                   />
-                  <span className="settings-help">Custom endpoint base address for local Ollama instances.</span>
                 </div>
-              )}
+              </div>
             </div>
-          ) : (
-            <div className="settings-section">
-              <div className="settings-field">
-                <label className="settings-label">OpenAI API Key</label>
-                <div className="settings-password-input">
-                  <input
-                    type="password"
-                    className="settings-input"
-                    value={config.api_keys["openai"] || ""}
-                    onChange={(e) => handleKeyChange("openai", e.target.value)}
-                    placeholder="sk-proj-..."
-                  />
-                </div>
-              </div>
+          )}
 
-              <div className="settings-field">
-                <label className="settings-label">Anthropic API Key</label>
-                <div className="settings-password-input">
-                  <input
-                    type="password"
-                    className="settings-input"
-                    value={config.api_keys["anthropic"] || ""}
-                    onChange={(e) => handleKeyChange("anthropic", e.target.value)}
-                    placeholder="sk-ant-..."
-                  />
+          {/* ─── TAB: Appearance ─── */}
+          {activeTab === "appearance" && (
+            <div className="stng-tab-content">
+              <div className="stng-section">
+                <div className="stng-section-header">
+                  <i className="bx bx-palette" />
+                  <span>Theme</span>
                 </div>
-              </div>
-
-              <div className="settings-field">
-                <label className="settings-label">DeepSeek API Key</label>
-                <div className="settings-password-input">
-                  <input
-                    type="password"
-                    className="settings-input"
-                    value={config.api_keys["deepseek"] || ""}
-                    onChange={(e) => handleKeyChange("deepseek", e.target.value)}
-                    placeholder="sk-ds-..."
-                  />
+                <div className="stng-section-body">
+                  <p className="stng-section-desc">
+                    Choose how Integraded looks. Auto follows your system preference.
+                  </p>
+                  <div className="theme-picker">
+                    <button
+                      type="button"
+                      className={`theme-option ${themeMode === "dark" ? "active" : ""}`}
+                      onClick={() => changeTheme("dark")}
+                    >
+                      <i className="bx bx-moon" />
+                      Dark
+                    </button>
+                    <button
+                      type="button"
+                      className={`theme-option ${themeMode === "light" ? "active" : ""}`}
+                      onClick={() => changeTheme("light")}
+                    >
+                      <i className="bx bx-sun" />
+                      Light
+                    </button>
+                    <button
+                      type="button"
+                      className={`theme-option ${themeMode === "auto" ? "active" : ""}`}
+                      onClick={() => changeTheme("auto")}
+                    >
+                      <i className="bx bx-adjust" />
+                      Auto
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
           )}
         </div>
 
-        <div className="dialog-footer">
-          <button className="btn btn-ghost" onClick={onClose} disabled={saving}>
-            Cancel
-          </button>
-          <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
+        {/* ── Footer ── */}
+        <div className="stng-footer">
+          <button className="stng-btn stng-btn-ghost" onClick={onClose} disabled={saving}>Cancel</button>
+          <button className="stng-btn stng-btn-primary" onClick={handleSave} disabled={saving}>
             {saving ? (
-              <>
-                <i className="bx bx-loader-alt bx-spin" />
-                Validating & Saving...
-              </>
+              <><i className="bx bx-loader-alt bx-spin" /> Saving...</>
             ) : (
-              <>
-                <i className="bx bx-save" />
-                Save Settings
-              </>
+              <><i className="bx bx-save" /> Save Changes</>
             )}
           </button>
         </div>

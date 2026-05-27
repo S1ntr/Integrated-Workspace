@@ -52,7 +52,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
     e.stopPropagation(); // don't toggle when clicking + / -
     setCounts(prev => ({
       ...prev,
-      [key]: Math.max(0, Math.min(4, prev[key] + delta)),
+      [key]: Math.max(0, Math.min(16, prev[key] + delta)),
     }));
   };
 
