@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 interface SettingsDialogProps {
   onClose: () => void;
@@ -20,7 +21,8 @@ interface AppConfig {
 interface CloudProviderDef {
   id: string;
   name: string;
-  icon: string;
+  iconUrl: string;
+  short: string;
   baseUrl: string;
   keyPlaceholder: string;
   docsUrl: string;
@@ -29,62 +31,93 @@ interface CloudProviderDef {
 
 const CLOUD_PROVIDERS: CloudProviderDef[] = [
   {
-    id: "openai", name: "OpenAI", icon: "bxl-openai",
+    id: "openai", name: "OpenAI",
+    iconUrl: "https://www.google.com/s2/favicons?domain=platform.openai.com&sz=64",
+    short: "AI",
     baseUrl: "https://api.openai.com/v1/chat/completions",
     keyPlaceholder: "sk-proj-...",
     docsUrl: "https://platform.openai.com/api-keys",
     authScheme: "bearer",
   },
   {
-    id: "anthropic", name: "Anthropic", icon: "bxl-tailwind-css",
+    id: "anthropic", name: "Anthropic",
+    iconUrl: "https://www.google.com/s2/favicons?domain=anthropic.com&sz=64",
+    short: "A",
     baseUrl: "https://api.anthropic.com/v1/messages",
     keyPlaceholder: "sk-ant-...",
     docsUrl: "https://console.anthropic.com/settings/keys",
     authScheme: "anthropic",
   },
   {
-    id: "deepseek", name: "DeepSeek", icon: "bx-chip",
+    id: "deepseek", name: "DeepSeek",
+    iconUrl: "https://www.google.com/s2/favicons?domain=deepseek.com&sz=64",
+    short: "D",
     baseUrl: "https://api.deepseek.com/chat/completions",
     keyPlaceholder: "sk-...",
-    docsUrl: "https://platform.deepseek.com/api-keys",
+    docsUrl: "https://platform.deepseek.com/api_keys",
     authScheme: "bearer",
   },
   {
-    id: "mistral", name: "Mistral", icon: "bx-wind",
+    id: "mistral", name: "Mistral",
+    iconUrl: "https://www.google.com/s2/favicons?domain=mistral.ai&sz=64",
+    short: "M",
     baseUrl: "https://api.mistral.ai/v1/chat/completions",
     keyPlaceholder: "MISTRAL_...",
     docsUrl: "https://console.mistral.ai/api-keys",
     authScheme: "bearer",
   },
   {
-    id: "google", name: "Google Gemini", icon: "bxl-google",
+    id: "google", name: "Google Gemini",
+    iconUrl: "https://www.google.com/s2/favicons?domain=aistudio.google.com&sz=64",
+    short: "G",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
     keyPlaceholder: "AIza...",
     docsUrl: "https://aistudio.google.com/apikey",
     authScheme: "gemini",
   },
   {
-    id: "grok", name: "Grok (xAI)", icon: "bx-bolt",
+    id: "grok", name: "Grok (xAI)",
+    iconUrl: "https://www.google.com/s2/favicons?domain=x.ai&sz=64",
+    short: "xAI",
     baseUrl: "https://api.x.ai/v1/chat/completions",
     keyPlaceholder: "xai-...",
     docsUrl: "https://console.x.ai",
     authScheme: "bearer",
   },
   {
-    id: "together", name: "Together AI", icon: "bx-group",
+    id: "together", name: "Together AI",
+    iconUrl: "https://www.google.com/s2/favicons?domain=together.ai&sz=64",
+    short: "T",
     baseUrl: "https://api.together.xyz/v1/chat/completions",
     keyPlaceholder: "tgp_...",
-    docsUrl: "https://api.together.xyz/settings/api-keys",
+    docsUrl: "https://api.together.ai/settings/projects/~current/api-keys",
     authScheme: "bearer",
   },
   {
-    id: "openrouter", name: "OpenRouter", icon: "bx-git-branch",
+    id: "openrouter", name: "OpenRouter",
+    iconUrl: "https://www.google.com/s2/favicons?domain=openrouter.ai&sz=64",
+    short: "OR",
     baseUrl: "https://openrouter.ai/api/v1/chat/completions",
     keyPlaceholder: "sk-or-...",
-    docsUrl: "https://openrouter.ai/keys",
+    docsUrl: "https://openrouter.ai/settings/keys",
     authScheme: "bearer",
   },
 ];
+
+const ProviderLogo: React.FC<{ provider: CloudProviderDef }> = ({ provider }) => (
+  <span className="stng-provider-logo" aria-hidden="true">
+    <img
+      src={provider.iconUrl}
+      alt=""
+      draggable={false}
+      onError={event => {
+        event.currentTarget.style.display = "none";
+        event.currentTarget.parentElement?.classList.add("fallback");
+      }}
+    />
+    <span>{provider.short}</span>
+  </span>
+);
 
 // ── Toggle Switch ──
 interface ToggleProps {
@@ -193,6 +226,15 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
       api_keys: { ...prev.api_keys, [provider]: val },
     }));
     setKeyStatus(prev => ({ ...prev, [provider]: null }));
+  };
+
+  const openProviderDocs = async (url: string) => {
+    try {
+      await openUrl(url);
+    } catch (err) {
+      console.warn("Failed to open provider docs via Tauri opener:", err);
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
   };
 
   const validateKey = async (cloudProv: string, key: string): Promise<boolean> => {
@@ -341,7 +383,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                     return (
                       <div key={prov.id} className="stng-api-key-row">
                         <div className="stng-api-key-header">
-                          <i className={`bx ${prov.icon}`} />
+                          <ProviderLogo provider={prov} />
                           <span>{prov.name}</span>
                           {status === "ok" && <span className="stng-key-badge ok"><i className="bx bx-check" /></span>}
                           {status === "err" && <span className="stng-key-badge err"><i className="bx bx-x" /></span>}
@@ -371,9 +413,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                             )}
                           </button>
                         </div>
-                        <a className="stng-key-docs" href={prov.docsUrl} target="_blank" rel="noopener noreferrer">
+                        <button type="button" className="stng-key-docs" onClick={() => openProviderDocs(prov.docsUrl)}>
                           <i className="bx bx-link-external" /> Get API key
-                        </a>
+                        </button>
                       </div>
                     );
                   })}

@@ -2022,9 +2022,9 @@ input, textarea { font-family: var(--font-ui); }
    ╚════════════════════════════════════════════╝ */
 
 .stng-dialog {
-  width: 600px; max-width: 95vw; max-height: 88vh;
+  width: min(780px, calc(100vw - 48px)); max-width: none; max-height: min(860px, calc(100vh - 48px));
   background: var(--bg-1); border: 1px solid var(--bg-5);
-  border-radius: var(--radius-lg); box-shadow: var(--shadow-xl);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow-xl);
   display: flex; flex-direction: column; overflow: hidden;
   animation: scaleIn 0.14s ease;
 }
@@ -2037,7 +2037,7 @@ input, textarea { font-family: var(--font-ui); }
 .stng-header-left { display: flex; align-items: center; gap: 12px; }
 .stng-header-icon {
   width: 32px; height: 32px; background: var(--bg-2); border: 1px solid var(--bg-4);
-  border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-xs); display: flex; align-items: center; justify-content: center;
   font-size: 15px; color: var(--text-2);
 }
 .stng-header-title { font-size: 14px; font-weight: 600; color: var(--text-1); display: block; }
@@ -2094,10 +2094,28 @@ input, textarea { font-family: var(--font-ui); }
 .stng-section-desc { font-size: 11.5px; color: var(--text-3); line-height: 1.55; }
 
 /* API key rows */
-.stng-api-key-row { display: flex; flex-direction: column; gap: 6px; padding: 10px 0; border-bottom: 1px solid var(--bg-4); }
-.stng-api-key-row:last-child { border-bottom: none; }
-.stng-api-key-header { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 500; color: var(--text-1); }
-.stng-api-key-header i { font-size: 14px; color: var(--text-2); width: 16px; text-align: center; }
+.stng-api-key-row {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px; background: var(--bg-base);
+  border: 1px solid var(--bg-4); border-radius: var(--radius-xs);
+}
+.stng-api-key-row:last-child { border-bottom: 1px solid var(--bg-4); }
+.stng-api-key-header { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 500; color: var(--text-1); }
+.stng-api-key-header > i { font-size: 14px; color: var(--text-2); width: 16px; text-align: center; }
+.stng-provider-logo {
+  width: 22px; height: 22px; flex: 0 0 22px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-2); border: 1px solid var(--bg-5);
+  border-radius: 5px; overflow: hidden;
+}
+.stng-provider-logo img { width: 16px; height: 16px; object-fit: contain; display: block; }
+.stng-provider-logo span { display: none; }
+.stng-provider-logo.fallback img { display: none; }
+.stng-provider-logo.fallback span {
+  display: block;
+  font-family: var(--font-mono); font-size: 8.5px; font-weight: 700;
+  color: var(--text-2);
+}
 .stng-key-badge {
   font-size: 9px; font-weight: 600; padding: 1px 6px; border-radius: 2px;
   margin-left: auto;
@@ -2120,8 +2138,11 @@ input, textarea { font-family: var(--font-ui); }
 .stng-input[type="text"] { font-family: var(--font-mono); }
 
 .stng-key-docs {
-  display: flex; align-items: center; gap: 5px;
-  font-size: 10.5px; color: var(--text-3);
+  display: flex; align-items: center; gap: 5px; width: max-content;
+  padding: 0; background: transparent; border: none;
+  font-family: var(--font-ui); font-size: 10px; font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text-3); cursor: pointer;
   transition: color 0.1s;
 }
 .stng-key-docs:hover { color: var(--text-1); }
