@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import type { BrowserOpenRequest } from "../types/browser";
+import type { BrowserOpenRequest, ChatAttachment, ExternalChatPrompt } from "../types/browser";
 
+type BrowserMode = "app" | "web";
 type BrowserTool = "browse" | "point" | "region";
 
 interface BrowserSelection {
@@ -18,18 +19,18 @@ interface BrowserOverlayProps {
   suggestedUrls?: string[];
   workspaceName?: string;
   onClose: () => void;
-  onSendToChat: (text: string) => void;
+  onSendToChat: (prompt: Omit<ExternalChatPrompt, "id">) => void;
 }
 
 const DEVICE_PRESETS = [
-  { key: "responsive", label: "Responsive", icon: "bx-expand", width: 0, height: 0 },
-  { key: "desktop", label: "Desktop", icon: "bx-desktop", width: 1440, height: 900 },
-  { key: "macos", label: "macOS", icon: "bx-laptop", width: 1280, height: 832 },
-  { key: "windows", label: "Windows", icon: "bx-window", width: 1366, height: 768 },
-  { key: "linux", label: "Linux", icon: "bx-terminal", width: 1366, height: 768 },
-  { key: "iphone", label: "iPhone", icon: "bx-mobile", width: 390, height: 844 },
-  { key: "android", label: "Android", icon: "bx-mobile-alt", width: 412, height: 915 },
-  { key: "tablet", label: "Tablet", icon: "bx-tablet", width: 820, height: 1180 },
+  { key: "responsive", label: "Responsive", width: 0, height: 0 },
+  { key: "desktop", label: "Desktop", width: 1440, height: 900 },
+  { key: "macos", label: "macOS", width: 1280, height: 832 },
+  { key: "windows", label: "Windows", width: 1366, height: 768 },
+  { key: "linux", label: "Linux", width: 1366, height: 768 },
+  { key: "iphone", label: "iPhone", width: 390, height: 844 },
+  { key: "android", label: "Android", width: 412, height: 915 },
+  { key: "tablet", label: "Tablet", width: 820, height: 1180 },
 ];
 
 function normalizeUrl(raw: string): string {
@@ -39,11 +40,26 @@ function normalizeUrl(raw: string): string {
   if (/^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(\/.*)?$/i.test(value)) {
     return `http://${value.replace(/^0\.0\.0\.0/i, "127.0.0.1")}`;
   }
+  if (/\s/.test(value) || (!value.includes(".") && !value.includes(":"))) {
+    return `https://www.google.com/search?q=${encodeURIComponent(value)}`;
+  }
   return `https://${value}`;
+}
+
+function isLocalUrl(url: string): boolean {
+  return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?/i.test(url);
 }
 
 function compactUrl(url: string): string {
   return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
@@ -58,6 +74,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   const viewportRef = useRef<HTMLDivElement>(null);
   const handledRequestRef = useRef<string | null>(null);
 
+  const [mode, setMode] = useState<BrowserMode>("app");
   const [address, setAddress] = useState("");
   const [currentUrl, setCurrentUrl] = useState("");
   const [history, setHistory] = useState<string[]>([]);
@@ -72,6 +89,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   const [note, setNote] = useState("");
   const [sentHint, setSentHint] = useState("");
   const [frameTitle, setFrameTitle] = useState("");
+  const [nativeHint, setNativeHint] = useState("");
 
   const preset = useMemo(
     () => DEVICE_PRESETS.find(item => item.key === device) || DEVICE_PRESETS[0],
@@ -90,10 +108,13 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   useEffect(() => {
     if (!open || !request || handledRequestRef.current === request.id) return;
     handledRequestRef.current = request.id;
+    if (request.mode) setMode(request.mode);
     if (request.device && DEVICE_PRESETS.some(item => item.key === request.device)) {
       setDevice(request.device);
     }
     if (request.url) {
+      const normalized = normalizeUrl(request.url);
+      setMode(request.mode || (isLocalUrl(normalized) ? "app" : "web"));
       navigateTo(request.url);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -118,16 +139,17 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
 
   if (!open) return null;
 
-  function navigateTo(raw: string, mode: "push" | "replace" = "push") {
+  function navigateTo(raw: string, navMode: "push" | "replace" = "push") {
     const next = normalizeUrl(raw);
     if (!next) return;
     setAddress(next);
     setCurrentUrl(next);
     setLoading(true);
+    setNativeHint("");
     setSelection(null);
     setDraft(null);
     setFrameTitle("");
-    if (mode === "replace" || historyIndex < 0) {
+    if (navMode === "replace" || historyIndex < 0) {
       setHistory([next]);
       setHistoryIndex(0);
     } else {
@@ -156,6 +178,32 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     if (!currentUrl) return;
     setLoading(true);
     setFrameKey(key => key + 1);
+  }
+
+  async function openNativeWindow(raw = currentUrl || address) {
+    const url = normalizeUrl(raw);
+    if (!url) return;
+    setNativeHint("Opening native webview...");
+    try {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      const label = `integraded-browser-${Date.now()}`;
+      const webview = new WebviewWindow(label, {
+        url,
+        title: `Integraded Browser - ${compactUrl(url)}`,
+        width: 1280,
+        height: 820,
+        center: true,
+        resizable: true,
+        decorations: true,
+        focus: true,
+        incognito: mode === "app",
+      });
+      await webview.once("tauri://created", () => setNativeHint("Opened in native webview"));
+      await webview.once("tauri://error", () => setNativeHint("Native webview could not be opened"));
+    } catch {
+      setNativeHint("Native webview is available only inside the Tauri app");
+    }
+    setTimeout(() => setNativeHint(""), 2600);
   }
 
   function readElementInfo(x: number, y: number): string | undefined {
@@ -193,6 +241,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     event.preventDefault();
     const point = pointFromEvent(event);
     setDragStart(point);
+    setNote("");
     const next: BrowserSelection = {
       kind: tool === "point" ? "element" : "region",
       x: point.x,
@@ -240,7 +289,42 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     setDragStart(null);
   }
 
-  function buildChatPrompt() {
+  function makeSelectionAttachment(): ChatAttachment | undefined {
+    if (!selection) return undefined;
+    const viewport = viewportRef.current?.getBoundingClientRect();
+    const width = Math.round(viewport?.width || preset.width || 0);
+    const height = Math.round(viewport?.height || preset.height || 0);
+    const scale = 0.35;
+    const canvasWidth = Math.max(360, Math.min(760, Math.round(width * scale)));
+    const canvasHeight = Math.max(220, Math.min(520, Math.round(height * scale)));
+    const sx = Math.round(selection.x * (canvasWidth / Math.max(width, 1)));
+    const sy = Math.round(selection.y * (canvasHeight / Math.max(height, 1)));
+    const sw = Math.max(8, Math.round(selection.width * (canvasWidth / Math.max(width, 1))));
+    const sh = Math.max(8, Math.round(selection.height * (canvasHeight / Math.max(height, 1))));
+    const title = escapeXml(frameTitle || compactUrl(currentUrl) || "Browser selection");
+    const url = escapeXml(currentUrl || "not opened");
+    const bounds = escapeXml(`${selection.kind} x=${Math.round(selection.x)} y=${Math.round(selection.y)} w=${Math.round(selection.width)} h=${Math.round(selection.height)} viewport=${width}x${height}`);
+    const svg = [
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}">`,
+      `<rect width="100%" height="100%" fill="#111"/>`,
+      `<rect x="10" y="10" width="${canvasWidth - 20}" height="${canvasHeight - 20}" rx="8" fill="#f8f8f8"/>`,
+      `<text x="24" y="34" font-family="monospace" font-size="13" fill="#222">${title}</text>`,
+      `<text x="24" y="54" font-family="monospace" font-size="10" fill="#666">${url}</text>`,
+      `<rect x="${sx}" y="${sy}" width="${sw}" height="${sh}" fill="rgba(251,191,36,0.22)" stroke="#f59e0b" stroke-width="3"/>`,
+      `<text x="24" y="${canvasHeight - 28}" font-family="monospace" font-size="10" fill="#333">${bounds}</text>`,
+      `</svg>`,
+    ].join("");
+    return {
+      id: `sel-${Date.now()}`,
+      type: "browser-selection",
+      name: "browser-selection.svg",
+      mime: "image/svg+xml",
+      url: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`,
+      detail: `${selection.kind} selection on ${currentUrl || "browser"} (${bounds})`,
+    };
+  }
+
+  function buildChatPayload(): Omit<ExternalChatPrompt, "id"> {
     const viewport = viewportRef.current?.getBoundingClientRect();
     const width = Math.round(viewport?.width || preset.width || 0);
     const height = Math.round(viewport?.height || preset.height || 0);
@@ -251,29 +335,47 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
           selection.elementInfo ? `Element: ${selection.elementInfo}` : "Element: unavailable, likely cross-origin iframe",
         ].join("\n")
       : "Selection: none";
+    const attachment = makeSelectionAttachment();
 
-    return [
-      "Browser feedback from the integrated web browser.",
-      `URL: ${currentUrl || "not opened"}`,
-      `Title: ${frameTitle || "unknown"}`,
-      `Device preset: ${preset.label}${width && height ? ` (${width}x${height})` : ""}`,
-      selected,
-      "",
-      `User request: ${note.trim() || "Inspect this view and propose the right fix."}`,
-      "",
-      "Use the terminal transcript, project files, and tool calls to split the fix between CLI agents. If this needs more detail, ask me before changing behavior.",
-    ].join("\n");
+    return {
+      text: [
+        "Browser feedback from the integrated browser.",
+        `Mode: ${mode === "app" ? "sandboxed app preview" : "web browsing"}`,
+        `URL: ${currentUrl || "not opened"}`,
+        `Title: ${frameTitle || "unknown"}`,
+        `Device preset: ${mode === "app" ? `${preset.label}${width && height ? ` (${width}x${height})` : ""}` : "browser window"}`,
+        selected,
+        "",
+        `User request: ${note.trim() || "Inspect this view and propose the right fix."}`,
+        "",
+        "Use project files, terminal transcripts, and tool calls. Split the work between available CLI agents when it makes sense. If a mentioned file or selected region matters, make the receiving agent inspect it before editing.",
+      ].join("\n"),
+      attachments: attachment ? [attachment] : undefined,
+    };
   }
 
   function sendToChat() {
-    const prompt = buildChatPrompt();
-    onSendToChat(prompt);
+    const payload = buildChatPayload();
+    onSendToChat(payload);
     setSentHint("Sent to chat");
     setTimeout(() => setSentHint(""), 1800);
   }
 
+  function popoverStyle(): React.CSSProperties {
+    if (!selection) return {};
+    const viewport = viewportRef.current?.getBoundingClientRect();
+    const vw = viewport?.width || 360;
+    const vh = viewport?.height || 260;
+    const left = Math.min(Math.max(10, selection.x + selection.width + 10), Math.max(10, vw - 304));
+    const top = Math.min(Math.max(10, selection.y), Math.max(10, vh - 190));
+    return { left, top };
+  }
+
   const selectionBox = draft || selection;
   const hasUrl = Boolean(currentUrl);
+  const sandboxPolicy = mode === "app"
+    ? "allow-same-origin allow-scripts allow-forms allow-modals allow-popups allow-downloads allow-pointer-lock allow-presentation"
+    : undefined;
 
   return (
     <div className="browser-overlay" role="dialog" aria-modal="true" aria-label="Integrated browser">
@@ -294,12 +396,12 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
         </div>
 
         <div className="browser-toolbar">
-          <div className="browser-nav">
+          <div className="browser-nav" aria-label="Navigation">
             <button type="button" className="browser-icon-btn" disabled={historyIndex <= 0} onClick={() => go(-1)} title="Back">
-              <i className="bx bx-left-arrow-alt" />
+              <i className="bx bx-chevron-left" />
             </button>
             <button type="button" className="browser-icon-btn" disabled={historyIndex >= history.length - 1} onClick={() => go(1)} title="Forward">
-              <i className="bx bx-right-arrow-alt" />
+              <i className="bx bx-chevron-right" />
             </button>
             <button type="button" className="browser-icon-btn" disabled={!currentUrl} onClick={reload} title="Reload">
               <i className={`bx bx-refresh ${loading ? "spin" : ""}`} />
@@ -307,74 +409,90 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
           </div>
 
           <form className="browser-address" onSubmit={event => { event.preventDefault(); navigateTo(address); }}>
-            <i className="bx bx-lock-alt" />
+            <i className={`bx ${mode === "app" ? "bx-shield-quarter" : "bx-search-alt-2"}`} />
             <input
               value={address}
               onChange={event => setAddress(event.target.value)}
-              placeholder="Search or enter URL, e.g. localhost:3000"
+              placeholder={mode === "app" ? "localhost:3000 or app URL" : "Search or enter a website"}
             />
             <button type="submit" title="Open">
               <i className="bx bx-right-arrow-alt" />
             </button>
           </form>
 
+          <div className="browser-mode-switch" aria-label="Browser mode">
+            <button type="button" className={mode === "app" ? "active" : ""} onClick={() => setMode("app")} title="Sandboxed app preview">
+              App
+            </button>
+            <button type="button" className={mode === "web" ? "active" : ""} onClick={() => setMode("web")} title="Web browsing">
+              Web
+            </button>
+          </div>
+
           <div className="browser-tool-group" aria-label="Browser tools">
-            <button type="button" className={`browser-tool-btn ${tool === "browse" ? "active" : ""}`} onClick={() => setTool("browse")} title="Browse mode">
-              <i className="bx bx-pointer" />
+            <button type="button" className={`browser-tool-btn ${tool === "browse" ? "active" : ""}`} onClick={() => setTool("browse")} title="Interact with page">
+              Browse
             </button>
             <button type="button" className={`browser-tool-btn ${tool === "point" ? "active" : ""}`} onClick={() => setTool("point")} title="Select element">
-              <i className="bx bx-crosshair" />
+              Pick
             </button>
             <button type="button" className={`browser-tool-btn ${tool === "region" ? "active" : ""}`} onClick={() => setTool("region")} title="Select region">
-              <i className="bx bx-select-multiple" />
+              Area
             </button>
           </div>
 
-          <div className="browser-device-strip">
-            {DEVICE_PRESETS.map(item => (
-              <button
-                key={item.key}
-                type="button"
-                className={`browser-device-btn ${device === item.key ? "active" : ""}`}
-                onClick={() => setDevice(item.key)}
-                title={item.label}
-              >
-                <i className={`bx ${item.icon}`} />
-                <span>{item.label}</span>
-              </button>
-            ))}
-          </div>
+          {mode === "web" ? (
+            <button type="button" className="browser-native-btn" disabled={!currentUrl && !address.trim()} onClick={() => openNativeWindow()} title="Open in native Tauri webview for sites that block iframe embedding">
+              Native
+            </button>
+          ) : (
+            <div className="browser-device-strip">
+              {DEVICE_PRESETS.map(item => (
+                <button
+                  key={item.key}
+                  type="button"
+                  className={`browser-device-btn ${device === item.key ? "active" : ""}`}
+                  onClick={() => setDevice(item.key)}
+                  title={item.label}
+                >
+                  <span>{item.label}</span>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
-        {(cleanedSuggestions.length > 0 || sentHint) && (
+        {(cleanedSuggestions.length > 0 || sentHint || nativeHint) && (
           <div className="browser-suggestion-row">
             {cleanedSuggestions.map(url => (
-              <button key={url} type="button" onClick={() => navigateTo(url)}>
+              <button key={url} type="button" onClick={() => { setMode("app"); navigateTo(url); }}>
                 <i className="bx bx-link-external" />
                 {compactUrl(url)}
               </button>
             ))}
             {sentHint && <span className="browser-sent-hint">{sentHint}</span>}
+            {nativeHint && <span className="browser-sent-hint">{nativeHint}</span>}
           </div>
         )}
 
-        <div className="browser-stage">
+        <div className={`browser-stage mode-${mode}`}>
           <div
             ref={viewportRef}
-            className={`browser-viewport ${preset.width ? "device-fixed" : "device-fluid"} tool-${tool}`}
+            className={`browser-viewport ${mode === "app" && preset.width ? "device-fixed" : "device-fluid"} tool-${tool}`}
             style={{
-              ["--browser-device-width" as string]: preset.width ? `${preset.width}px` : "100%",
-              ["--browser-device-height" as string]: preset.height ? `${preset.height}px` : "100%",
+              ["--browser-device-width" as string]: mode === "app" && preset.width ? `${preset.width}px` : "100%",
+              ["--browser-device-height" as string]: mode === "app" && preset.height ? `${preset.height}px` : "100%",
             } as React.CSSProperties}
           >
             {hasUrl ? (
               <iframe
-                key={`${currentUrl}-${frameKey}`}
+                key={`${currentUrl}-${frameKey}-${mode}`}
                 ref={iframeRef}
                 className="browser-frame"
                 src={currentUrl}
                 title="Integrated browser preview"
-                allow="clipboard-read; clipboard-write; fullscreen"
+                sandbox={sandboxPolicy}
+                allow="clipboard-read; clipboard-write; fullscreen; geolocation; camera; microphone"
                 onLoad={() => {
                   setLoading(false);
                   try {
@@ -386,14 +504,24 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
               />
             ) : (
               <div className="browser-start-page">
-                <i className="bx bx-globe" />
-                <span className="browser-start-title">Open an app or website</span>
-                <span className="browser-start-sub">Use a localhost URL from your dev server, or open any web page that allows embedding.</span>
+                <i className={`bx ${mode === "app" ? "bx-shield-quarter" : "bx-globe"}`} />
+                <span className="browser-start-title">{mode === "app" ? "Open a sandboxed app preview" : "Open a website"}</span>
+                <span className="browser-start-sub">
+                  {mode === "app"
+                    ? "Use a detected localhost URL from your dev server and choose the device viewport you want to simulate."
+                    : "Search or open a URL. If a site blocks embedding, use Native to open it in a Tauri webview."}
+                </span>
                 <form className="browser-start-form" onSubmit={event => { event.preventDefault(); navigateTo(address); }}>
-                  <input value={address} onChange={event => setAddress(event.target.value)} placeholder="localhost:3000" />
+                  <input value={address} onChange={event => setAddress(event.target.value)} placeholder={mode === "app" ? "localhost:3000" : "google.com or search"} />
                   <button type="submit"><i className="bx bx-right-arrow-alt" /></button>
                 </form>
               </div>
+            )}
+
+            {mode === "web" && hasUrl && (
+              <button type="button" className="browser-native-fallback" onClick={() => openNativeWindow()}>
+                Site blocked here? Open Native
+              </button>
             )}
 
             {tool !== "browse" && (
@@ -427,38 +555,35 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                 )}
               </div>
             )}
-          </div>
 
-          <aside className="browser-inspector-panel">
-            <div className="browser-inspector-head">
-              <span>Selection</span>
-              {selection && (
-                <button type="button" onClick={() => setSelection(null)} title="Clear selection">
-                  <i className="bx bx-x" />
-                </button>
-              )}
-            </div>
-            <div className="browser-inspector-meta">
-              {selection ? (
-                <>
-                  <span>{selection.kind}</span>
-                  <span>{Math.round(selection.width)}x{Math.round(selection.height)}</span>
-                  {selection.elementInfo && <span>{selection.elementInfo}</span>}
-                </>
-              ) : (
-                <span>Use the pointer or region tool to reference part of the page.</span>
-              )}
-            </div>
-            <textarea
-              value={note}
-              onChange={event => setNote(event.target.value)}
-              placeholder="Describe what should change, what looks broken, or what the chatbot should test..."
-            />
-            <button type="button" className="browser-send-chat" onClick={sendToChat} disabled={!hasUrl && !note.trim()}>
-              <i className="bx bx-send" />
-              Send to Chat
-            </button>
-          </aside>
+            {selection && (
+              <div className="browser-selection-popover" style={popoverStyle()} onMouseDown={event => event.stopPropagation()}>
+                <div className="browser-popover-head">
+                  <span>{selection.kind === "element" ? "Element" : "Selection"}</span>
+                  <button type="button" onClick={() => setSelection(null)} title="Clear selection">
+                    <i className="bx bx-x" />
+                  </button>
+                </div>
+                <div className="browser-popover-meta">
+                  {Math.round(selection.width)}x{Math.round(selection.height)}
+                  {selection.elementInfo ? ` - ${selection.elementInfo}` : ""}
+                </div>
+                <textarea
+                  value={note}
+                  onChange={event => setNote(event.target.value)}
+                  placeholder="Describe what should change here..."
+                  autoFocus
+                />
+                <div className="browser-popover-actions">
+                  <button type="button" className="browser-popover-ghost" onClick={() => setSelection(null)}>Clear</button>
+                  <button type="button" className="browser-send-chat" onClick={sendToChat}>
+                    <i className="bx bx-send" />
+                    Send
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
