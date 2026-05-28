@@ -172,12 +172,16 @@ const CLOUD_MODELS: Record<string, { value: string; label: string }[]> = {
     { value: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
     { value: "google/gemini-2.0-flash", label: "Gemini 2.0 Flash" },
   ],
+  ollama_cloud: [
+    { value: "gpt-oss:120b", label: "GPT OSS 120B" },
+    { value: "gpt-oss:20b", label: "GPT OSS 20B" },
+  ],
 };
 
 const PROVIDER_NAMES: Record<string, string> = {
   openai: "OpenAI", anthropic: "Anthropic", deepseek: "DeepSeek",
   mistral: "Mistral", google: "Google", grok: "Grok",
-  together: "Together AI", openrouter: "OpenRouter",
+  together: "Together AI", openrouter: "OpenRouter", ollama_cloud: "Ollama Cloud",
 };
 
 // ─── Markdown helpers ─────────────────────────────────────────────────────────
@@ -230,7 +234,7 @@ function formatBody(body: string): React.ReactNode {
 
 function parseStreamDelta(line: string, provider: string): string | null {
   if (!line.trim()) return null;
-  if (provider === "ollama") {
+  if (provider === "ollama" || provider === "ollama_cloud") {
     try { const d = JSON.parse(line); return d.response || d.message?.content || null; } catch { return null; }
   }
   if (provider === "anthropic") {
@@ -247,7 +251,7 @@ function parseStreamDelta(line: string, provider: string): string | null {
 function parseStreamThinking(line: string, provider: string): string | null {
   if (!line.trim()) return null;
   try {
-    if (provider === "ollama") {
+    if (provider === "ollama" || provider === "ollama_cloud") {
       const d = JSON.parse(line);
       return d.message?.thinking || d.message?.reasoning || d.thinking || d.reasoning || null;
     }
@@ -554,7 +558,10 @@ function formatAttachmentsForPrompt(attachments?: ChatAttachment[]): string {
     if (att.path) bits.push(`path=${att.path}`);
     if (att.detail) bits.push(`detail=${att.detail}`);
     if (att.url && att.url.startsWith("data:")) bits.push("inline image attached in chat UI");
-    return `- ${bits.join(" | ")}`;
+    const content = att.content
+      ? `\n  File content:\n${att.content.split("\n").map(line => `  ${line}`).join("\n")}`
+      : "";
+    return `- ${bits.join(" | ")}${content}`;
   }).join("\n");
 }
 
@@ -706,6 +713,31 @@ function parseFileMentions(text: string, files: MentionFile[]): ChatAttachment[]
     }
   }
   return found;
+}
+
+const MAX_MENTION_FILE_CHARS = 14000;
+
+async function hydrateFileMentionAttachments(attachments: ChatAttachment[]): Promise<ChatAttachment[]> {
+  return Promise.all(attachments.map(async att => {
+    if (att.type !== "file" || !att.path || att.content) return att;
+    try {
+      const raw = await invoke<string>("read_file_content", { filePath: att.path });
+      const clipped = raw.length > MAX_MENTION_FILE_CHARS
+        ? `${raw.slice(0, MAX_MENTION_FILE_CHARS)}\n\n[File clipped after ${MAX_MENTION_FILE_CHARS} characters.]`
+        : raw;
+      return {
+        ...att,
+        mime: att.mime || "text/plain",
+        detail: `${att.detail || "Mentioned file"}; content included for agent context`,
+        content: clipped,
+      };
+    } catch (err) {
+      return {
+        ...att,
+        detail: `${att.detail || "Mentioned file"}; content could not be read: ${String(err)}`,
+      };
+    }
+  }));
 }
 
 // ─── ChatPanel ────────────────────────────────────────────────────────────────
@@ -1303,6 +1335,14 @@ export const ChatPanel: React.FC<{
       if (sys) body.system = sys.content;
       return { provider: "anthropic", url: "https://api.anthropic.com/v1/messages", body: JSON.stringify(body), headers: [["x-api-key",key],["anthropic-version","2023-06-01"],["Content-Type","application/json"]] as string[][] };
     }
+    if (prov === "ollama_cloud") {
+      return {
+        provider: "ollama_cloud",
+        url: "https://ollama.com/api/chat",
+        body: JSON.stringify({ model, messages, stream: streaming }),
+        headers: [["Authorization", `Bearer ${key}`], ["Content-Type", "application/json"]] as string[][],
+      };
+    }
 
     const URLS: Record<string,string> = {
       openai: "https://api.openai.com/v1/chat/completions",
@@ -1401,7 +1441,7 @@ export const ChatPanel: React.FC<{
     const req = buildRequest(messages, false);
     const res = await invoke<string>("curl_post", { url: req.url, body: req.body, headers: req.headers });
     const d = JSON.parse(res);
-    if (req.provider === "ollama") return d.message?.content || "_(no response)_";
+    if (req.provider === "ollama" || req.provider === "ollama_cloud") return d.message?.content || "_(no response)_";
     if (req.provider === "anthropic") return d.content?.[0]?.text || "_(no response)_";
     const message = d.choices?.[0]?.message || {};
     const toolText = message.tool_calls?.length ? `\n${JSON.stringify({ tool_calls: message.tool_calls })}` : "";
@@ -1628,7 +1668,7 @@ export const ChatPanel: React.FC<{
     if (e) e.preventDefault();
     const text = (overrideText ?? input).trim();
     const mentionedFiles = parseFileMentions(text, mentionFilesRef.current);
-    const attachments = [...(overrideAttachments || composerAttachments), ...mentionedFiles];
+    const attachments = await hydrateFileMentionAttachments([...(overrideAttachments || composerAttachments), ...mentionedFiles]);
     if ((!text && !attachments.length) || isProcessing) return;
     const userMsg: Msg = {
       id: `u${Date.now()}`,

@@ -14,6 +14,7 @@ export interface ChatAttachment {
   path?: string;
   mime?: string;
   detail?: string;
+  content?: string;
 }
 
 export interface ExternalChatPrompt {

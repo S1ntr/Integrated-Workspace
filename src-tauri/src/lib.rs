@@ -42,6 +42,12 @@ pub struct StreamState(Mutex<HashMap<String, u32>>);
 #[derive(Default)]
 pub struct WorkspaceState(pub Mutex<Option<String>>);
 
+#[derive(Serialize, Clone)]
+struct BrowserNewWindowPayload {
+    source_label: String,
+    url: String,
+}
+
 // Helper to validate that canonicalized targets are strictly within picked workspace parent boundaries
 fn validate_in_workspace(target_path_str: &str, workspace_opt: &Option<String>) -> Result<std::path::PathBuf, String> {
     let ws_dir = workspace_opt.as_ref().ok_or_else(|| "Access denied: No active workspace directory selected in backend.".to_string())?;
@@ -781,7 +787,8 @@ fn validate_url(url: &str) -> Result<(), String> {
         || parsed_url.starts_with("https://generativelanguage.googleapis.com/")
         || parsed_url.starts_with("https://api.x.ai/")
         || parsed_url.starts_with("https://api.together.xyz/")
-        || parsed_url.starts_with("https://openrouter.ai/");
+        || parsed_url.starts_with("https://openrouter.ai/")
+        || parsed_url.starts_with("https://ollama.com/");
         
     if is_allowed {
         Ok(())
@@ -811,6 +818,105 @@ async fn curl_get(url: String) -> Result<String, String> {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         Err(format!("curl error: {}", stderr))
     }
+}
+
+#[tauri::command]
+async fn browser_create_webview(
+    app: AppHandle,
+    label: String,
+    url: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let parsed_url: tauri::Url = url
+        .parse()
+        .map_err(|e| format!("Invalid browser URL: {}", e))?;
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| "Main window is not available.".to_string())?;
+    if let Some(existing) = app.get_webview(&label) {
+        let _ = existing.close();
+    }
+
+    let app_for_popup = app.clone();
+    let label_for_popup = label.clone();
+    let webview_builder = tauri::webview::WebviewBuilder::new(
+        label,
+        tauri::WebviewUrl::External(parsed_url),
+    )
+    .focused(true)
+    .accept_first_mouse(true)
+    .disable_drag_drop_handler()
+    .zoom_hotkeys_enabled(true)
+    .devtools(true)
+    .general_autofill_enabled(true)
+    .on_new_window(move |popup_url, _features| {
+        let _ = app_for_popup.emit(
+            "browser-new-window",
+            BrowserNewWindowPayload {
+                source_label: label_for_popup.clone(),
+                url: popup_url.to_string(),
+            },
+        );
+        tauri::webview::NewWindowResponse::Deny
+    });
+
+    window
+        .add_child(
+            webview_builder,
+            tauri::LogicalPosition::new(x, y),
+            tauri::LogicalSize::new(width, height),
+        )
+        .map_err(|e| format!("Failed to create embedded browser webview: {}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn browser_close_webview(app: AppHandle, label: String) -> Result<(), String> {
+    if let Some(webview) = app.get_webview(&label) {
+        webview
+            .close()
+            .map_err(|e| format!("Failed to close embedded browser webview: {}", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn browser_show_webview(app: AppHandle, label: String) -> Result<(), String> {
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "Embedded browser webview is not available.".to_string())?;
+    webview
+        .show()
+        .map_err(|e| format!("Failed to show embedded browser webview: {}", e))?;
+    webview
+        .set_focus()
+        .map_err(|e| format!("Failed to focus embedded browser webview: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn browser_set_webview_bounds(
+    app: AppHandle,
+    label: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "Embedded browser webview is not available.".to_string())?;
+    webview
+        .set_position(tauri::LogicalPosition::new(x, y))
+        .map_err(|e| format!("Failed to position embedded browser webview: {}", e))?;
+    webview
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|e| format!("Failed to size embedded browser webview: {}", e))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -966,6 +1072,10 @@ pub fn run() {
             save_chat_history,
             load_chat_history,
             clear_chat_history,
+            browser_create_webview,
+            browser_close_webview,
+            browser_show_webview,
+            browser_set_webview_bounds,
             check_agent_installed,
             pty_create,
             pty_write,

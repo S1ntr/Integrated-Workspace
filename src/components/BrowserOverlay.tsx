@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import type { Webview } from "@tauri-apps/api/webview";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { BrowserOpenRequest, ChatAttachment, ExternalChatPrompt } from "../types/browser";
 
 type BrowserMode = "app" | "web";
@@ -29,6 +30,11 @@ interface BrowserOverlayProps {
   workspaceName?: string;
   onClose: () => void;
   onSendToChat: (prompt: Omit<ExternalChatPrompt, "id">) => void;
+}
+
+interface BrowserNewWindowEvent {
+  source_label?: string;
+  url?: string;
 }
 
 const DEVICE_PRESETS = [
@@ -82,8 +88,9 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const handledRequestRef = useRef<string | null>(null);
-  const embeddedWebviewRef = useRef<Webview | null>(null);
+  const embeddedWebviewRef = useRef<string | null>(null);
   const embeddedWebviewUrlRef = useRef("");
+  const embeddedWebviewLabelRef = useRef("");
   const embeddedWebviewRequestRef = useRef(0);
 
   const [mode, setMode] = useState<BrowserMode>("app");
@@ -142,26 +149,31 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   }
 
   async function closeEmbeddedWebview(resetState = true) {
-    const webview = embeddedWebviewRef.current;
+    const label = embeddedWebviewRef.current;
     embeddedWebviewRef.current = null;
     embeddedWebviewUrlRef.current = "";
+    embeddedWebviewLabelRef.current = "";
     if (resetState) setEmbeddedBrowserReady(false);
-    if (!webview) return;
+    if (!label) return;
     try {
-      await webview.close();
+      await invoke("browser_close_webview", { label });
     } catch {
       // The webview may already be gone after a tab/window transition.
     }
   }
 
   async function syncEmbeddedWebviewBounds() {
-    const webview = embeddedWebviewRef.current;
+    const label = embeddedWebviewRef.current;
     const bounds = readViewportBounds();
-    if (!webview || !bounds) return;
+    if (!label || !bounds) return;
     try {
-      const { LogicalPosition, LogicalSize } = await import("@tauri-apps/api/dpi");
-      await webview.setPosition(new LogicalPosition(bounds.x, bounds.y));
-      await webview.setSize(new LogicalSize(bounds.width, bounds.height));
+      await invoke("browser_set_webview_bounds", {
+        label,
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+      });
     } catch {
       setEmbeddedBrowserError("Embedded browser lost its layout. Reopen the tab to reset it.");
     }
@@ -181,8 +193,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     if (embeddedWebviewRef.current && embeddedWebviewUrlRef.current === url) {
       try {
         await syncEmbeddedWebviewBounds();
-        await embeddedWebviewRef.current.show();
-        await embeddedWebviewRef.current.setFocus();
+        await invoke("browser_show_webview", { label: embeddedWebviewRef.current });
         setEmbeddedBrowserReady(true);
         setLoading(false);
         return;
@@ -196,52 +207,31 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     if (embeddedWebviewRequestRef.current !== requestId) return;
 
     try {
-      const { Webview } = await import("@tauri-apps/api/webview");
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
       const label = `integraded-browser-${targetTabId}-${Date.now()}`
         .replace(/[^a-zA-Z0-9\-/:_]/g, "-")
         .slice(0, 96);
-      const webview = new Webview(getCurrentWindow(), label, {
+      await invoke("browser_create_webview", {
+        label,
         url,
         x: bounds.x,
         y: bounds.y,
         width: bounds.width,
         height: bounds.height,
-        focus: true,
-        acceptFirstMouse: true,
-        dragDropEnabled: false,
-        zoomHotkeysEnabled: true,
-        devtools: true,
-        generalAutofillEnabled: true,
-        backgroundColor: "#ffffff",
       });
+      if (embeddedWebviewRequestRef.current !== requestId) return;
 
-      embeddedWebviewRef.current = webview;
+      embeddedWebviewRef.current = label;
       embeddedWebviewUrlRef.current = url;
-
-      void webview.once("tauri://created", () => {
-        if (embeddedWebviewRef.current !== webview) return;
-        setEmbeddedBrowserReady(true);
-        setEmbeddedBrowserError("");
-        setLoading(false);
-        void syncEmbeddedWebviewBounds();
-        void webview.setFocus();
-      });
-
-      void webview.once<string>("tauri://error", event => {
-        if (embeddedWebviewRef.current !== webview) return;
-        const detail = typeof event.payload === "string" && event.payload.trim()
-          ? ` ${event.payload.trim()}`
-          : "";
-        embeddedWebviewRef.current = null;
-        embeddedWebviewUrlRef.current = "";
-        setEmbeddedBrowserReady(false);
-        setLoading(false);
-        setEmbeddedBrowserError(`Embedded browser could not be opened.${detail}`);
-      });
+      embeddedWebviewLabelRef.current = label;
+      setEmbeddedBrowserReady(true);
+      setEmbeddedBrowserError("");
+      setLoading(false);
+      void syncEmbeddedWebviewBounds();
+      void invoke("browser_show_webview", { label });
     } catch (error) {
       embeddedWebviewRef.current = null;
       embeddedWebviewUrlRef.current = "";
+      embeddedWebviewLabelRef.current = "";
       setEmbeddedBrowserReady(false);
       setLoading(false);
       setEmbeddedBrowserError(error instanceof Error ? error.message : "Embedded browser could not be opened.");
@@ -284,6 +274,27 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   useEffect(() => {
     if (open) return;
     void closeEmbeddedWebview();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    listen<BrowserNewWindowEvent>("browser-new-window", event => {
+      const url = event.payload?.url;
+      if (!url) return;
+      const source = event.payload?.source_label || "";
+      if (source && embeddedWebviewLabelRef.current && source !== embeddedWebviewLabelRef.current) return;
+      openInNewTab(url);
+    }).then(fn => {
+      if (alive) unlisten = fn;
+      else fn();
+    }).catch(() => {});
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -437,6 +448,42 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     const tab = { id, label: "New tab", url: "", kind: "web" as const };
     setTabs(prev => [...prev, tab]);
     selectTab(tab);
+  }
+
+  function openInNewTab(raw: string) {
+    const next = normalizeUrl(raw);
+    if (!next) return;
+    const nextIsLocal = isLocalUrl(next);
+    const id = `web-${Date.now()}`;
+    const tab: BrowserTab = {
+      id,
+      label: compactUrl(next),
+      url: next,
+      kind: nextIsLocal ? "project" : "web",
+      external: !nextIsLocal,
+    };
+    setTabs(prev => [...prev, tab]);
+    setActiveTabId(id);
+    setAddress(next);
+    setHistory([next]);
+    setHistoryIndex(0);
+    setSelection(null);
+    setDraft(null);
+    setBrowserHint("");
+    setEmbeddedBrowserError("");
+    if (nextIsLocal) {
+      setMode("app");
+      void closeEmbeddedWebview();
+      setCurrentUrl(next);
+      setLoading(true);
+      setFrameTitle("");
+    } else {
+      setMode("web");
+      setTool("browse");
+      setCurrentUrl("");
+      setFrameTitle(compactUrl(next));
+      void openEmbeddedWebview(next, id);
+    }
   }
 
   function closeTab(tabId: string, event: React.MouseEvent) {

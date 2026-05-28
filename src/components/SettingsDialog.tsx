@@ -18,15 +18,18 @@ interface AppConfig {
 }
 
 // ── Provider validation defs ──
-interface CloudProviderDef {
+interface ProviderIdentity {
   id: string;
   name: string;
   iconUrl: string;
   short: string;
+}
+
+interface CloudProviderDef extends ProviderIdentity {
   baseUrl: string;
   keyPlaceholder: string;
   docsUrl: string;
-  authScheme: "bearer" | "anthropic" | "gemini";
+  authScheme: "bearer" | "anthropic" | "gemini" | "ollama";
 }
 
 const CLOUD_PROVIDERS: CloudProviderDef[] = [
@@ -102,9 +105,33 @@ const CLOUD_PROVIDERS: CloudProviderDef[] = [
     docsUrl: "https://openrouter.ai/settings/keys",
     authScheme: "bearer",
   },
+  {
+    id: "ollama_cloud", name: "Ollama Cloud",
+    iconUrl: "https://www.google.com/s2/favicons?domain=ollama.com&sz=64",
+    short: "OL",
+    baseUrl: "https://ollama.com/api/chat",
+    keyPlaceholder: "ollama_...",
+    docsUrl: "https://ollama.com/settings/keys",
+    authScheme: "ollama",
+  },
 ];
 
-const ProviderLogo: React.FC<{ provider: CloudProviderDef }> = ({ provider }) => (
+const LOCAL_PROVIDERS: Record<"lmstudio" | "ollama", ProviderIdentity> = {
+  lmstudio: {
+    id: "lmstudio",
+    name: "LM Studio",
+    iconUrl: "https://www.google.com/s2/favicons?domain=lmstudio.ai&sz=64",
+    short: "LM",
+  },
+  ollama: {
+    id: "ollama",
+    name: "Ollama",
+    iconUrl: "https://www.google.com/s2/favicons?domain=ollama.com&sz=64",
+    short: "OL",
+  },
+};
+
+const ProviderLogo: React.FC<{ provider: ProviderIdentity }> = ({ provider }) => (
   <span className="stng-provider-logo" aria-hidden="true">
     <img
       src={provider.iconUrl}
@@ -256,12 +283,18 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
       } else if (provDef.authScheme === "gemini") {
         url = `${provDef.baseUrl}?key=${key}`;
         headers = [["Content-Type", "application/json"]];
+      } else if (provDef.authScheme === "ollama") {
+        url = provDef.baseUrl;
+        headers = [["Authorization", `Bearer ${key}`], ["Content-Type", "application/json"]];
       } else {
         url = provDef.baseUrl;
         headers = [["Authorization", `Bearer ${key}`], ["Content-Type", "application/json"]];
       }
 
-      const res = await invoke<string>("curl_post", { url, body, headers });
+      const requestBody = provDef.authScheme === "ollama"
+        ? JSON.stringify({ model: "gpt-oss:120b", messages: [{ role: "user", content: "ping" }], stream: false })
+        : body;
+      const res = await invoke<string>("curl_post", { url, body: requestBody, headers });
       const data = JSON.parse(res);
       if (data.error) throw new Error(data.error.message || "Invalid key");
       setKeyStatus(prev => ({ ...prev, [cloudProv]: "ok" }));
@@ -367,7 +400,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
 
           {/* ─── TAB: API Keys ─── */}
           {activeTab === "keys" && (
-            <div className="stng-tab-content">
+            <div className="stng-tab-content stng-tab-content-keys">
               <div className="stng-section">
                 <div className="stng-section-header">
                   <i className="bx bx-key" />
@@ -436,7 +469,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                   {/* LM Studio */}
                   <div className="stng-api-key-row">
                     <div className="stng-api-key-header">
-                      <i className="bx bx-desktop" />
+                      <ProviderLogo provider={LOCAL_PROVIDERS.lmstudio} />
                       <span>LM Studio</span>
                       {localStatus.lmstudio === "ok" && <span className="stng-key-badge ok">Online</span>}
                       {localStatus.lmstudio === "err" && <span className="stng-key-badge err">Offline</span>}
@@ -467,7 +500,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                   {/* Ollama */}
                   <div className="stng-api-key-row">
                     <div className="stng-api-key-header">
-                      <i className="bx bx-data" />
+                      <ProviderLogo provider={LOCAL_PROVIDERS.ollama} />
                       <span>Ollama</span>
                       {localStatus.ollama === "ok" && <span className="stng-key-badge ok">Online</span>}
                       {localStatus.ollama === "err" && <span className="stng-key-badge err">Offline</span>}
