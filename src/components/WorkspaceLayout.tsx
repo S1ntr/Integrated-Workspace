@@ -3,9 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Sidebar, FileEntry } from "./Sidebar";
 import { ChatPanel, type TerminalTranscriptEntry } from "./ChatPanel";
+import { BrowserOverlay } from "./BrowserOverlay";
 import { TerminalGrid, Session } from "./TerminalGrid";
 import { ChangesViewer, ChangedFile } from "./ChangesViewer";
 import type { AgentSession } from "./Onboarding";
+import type { BrowserOpenRequest, ExternalChatPrompt } from "../types/browser";
 import { SettingsDialog } from "./SettingsDialog";
 import { FileViewerDialog } from "./FileViewerDialog";
 import { useNotify } from "./Notification";
@@ -118,6 +120,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onC
 // ── Right Panel with tabs ──────────────────────────────────────────────────────
 interface RightPanelProps {
   width: number;
+  directory: string;
   sessions: Session[];
   terminalOutputs: Record<string, string>;
   terminalTranscripts: Record<string, TerminalTranscriptEntry[]>;
@@ -132,6 +135,7 @@ interface RightPanelProps {
 
 const RightPanel: React.FC<RightPanelProps> = ({
   width,
+  directory,
   sessions,
   terminalOutputs,
   terminalTranscripts,
@@ -144,6 +148,29 @@ const RightPanel: React.FC<RightPanelProps> = ({
   onRestartSession,
 }) => {
   const [tab, setTab] = useState<"chat" | "file">("chat");
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserRequest, setBrowserRequest] = useState<BrowserOpenRequest | null>(null);
+  const [externalPrompt, setExternalPrompt] = useState<ExternalChatPrompt | null>(null);
+
+  const suggestedUrls = React.useMemo(() => {
+    const urls = new Set<string>();
+    const text = Object.values(terminalOutputs).join("\n");
+    const matches = text.match(/\bhttps?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?[^\s'"<>)]*/gi) || [];
+    for (const raw of matches) {
+      urls.add(raw.replace(/^http:\/\/0\.0\.0\.0/i, "http://127.0.0.1").replace(/^https:\/\/0\.0\.0\.0/i, "https://127.0.0.1"));
+    }
+    return Array.from(urls).slice(0, 6);
+  }, [terminalOutputs]);
+
+  const openBrowser = (request?: Omit<BrowserOpenRequest, "id"> | BrowserOpenRequest) => {
+    setBrowserRequest({
+      id: "id" in (request || {}) ? (request as BrowserOpenRequest).id : `browser-${Date.now()}`,
+      label: request?.label,
+      url: request?.url || suggestedUrls[0],
+      device: request?.device,
+    });
+    setBrowserOpen(true);
+  };
 
   return (
     <div className="right-panel" style={{ width }}>
@@ -163,6 +190,13 @@ const RightPanel: React.FC<RightPanelProps> = ({
           Changes
           {changedFiles.length > 0 && <span className="rp-tab-badge">{changedFiles.length}</span>}
         </button>
+        <button
+          className={`rp-tab ${browserOpen ? "active" : ""}`}
+          onClick={() => openBrowser()}
+        >
+          <i className="bx bx-globe" />
+          Browser
+        </button>
       </div>
 
       <div className="right-panel-body">
@@ -172,10 +206,12 @@ const RightPanel: React.FC<RightPanelProps> = ({
             sessions={sessions}
             terminalOutputs={terminalOutputs}
             terminalTranscripts={terminalTranscripts}
+            externalPrompt={externalPrompt}
             onSendPtyCommand={onSendPtyCommand}
             onAddSession={onAddSession}
             onCloseSession={onCloseSession}
             onRestartSession={onRestartSession}
+            onOpenBrowser={openBrowser}
           />
         ) : (
           <ChangesViewer
@@ -185,6 +221,17 @@ const RightPanel: React.FC<RightPanelProps> = ({
           />
         )}
       </div>
+      <BrowserOverlay
+        open={browserOpen}
+        request={browserRequest}
+        suggestedUrls={suggestedUrls}
+        workspaceName={directory.split(/[\\/]/).pop() || directory}
+        onClose={() => setBrowserOpen(false)}
+        onSendToChat={(text) => {
+          setTab("chat");
+          setExternalPrompt({ id: `browser-prompt-${Date.now()}`, text });
+        }}
+      />
     </div>
   );
 };
@@ -607,6 +654,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
             <div className="resize-handle h" onMouseDown={resizeRight} />
             <RightPanel
               width={rightW}
+              directory={directory}
               sessions={sessions}
               terminalOutputs={terminalOutputs}
               terminalTranscripts={terminalTranscripts}
