@@ -469,6 +469,9 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
             ) : diffLines ? (
               <div className="code-editor-viewport diff-full-viewport" style={{ flex: 1, display: "flex", overflow: "hidden" }}>
                 <div className="diff-scroll" ref={diffScrollRef} onScroll={handleDiffScroll} style={{ flex: 1, overflow: "auto", fontFamily: "var(--font-mono)", fontSize: "13px", lineHeight: "1.55", padding: "8px 0" }}>
+                  {diffLines.length === 0 && (
+                    <div className="diff-empty-line">This file is empty, so there are no changed lines to display yet.</div>
+                  )}
                   {diffLines.map((line, i) => (
                     <div key={i} className={`diff-line ${line.type}`} style={{ height: "20.15px" }}>
                       <span className="diff-ln diff-ln-old">{line.oldLine ?? ""}</span>

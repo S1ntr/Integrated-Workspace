@@ -61,6 +61,9 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
 }) => {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [isResizing, setIsResizing] = useState(false);
+  const [draggingSessionId, setDraggingSessionId] = useState<number | null>(null);
+  const [dragOverSessionId, setDragOverSessionId] = useState<number | null>(null);
+  const dragOverSessionIdRef = useRef<number | null>(null);
 
   const N = sessions.length;
 
@@ -76,6 +79,59 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   const [colPcts, setColPcts] = useState<number[][]>([]);
 
   const rows = partitionSessions(sessions, rowCount);
+
+  const startSessionReorder = useCallback((session: Session, e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || isResizing) return;
+    const target = e.target as HTMLElement;
+    if (
+      !target.closest(".term-bar") ||
+      target.closest("button") ||
+      target.closest(".term-agent-dropdown-menu")
+    ) {
+      return;
+    }
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let active = false;
+
+    const cleanup = () => {
+      document.body.classList.remove("terminal-reorder-active");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      dragOverSessionIdRef.current = null;
+      setDraggingSessionId(null);
+      setDragOverSessionId(null);
+    };
+
+    const onMove = (me: MouseEvent) => {
+      const moved = Math.hypot(me.clientX - startX, me.clientY - startY);
+      if (!active && moved < 5) return;
+      if (!active) {
+        active = true;
+        document.body.classList.add("terminal-reorder-active");
+        setDraggingSessionId(session.id);
+      }
+      me.preventDefault();
+      const underPointer = document.elementFromPoint(me.clientX, me.clientY) as HTMLElement | null;
+      const panel = underPointer?.closest("[data-terminal-panel-id]") as HTMLElement | null;
+      const targetId = panel ? Number(panel.dataset.terminalPanelId) : null;
+      const nextTarget = Number.isFinite(targetId) ? targetId : null;
+      dragOverSessionIdRef.current = nextTarget;
+      setDragOverSessionId(nextTarget);
+    };
+
+    const onUp = () => {
+      const targetId = dragOverSessionIdRef.current;
+      if (active && targetId !== null && targetId !== session.id) {
+        onSwapSessions?.(session.id, targetId);
+      }
+      cleanup();
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [isResizing, onSwapSessions]);
 
   // Synchronize generic grid percentages
   useEffect(() => {
@@ -322,12 +378,14 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   }
 
   return (
-    <div className={`tgrid-wrapper ${isResizing ? "resizing" : ""}`} ref={wrapperRef} style={{ position: "relative", width: "100%", height: "100%" }}>
+    <div className={`tgrid-wrapper ${isResizing ? "resizing" : ""} ${draggingSessionId !== null ? "reordering" : ""}`} ref={wrapperRef} style={{ position: "relative", width: "100%", height: "100%" }}>
       {/* ── Render absolutely positioned panels ── */}
       {panels.map(({ s, left, top, width, height, pct }) => (
         <div
           key={s.id}
-          className="tgrid-absolute-panel"
+          className={`tgrid-absolute-panel ${draggingSessionId === s.id ? "dragging" : ""} ${dragOverSessionId === s.id && draggingSessionId !== s.id ? "drag-over" : ""}`}
+          data-terminal-panel-id={s.id}
+          onMouseDown={(e) => startSessionReorder(s, e)}
           style={{
             position: "absolute",
             left: `${left}%`,
