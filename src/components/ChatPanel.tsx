@@ -1177,9 +1177,12 @@ export const ChatPanel: React.FC<{
   // Save to both the global home-dir store AND the workspace's date-organised folder.
   function persistPayload(payload: string) {
     invoke("save_chat_history", { jsonData: payload, scope: chatScopeKey }).catch(() => {});
+    // disabled save_chat_to_workspace to avoid polluting the workspace
+    /*
     if (workspaceDir) {
       invoke("save_chat_to_workspace", { workspaceDir, jsonData: payload }).catch(() => {});
     }
+    */
   }
 
   // Persistence synchronizations

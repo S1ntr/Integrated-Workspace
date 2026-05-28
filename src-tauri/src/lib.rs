@@ -496,6 +496,7 @@ fn copy_item(src_path: String, dest_path: String, state: State<'_, WorkspaceStat
 
 /// Return a folder name like "Thursday_2026-05-28" for today's date.
 /// Uses Hinnant's civil_from_days algorithm — no chrono dependency needed.
+#[allow(dead_code)]
 fn today_folder_name() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -524,30 +525,15 @@ fn today_folder_name() -> String {
     format!("{}_{:04}-{:02}-{:02}", day_name, y, m, d)
 }
 
-/// Save the current chat session snapshot to {workspace_dir}/chat-history/{weekday_date}/
-/// so every workspace keeps its own readable, date-organised history on disk.
+/// Save the current chat session snapshot (disabled to avoid polluting the workspace directory).
 #[tauri::command]
-fn save_chat_to_workspace(workspace_dir: String, json_data: String) -> Result<(), String> {
-    let ws = Path::new(&workspace_dir);
-    if !ws.exists() || !ws.is_dir() {
-        return Err("Workspace directory does not exist".to_string());
-    }
-
-    let today  = today_folder_name();
-    let folder = ws.join("chat-history").join(&today);
-    fs::create_dir_all(&folder)
-        .map_err(|e| format!("Failed to create chat-history folder: {}", e))?;
-
-    let file = folder.join("chat_history.json");
-    fs::write(&file, json_data.as_bytes())
-        .map_err(|e| format!("Failed to write workspace chat history: {}", e))?;
-
+fn save_chat_to_workspace(_workspace_dir: String, _json_data: String) -> Result<(), String> {
     Ok(())
 }
 
 fn chat_history_root(app: &AppHandle) -> Result<PathBuf, String> {
     let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
-    Ok(home.join("chat-history"))
+    Ok(home.join(".integraded-workspace").join("chat-history"))
 }
 
 fn scoped_chat_history_root(app: &AppHandle, scope: Option<String>) -> Result<PathBuf, String> {
@@ -1365,15 +1351,26 @@ fn start_dev_server_background(dir: String, command: String) -> Result<(), Strin
     Ok(())
 }
 
-/// Attempt a TCP connection to 127.0.0.1:port; returns true if something is
+/// Attempt a TCP connection to 127.0.0.1:port or [::1]:port; returns true if something is
 /// already listening there (i.e. the dev server is up).
 #[tauri::command]
 fn check_port_open(port: u16) -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
-    TcpStream::connect_timeout(
+    
+    // Check IPv4 loopback
+    if TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_millis(400),
+        Duration::from_millis(200),
+    )
+    .is_ok() {
+        return true;
+    }
+
+    // Check IPv6 loopback
+    TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+        Duration::from_millis(200),
     )
     .is_ok()
 }
