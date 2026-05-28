@@ -208,7 +208,11 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
         width: bounds.width,
         height: bounds.height,
         focus: true,
+        acceptFirstMouse: true,
         dragDropEnabled: false,
+        zoomHotkeysEnabled: true,
+        devtools: true,
+        generalAutofillEnabled: true,
         backgroundColor: "#ffffff",
       });
 
