@@ -384,20 +384,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   const dragCounter = useRef(0);
 
   const handleDragStart = (e: React.DragEvent) => {
-    // Only allow dragging if the user initiated the drag from the term-bar (or its children)
-    const target = e.target as HTMLElement;
-    if (!target.closest(".term-bar") || target.closest("button") || target.closest(".term-agent-dropdown-menu")) {
-      e.preventDefault();
-      return;
-    }
-
-    console.log(`[DragStart] Panel ID: ${id}`);
-    e.dataTransfer.setData("text/plain", id.toString());
-    e.dataTransfer.effectAllowed = "move";
-    (window as any).draggedTerminalId = id;
-    
-    // Add dragging class natives to parent panel
-    e.currentTarget.closest(".term-pane")?.classList.add("dragging");
+    e.preventDefault();
   };
 
   const handleDragEnd = (e: React.DragEvent) => {
@@ -472,7 +459,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   return (
     <div
       className="term-pane"
-      draggable={true}
+      draggable={false}
       onDragStart={handleDragStart}
       onDragEnd={handleDragEnd}
       onDragOver={(e) => {

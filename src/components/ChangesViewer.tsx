@@ -196,6 +196,11 @@ export const ChangesViewer: React.FC<ChangesViewerProps> = ({
                           </button>
                         </div>
                         <div className="diff-scroll">
+                          {diffData && diffData.length === 0 && (
+                            <div className="diff-empty-line">
+                              This file is empty, so there are no changed lines to display yet.
+                            </div>
+                          )}
                           {diffData?.map((line, index) => {
                             const lineClass = line.type === "added" ? "added" : line.type === "removed" ? "removed" : "unchanged";
                             const prefix = line.type === "added" ? "+" : line.type === "removed" ? "-" : " ";

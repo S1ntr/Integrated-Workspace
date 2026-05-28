@@ -526,10 +526,13 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                           <button
                             type="button"
                             className="stng-btn stng-btn-danger-solid"
-                            onClick={() => {
+                            onClick={async () => {
                               try {
                                 localStorage.removeItem("integraded_chat_current_msgs");
                                 localStorage.removeItem("integraded_chat_histories");
+                                localStorage.removeItem("integraded_chat_context_window");
+                                localStorage.removeItem("integraded_tool_calls");
+                                await invoke("clear_chat_history");
                                 window.dispatchEvent(new CustomEvent("__integradedChatHistoryCleared"));
                                 setConfirmClear(false);
                                 setSuccess("Chat history cleared successfully.");

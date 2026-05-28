@@ -35,6 +35,19 @@ interface ToolCallLog {
   note?: string;
 }
 
+export interface ChatDiffFile {
+  name: string;
+  path: string;
+  status: "new" | "modified";
+}
+
+interface DiffLog {
+  id: string;
+  files: ChatDiffFile[];
+  total: number;
+  ts: string;
+}
+
 interface AgentQuestion {
   id: string;
   sessionId: string;
@@ -75,10 +88,11 @@ interface Msg {
   body: string;
   ts: string;
   streaming?: boolean;
-  agent?: "orchestrator" | "system" | "tool";
+  agent?: "orchestrator" | "system" | "tool" | "diff";
   actions?: AgentAction[];
   attachments?: ChatAttachment[];
   toolLog?: ToolCallLog;
+  diffLog?: DiffLog;
   thinking?: {
     text: string;
     elapsedMs: number;
@@ -93,6 +107,13 @@ interface ChatHistory {
   msgs: Msg[];
   contextWindow?: string;
   createdAt: number;
+  folderName?: string;
+}
+
+interface ChatSessionMeta {
+  id: string;
+  createdAt: number;
+  folderName: string;
 }
 
 interface ModelEntry {
@@ -493,7 +514,7 @@ If your model has trouble with XML, a fenced JSON block named tool_call is also 
 9. Browser feedback may include a URL, viewport, selected element/region, and user note. Use that context to prompt agents with precise visual/UI fixes.
 10. When an agent finishes, convert its terminal output into a concise visible summary of changed files, integrations, tests, and remaining risks. Do not show a question card unless the terminal is clearly waiting for user input.
 11. After dispatching, briefly summarize what each agent is doing (visible to user)
-12. The user may mention files with @filename. Pass exact mentioned paths to agents and tell them to inspect those files before editing.
+12. The user may mention files with @filename, @path/file, or quoted @"path with spaces". Pass exact resolved paths to agents and tell them to inspect those files before editing. If a mention is unresolved, tell the agent to locate it with workspace search before touching files.
 13. If the task is naturally parallel and multiple agents are already open, split it across those agents. If there are not enough useful agents, use agent.request.
 
 ## Session Context Window
@@ -545,12 +566,15 @@ function messageForModel(msg: Msg): string {
     const note = msg.toolLog.note || msg.toolLog.action.prompt || msg.toolLog.action.reason || msg.toolLog.action.url || "";
     content += `\n\nTool log: ${msg.toolLog.action.type} ${msg.toolLog.action.label} ${msg.toolLog.status}${note ? ` - ${note}` : ""}`;
   }
+  if (msg.diffLog) {
+    content += `\n\nDiff log:\n${formatDiffLogBody(msg.diffLog)}`;
+  }
   return content.trim();
 }
 
 function appendContextWindow(current: string, msg: Msg): string {
   if (msg.streaming) return current;
-  const label = msg.role === "user" ? "User" : msg.agent === "tool" ? "Tool" : msg.agent === "system" ? "System" : "Assistant";
+  const label = msg.role === "user" ? "User" : msg.agent === "tool" ? "Tool" : msg.agent === "diff" ? "Diff" : msg.agent === "system" ? "System" : "Assistant";
   const content = compactText(messageForModel(msg), msg.role === "user" ? 1000 : 1200);
   if (!content) return current;
   const line = `[${msg.ts}] ${label}: ${content}`;
@@ -563,18 +587,105 @@ function formatToolLogBody(log: ToolCallLog): string {
   return `Tool call - ${log.action.type} -> ${target}\nStatus: ${log.status}${note ? `\n${compactText(note, 420)}` : ""}`;
 }
 
+function chatFolderName(createdAt: number, id: string): string {
+  const iso = new Date(createdAt)
+    .toISOString()
+    .replace(/\.\d{3}Z$/, "")
+    .replace(/[:T]/g, "-");
+  const safeId = id.replace(/[^a-zA-Z0-9_-]/g, "").slice(-10);
+  return `${iso}_${safeId}`;
+}
+
+function createChatMeta(): ChatSessionMeta {
+  const createdAt = Date.now();
+  const id = `h${createdAt}-${Math.random().toString(36).slice(2, 6)}`;
+  return { id, createdAt, folderName: chatFolderName(createdAt, id) };
+}
+
+function normalizeHistory(raw: any): ChatHistory | null {
+  if (!raw || !Array.isArray(raw.msgs)) return null;
+  const createdAt = typeof raw.createdAt === "number" ? raw.createdAt : Date.now();
+  const id = typeof raw.id === "string" ? raw.id : `h${createdAt}`;
+  return {
+    id,
+    name: typeof raw.name === "string" ? raw.name : "Chat",
+    msgs: raw.msgs,
+    contextWindow: typeof raw.contextWindow === "string" ? raw.contextWindow : "",
+    createdAt,
+    folderName: typeof raw.folderName === "string" ? raw.folderName : chatFolderName(createdAt, id),
+  };
+}
+
+function diffSignature(files: ChatDiffFile[]): string {
+  return files
+    .map(file => `${file.status}:${file.path}`)
+    .sort()
+    .join("|");
+}
+
+function formatDiffLogBody(log: DiffLog): string {
+  const preview = log.files.slice(0, 6).map(file => `${file.status}: ${file.path}`).join("\n");
+  const more = log.total > log.files.length ? `\n...and ${log.total - log.files.length} more` : "";
+  return `Diff view updated\n${preview}${more}`;
+}
+
+function toolLogTarget(log: ToolCallLog): string {
+  if (log.action.type === "browser_open") return log.action.url || log.action.label;
+  if (log.action.type === "request") return `${log.action.count || 1} ${log.action.agentType || "agent"}`;
+  if (log.action.type === "mode") return `${log.action.label} -> ${log.action.agentType || log.action.mode || "mode"}`;
+  return log.action.label;
+}
+
+function toolLogNote(log: ToolCallLog): string {
+  const raw = log.note || log.action.prompt || log.action.reason || log.action.url || log.action.question || "";
+  if (/^sent to\b/i.test(raw.trim())) return "";
+  return compactText(raw, 360);
+}
+
+function cleanMentionToken(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^[@`"'\[]+|[`"',.!?\]]+$/g, "")
+    .replace(/^\.\//, "")
+    .trim();
+}
+
+function normalizeMentionPath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
+}
+
+function fileBaseName(name: string): string {
+  return name.replace(/\.[^.]+$/, "").toLowerCase();
+}
+
 function parseFileMentions(text: string, files: MentionFile[]): ChatAttachment[] {
-  if (!text.includes("@") || !files.length) return [];
-  const tokens = Array.from(text.matchAll(/@([^\s,;:)]+)/g)).map(m => m[1].replace(/^["']|["']$/g, "").replace(/[.!?]+$/g, ""));
+  if (!text.includes("@")) return [];
+  const mentionRegex = /(?:^|[\s([{])@(?:"([^"]+)"|'([^']+)'|`([^`]+)`|([^\s,;:)]+))/g;
+  const tokens = Array.from(text.matchAll(mentionRegex))
+    .map(m => cleanMentionToken(m[1] || m[2] || m[3] || m[4] || ""))
+    .filter(Boolean);
   const found: ChatAttachment[] = [];
   const used = new Set<string>();
   for (const token of tokens) {
     const lower = token.toLowerCase();
-    const match = files.find(file =>
-      file.name.toLowerCase() === lower ||
-      file.path.toLowerCase().endsWith(lower.replace(/\//g, "\\").replace(/^\\/, "")) ||
-      file.path.toLowerCase().endsWith(lower.replace(/\\/g, "/").replace(/^\//, ""))
-    );
+    const wantedPath = normalizeMentionPath(token);
+    const wantedBase = fileBaseName(lower.split(/[\\/]/).pop() || lower);
+    const match = files
+      .map(file => {
+        const path = normalizeMentionPath(file.path);
+        const name = file.name.toLowerCase();
+        const base = fileBaseName(file.name);
+        let score = 0;
+        if (path === wantedPath) score = 100;
+        else if (name === lower) score = 92;
+        else if (base === wantedBase) score = 84;
+        else if (path.endsWith(`/${wantedPath}`) || path.endsWith(wantedPath)) score = 76;
+        else if (path.includes(wantedPath) && wantedPath.length >= 4) score = 52;
+        else if (name.includes(lower) && lower.length >= 3) score = 42;
+        return { file, score };
+      })
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score)[0]?.file;
     if (match && !used.has(match.path)) {
       used.add(match.path);
       found.push({
@@ -583,6 +694,14 @@ function parseFileMentions(text: string, files: MentionFile[]): ChatAttachment[]
         name: match.name,
         path: match.path,
         detail: `Mentioned by @${token}`,
+      });
+    } else if (!match && !used.has(`unresolved:${token}`)) {
+      used.add(`unresolved:${token}`);
+      found.push({
+        id: `file-missing-${Date.now()}-${found.length}`,
+        type: "file",
+        name: token,
+        detail: `Unresolved @${token} mention. Agent should locate this file in the workspace before editing.`,
       });
     }
   }
@@ -598,12 +717,14 @@ export const ChatPanel: React.FC<{
   terminalTranscripts?: Record<string, TerminalTranscriptEntry[]>;
   externalPrompt?: ExternalChatPrompt | null;
   mentionFiles?: MentionFile[];
+  changedFiles?: ChatDiffFile[];
   onSendPtyCommand?: (sessId: string, cmd: string) => void;
   onAddSession?: (label: string, command: string) => Session;
   onCloseSession?: (id: number) => void;
   onRestartSession?: (id: number) => string;
   onChangeSessionAgent?: (id: number, label: string, command: string, restart?: boolean) => string | void;
   onOpenBrowser?: (request: BrowserOpenRequest) => void;
+  onOpenDiffFile?: (path: string, name: string) => void;
 }> = ({
   embedded,
   sessions: sessionsProp = [],
@@ -611,20 +732,30 @@ export const ChatPanel: React.FC<{
   terminalTranscripts: terminalTranscriptsProp = {},
   externalPrompt,
   mentionFiles = [],
+  changedFiles = [],
   onSendPtyCommand,
   onAddSession,
   onCloseSession,
   onRestartSession,
   onChangeSessionAgent,
   onOpenBrowser,
+  onOpenDiffFile,
 }) => {
   // ── Core state ───────────────────────────────────────────────────────────────
-  const [msgs, setMsgs] = useState<Msg[]>([]);
+  const [msgs, setMsgs] = useState<Msg[]>(() => {
+    try {
+      const stored = localStorage.getItem("integraded_chat_current_msgs");
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
   const [input, setInput] = useState("");
   const [contextWindow, setContextWindow] = useState<string>(() => {
     try { return localStorage.getItem("integraded_chat_context_window") || ""; } catch { return ""; }
   });
   const [composerAttachments, setComposerAttachments] = useState<ChatAttachment[]>([]);
+  const [imagePreview, setImagePreview] = useState<ChatAttachment | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [toolCalls, setToolCalls] = useState<ToolCallLog[]>(() => {
@@ -648,6 +779,8 @@ export const ChatPanel: React.FC<{
     }
   });
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyHydrated, setHistoryHydrated] = useState(false);
+  const [currentChatMeta, setCurrentChatMeta] = useState<ChatSessionMeta>(() => createChatMeta());
   const historyRef = useRef<HTMLDivElement>(null);
 
   // ── Terminal picker ──────────────────────────────────────────────────────────
@@ -671,6 +804,7 @@ export const ChatPanel: React.FC<{
 
   // ── Refs ─────────────────────────────────────────────────────────────────────
   const endRef = useRef<HTMLDivElement>(null);
+  const chatPanelRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<any>(null);
@@ -678,6 +812,7 @@ export const ChatPanel: React.FC<{
   const streamTextRef = useRef("");
   const streamThinkingRef = useRef("");
   const streamThinkingStartRef = useRef(0);
+  const streamThinkingElapsedRef = useRef<number | null>(null);
   const activeStreamIdRef = useRef<string | null>(null);
 
   const onSendPtyCommandRef = useRef(onSendPtyCommand);
@@ -694,11 +829,14 @@ export const ChatPanel: React.FC<{
   const pendingAgentRequestsRef = useRef<PendingAgentRequest[]>([]);
   const contextWindowRef = useRef(contextWindow);
   const mentionFilesRef = useRef(mentionFiles);
+  const changedFilesRef = useRef(changedFiles);
   const seenQuestionKeysRef = useRef<Set<string>>(new Set());
   const seenSummaryKeysRef = useRef<Set<string>>(new Set());
+  const lastDiffSignatureRef = useRef("");
   const usedPromptSessionIdsRef = useRef<Set<string>>(new Set());
   const handledExternalPromptRef = useRef<string | null>(null);
   const lastContextMsgIdRef = useRef<string | null>(null);
+  const currentChatMetaRef = useRef(currentChatMeta);
   
   onSendPtyCommandRef.current = onSendPtyCommand;
   onAddSessionRef.current = onAddSession;
@@ -714,10 +852,20 @@ export const ChatPanel: React.FC<{
   pendingAgentRequestsRef.current = pendingAgentRequests;
   contextWindowRef.current = contextWindow;
   mentionFilesRef.current = mentionFiles;
+  changedFilesRef.current = changedFiles;
+  currentChatMetaRef.current = currentChatMeta;
 
   // ── Effects ──────────────────────────────────────────────────────────────────
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    requestAnimationFrame(() => {
+      const bodies = chatPanelRef.current?.querySelectorAll<HTMLElement>(".chat-thinking.open .chat-thinking-body");
+      bodies?.forEach(body => {
+        body.scrollTop = body.scrollHeight;
+      });
+    });
+  }, [msgs]);
 
   useEffect(() => {
     const last = msgs[msgs.length - 1];
@@ -765,22 +913,78 @@ export const ChatPanel: React.FC<{
     return () => window.removeEventListener("__integradedConfigUpdated", loadConfig);
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const raw = await invoke<string | null>("load_chat_history");
+        if (!active) return;
+        if (raw) {
+          const payload = JSON.parse(raw);
+          const diskHistories = Array.isArray(payload.histories)
+            ? payload.histories.map(normalizeHistory).filter(Boolean) as ChatHistory[]
+            : [];
+          if (payload.current_session) {
+            const current = normalizeHistory(payload.current_session);
+            if (current) {
+              setCurrentChatMeta({
+                id: current.id,
+                createdAt: current.createdAt,
+                folderName: current.folderName || chatFolderName(current.createdAt, current.id),
+              });
+              setMsgs(current.msgs || []);
+              setContextWindow(current.contextWindow || current.msgs.reduce((ctx, msg) => appendContextWindow(ctx, msg), ""));
+            }
+          } else if (Array.isArray(payload.current_msgs)) {
+            setMsgs(payload.current_msgs);
+            setContextWindow(typeof payload.current_context === "string" ? payload.current_context : "");
+          }
+          if (diskHistories.length) setHistories(diskHistories);
+        }
+      } catch {
+        // LocalStorage initializers already provide an offline fallback.
+      } finally {
+        if (active) setHistoryHydrated(true);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const buildHistoryPayload = (nextMsgs = msgs, nextContext = contextWindow, nextHistories = histories) => {
+    const currentName = nextMsgs.find(m => m.role === "user")?.body.slice(0, 60) || "Current chat";
+    return JSON.stringify({
+      current_msgs: nextMsgs,
+      current_context: nextContext,
+      current_session: {
+        ...currentChatMetaRef.current,
+        name: currentName,
+        msgs: nextMsgs,
+        contextWindow: nextContext,
+      },
+      histories: nextHistories,
+    });
+  };
+
   // Persistence synchronizations
   useEffect(() => {
+    if (!historyHydrated) return;
     try {
       localStorage.setItem("integraded_chat_current_msgs", JSON.stringify(msgs));
     } catch {}
-    const payload = JSON.stringify({ current_msgs: msgs, current_context: contextWindow, histories });
+    const payload = buildHistoryPayload(msgs, contextWindow, histories);
     invoke("save_chat_history", { jsonData: payload }).catch(() => {});
-  }, [msgs, contextWindow]);
+  }, [msgs, contextWindow, historyHydrated]);
 
   useEffect(() => {
+    if (!historyHydrated) return;
     try {
       localStorage.setItem("integraded_chat_histories", JSON.stringify(histories));
     } catch {}
-    const payload = JSON.stringify({ current_msgs: msgs, current_context: contextWindow, histories });
+    const payload = buildHistoryPayload(msgs, contextWindow, histories);
     invoke("save_chat_history", { jsonData: payload }).catch(() => {});
-  }, [histories, contextWindow, msgs]);
+  }, [histories, contextWindow, msgs, currentChatMeta, historyHydrated]);
 
   useEffect(() => {
     try { localStorage.setItem("integraded_chat_context_window", contextWindow); } catch {}
@@ -801,6 +1005,8 @@ export const ChatPanel: React.FC<{
       setToolCalls([]);
       setAgentQuestions([]);
       setPendingAgentRequests([]);
+      setCurrentChatMeta(createChatMeta());
+      lastDiffSignatureRef.current = "";
     };
     window.addEventListener("__integradedChatHistoryCleared", handleClear);
     return () => window.removeEventListener("__integradedChatHistoryCleared", handleClear);
@@ -915,6 +1121,31 @@ export const ChatPanel: React.FC<{
     if (additions.length) setMsgs(prev => [...prev, ...additions]);
   }, [sessionsProp, terminalOutputsProp, terminalTranscriptsProp]);
 
+  // Keep diff-view changes as regular chat history entries so every chat session
+  // carries the file-change context that happened during that session.
+  useEffect(() => {
+    if (!historyHydrated) return;
+    const files = changedFiles.slice(0, 12);
+    const signature = diffSignature(files);
+    if (signature === lastDiffSignatureRef.current) return;
+    lastDiffSignatureRef.current = signature;
+    if (!files.length) return;
+    const log: DiffLog = {
+      id: `diff-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      files,
+      total: changedFiles.length,
+      ts: ts(),
+    };
+    setMsgs(prev => [...prev, {
+      id: log.id,
+      role: "ai",
+      agent: "diff",
+      body: formatDiffLogBody(log),
+      diffLog: log,
+      ts: log.ts,
+    }]);
+  }, [changedFiles, historyHydrated]);
+
   // Fulfill queued agent requests as soon as the user adds matching terminals.
   useEffect(() => {
     if (!pendingAgentRequestsRef.current.length) return;
@@ -987,12 +1218,22 @@ export const ChatPanel: React.FC<{
   const saveAndNewChat = () => {
     if (msgs.length > 0) {
       const name = msgs.find(m => m.role === "user")?.body.slice(0, 60) || "Chat";
-      setHistories(prev => [{ id: `h${Date.now()}`, name, msgs: [...msgs], contextWindow, createdAt: Date.now() }, ...prev]);
+      setHistories(prev => [{
+        id: currentChatMeta.id,
+        name,
+        msgs: [...msgs],
+        contextWindow,
+        createdAt: currentChatMeta.createdAt,
+        folderName: currentChatMeta.folderName,
+      }, ...prev]);
     }
     setMsgs([]);
     setContextWindow("");
     setComposerAttachments([]);
+    setImagePreview(null);
+    setCurrentChatMeta(createChatMeta());
     lastContextMsgIdRef.current = null;
+    lastDiffSignatureRef.current = diffSignature(changedFilesRef.current);
     setAgentQuestions([]);
     setHistoryOpen(false);
   };
@@ -1001,16 +1242,28 @@ export const ChatPanel: React.FC<{
     if (msgs.length > 0) {
       const name = msgs.find(m => m.role === "user")?.body.slice(0, 60) || "Chat";
       setHistories(prev => [
-        { id: `h${Date.now()}`, name, msgs: [...msgs], contextWindow, createdAt: Date.now() },
+        {
+          id: currentChatMeta.id,
+          name,
+          msgs: [...msgs],
+          contextWindow,
+          createdAt: currentChatMeta.createdAt,
+          folderName: currentChatMeta.folderName,
+        },
         ...prev.filter(x => x.id !== h.id),
       ]);
     } else {
       setHistories(prev => prev.filter(x => x.id !== h.id));
     }
+    const folderName = h.folderName || chatFolderName(h.createdAt, h.id);
+    setCurrentChatMeta({ id: h.id, createdAt: h.createdAt, folderName });
     setMsgs(h.msgs);
     setContextWindow(h.contextWindow || h.msgs.reduce((ctx, msg) => appendContextWindow(ctx, msg), ""));
     setComposerAttachments([]);
+    setImagePreview(null);
     lastContextMsgIdRef.current = h.msgs[h.msgs.length - 1]?.id || null;
+    const lastDiff = [...h.msgs].reverse().find(msg => msg.diffLog)?.diffLog;
+    lastDiffSignatureRef.current = lastDiff ? diffSignature(lastDiff.files) : diffSignature(changedFilesRef.current);
     setAgentQuestions([]);
     setHistoryOpen(false);
   };
@@ -1076,27 +1329,32 @@ export const ChatPanel: React.FC<{
     streamTextRef.current = "";
     streamThinkingRef.current = "";
     streamThinkingStartRef.current = Date.now();
+    streamThinkingElapsedRef.current = null;
 
     streamUnlistenRef.current = (await listen<string>(`stream-chunk-${sid}`, (e) => {
       if (activeStreamIdRef.current !== sid) return;
       const thinkingDelta = parseStreamThinking(e.payload, req.provider);
       if (thinkingPreviewEnabled && thinkingDelta) {
         streamThinkingRef.current += thinkingDelta;
-        const elapsedMs = Date.now() - streamThinkingStartRef.current;
+        const elapsedMs = streamThinkingElapsedRef.current ?? Date.now() - streamThinkingStartRef.current;
         setMsgs(p => p.map(m => m.id === msgId ? {
           ...m,
-          thinking: { text: streamThinkingRef.current, elapsedMs, open: true },
+          thinking: { text: streamThinkingRef.current, elapsedMs, open: m.thinking?.open ?? true, done: false },
         } : m));
       }
       const delta = parseStreamDelta(e.payload, req.provider);
       if (delta) {
         streamTextRef.current += delta;
-        const elapsedMs = Date.now() - streamThinkingStartRef.current;
+        const justFinishedThinking = streamThinkingElapsedRef.current === null;
+        if (justFinishedThinking) {
+          streamThinkingElapsedRef.current = Math.max(0, Date.now() - streamThinkingStartRef.current);
+        }
+        const elapsedMs = streamThinkingElapsedRef.current ?? 0;
         setMsgs(p => p.map(m => m.id === msgId ? {
           ...m,
           body: visibleStreamText(streamTextRef.current),
           thinking: thinkingPreviewEnabled
-            ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: false, done: true }
+            ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: justFinishedThinking ? false : (m.thinking?.open ?? false), done: true }
             : m.thinking,
         } : m));
       }
@@ -1108,13 +1366,14 @@ export const ChatPanel: React.FC<{
       activeStreamIdRef.current = null;
       streamUnlistenRef.current?.();
       streamUnlistenRef.current = null;
-      const elapsedMs = Math.max(0, Date.now() - streamThinkingStartRef.current);
+      const elapsedMs = streamThinkingElapsedRef.current ?? Math.max(0, Date.now() - streamThinkingStartRef.current);
+      streamThinkingElapsedRef.current = elapsedMs;
       setMsgs(p => p.map(m => m.id === msgId ? {
         ...m,
         streaming: false,
         body: visibleStreamText(streamTextRef.current),
         thinking: thinkingPreviewEnabled
-          ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: false, done: true }
+          ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: m.thinking?.open ?? false, done: true }
           : m.thinking,
       } : m));
     }
@@ -1128,12 +1387,13 @@ export const ChatPanel: React.FC<{
     streamUnlistenRef.current?.();
     streamUnlistenRef.current = null;
     setIsProcessing(false);
-    const elapsedMs = Math.max(0, Date.now() - streamThinkingStartRef.current);
+    const elapsedMs = streamThinkingElapsedRef.current ?? Math.max(0, Date.now() - streamThinkingStartRef.current);
+    streamThinkingElapsedRef.current = elapsedMs;
     setMsgs(p => p.map(m => m.streaming ? {
       ...m,
       streaming: false,
       body: visibleStreamText(streamTextRef.current),
-      thinking: m.thinking ? { ...m.thinking, elapsedMs, open: false, done: true } : m.thinking,
+      thinking: m.thinking ? { ...m.thinking, elapsedMs, open: m.thinking.open, done: true } : m.thinking,
     } : m));
   };
 
@@ -1467,7 +1727,9 @@ export const ChatPanel: React.FC<{
         {attachments.map(att => (
           <div key={att.id} className={`chat-attachment att-${att.type}`}>
             {(att.type === "image" || att.type === "browser-selection") && att.url ? (
-              <img src={att.url} alt={att.name} className="chat-attachment-image" />
+              <button type="button" className="chat-attachment-image-btn" onClick={() => setImagePreview(att)} title="Open image preview">
+                <img src={att.url} alt={att.name} className="chat-attachment-image" />
+              </button>
             ) : (
               <i className="bx bx-file" />
             )}
@@ -1481,6 +1743,45 @@ export const ChatPanel: React.FC<{
     );
   };
 
+  const renderDiffLog = (log: DiffLog) => (
+    <div className="chat-diff-message">
+      <div className="chat-diff-message-head">
+        <span className="chat-diff-kicker"><i className="bx bx-git-compare" /> Diff view</span>
+        <span className="chat-diff-count">{log.total} file{log.total !== 1 ? "s" : ""}</span>
+      </div>
+      <div className="chat-diff-files">
+        {log.files.map(file => (
+          <button
+            key={`${log.id}-${file.path}`}
+            type="button"
+            className="chat-diff-file"
+            onClick={() => onOpenDiffFile?.(file.path, file.name)}
+            title={file.path}
+          >
+            <span className={`chat-diff-status ${file.status}`}>{file.status === "new" ? "NEW" : "MOD"}</span>
+            <span className="chat-diff-name">{file.name}</span>
+            <span className="chat-diff-path">{file.path}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
+  const renderToolLog = (log: ToolCallLog) => {
+    const note = toolLogNote(log);
+    return (
+      <div className={`chat-tool-message status-${log.status}`}>
+        <div className="chat-tool-message-row">
+          <span className="chat-tool-status">{log.status}</span>
+          <span className="chat-tool-action">{log.action.type.replace("_", ".")}</span>
+          <span className="chat-tool-arrow">{"->"}</span>
+          <span className="chat-tool-target">{toolLogTarget(log)}</span>
+        </div>
+        {note && <div className="chat-tool-message-note">{note}</div>}
+      </div>
+    );
+  };
+
   const toggleThinking = (msgId: string) => {
     setMsgs(prev => prev.map(msg => msg.id === msgId && msg.thinking
       ? { ...msg, thinking: { ...msg.thinking, open: !msg.thinking.open } }
@@ -1489,12 +1790,26 @@ export const ChatPanel: React.FC<{
   };
 
   return (
-    <div className={`chat-panel ${embedded ? "embedded" : ""}`}>
+    <div ref={chatPanelRef} className={`chat-panel ${embedded ? "embedded" : ""}`}>
+      {imagePreview?.url && (
+        <div className="chat-image-lightbox" role="dialog" aria-modal="true" onClick={() => setImagePreview(null)}>
+          <div className="chat-image-lightbox-inner" onClick={event => event.stopPropagation()}>
+            <button type="button" className="chat-image-lightbox-close" onClick={() => setImagePreview(null)} title="Close image preview">
+              <i className="bx bx-x" />
+            </button>
+            <img src={imagePreview.url} alt={imagePreview.name} />
+            <div className="chat-image-lightbox-caption">{imagePreview.name}</div>
+          </div>
+        </div>
+      )}
 
       {/* ── Header ── */}
       <div className="chat-panel-header">
         <div className="chat-header-left">
-          <span className={`chat-header-dot ${models.length > 0 ? "online" : "offline"}`} />
+          <span className="chat-header-logo-wrap">
+            <img src="/logo.svg" className="chat-header-logo" alt="" />
+            <span className={`chat-header-dot ${models.length > 0 ? "online" : "offline"}`} />
+          </span>
           <span className="chat-header-title">Integraded Chat</span>
         </div>
 
@@ -1689,14 +2004,22 @@ export const ChatPanel: React.FC<{
               <div key={m.id} className={`chat-msg ${m.agent || "ai"}`}>
                 <div className="chat-msg-ai-wrap">
                   <span className={`chat-avatar ${m.agent || "ai"}`}>
-                    <i className={`bx ${m.agent === "system" ? "bx-error-circle" : m.agent === "tool" ? "bx-list-check" : "bx-robot"}`} />
+                    {m.agent === "system" ? (
+                      <i className="bx bx-error-circle" />
+                    ) : m.agent === "tool" ? (
+                      <i className="bx bx-list-check" />
+                    ) : m.agent === "diff" ? (
+                      <i className="bx bx-git-compare" />
+                    ) : (
+                      <img src="/logo.svg" className="chat-avatar-logo" alt="" />
+                    )}
                   </span>
                   <div className="chat-msg-ai-content">
-                    <div className="chat-msg-meta">
-                      <span className="chat-sender">{m.agent === "system" ? "System" : m.agent === "tool" ? "Tool call" : "Integraded"}</span>
-                      <span className="chat-ts">{m.ts}</span>
-                    </div>
-                    <div className={`chat-bubble-ai${m.agent === "system" ? " system-msg" : ""}${m.agent === "tool" ? " tool-msg" : ""}`}>
+                <div className="chat-msg-meta">
+                  <span className="chat-sender">{m.agent === "system" ? "System" : m.agent === "tool" ? "Tool call" : m.agent === "diff" ? "Diff view" : "Integraded"}</span>
+                  <span className="chat-ts">{m.ts}</span>
+                </div>
+                <div className={`chat-bubble-ai${m.agent === "system" ? " system-msg" : ""}${m.agent === "tool" ? " tool-msg" : ""}${m.agent === "diff" ? " diff-msg" : ""}`}>
                       {m.thinking && (
                         <div className={`chat-thinking ${m.thinking.open ? "open" : ""}`}>
                           <button type="button" className="chat-thinking-head" onClick={() => toggleThinking(m.id)}>
@@ -1706,34 +2029,15 @@ export const ChatPanel: React.FC<{
                           {m.thinking.open && <div className="chat-thinking-body">{m.thinking.text}</div>}
                         </div>
                       )}
-                      <div className="chat-bubble-body">
-                        {m.body ? formatBody(m.body) : null}
+                  <div className="chat-bubble-body">
+                    {m.agent === "tool" && m.toolLog
+                      ? renderToolLog(m.toolLog)
+                      : m.agent === "diff" && m.diffLog
+                        ? renderDiffLog(m.diffLog)
+                        : (m.body ? formatBody(m.body) : null)}
                         {renderAttachments(m.attachments)}
                         {m.streaming && <span className="chat-stream-cursor" />}
                       </div>
-                      {m.actions && m.actions.length > 0 && !m.streaming && (
-                        <div className="chat-dispatch">
-                          <div className="chat-dispatch-title"><i className="bx bx-chip" /> Dispatched</div>
-                          {m.actions.map((a, i) => (
-                            <div key={i} className={`chat-dispatch-card dispatch-${a.type}`}>
-                              <div className="chat-dispatch-header">
-                                <span className={`chat-dispatch-type dispatch-type-${a.type}`}>{a.type}</span>
-                                <span className="chat-dispatch-label">{a.label}</span>
-                                {a.agentType && <span className="chat-dispatch-agent">{a.agentType}</span>}
-                                <i className="bx bx-check-circle chat-dispatch-ok" />
-                              </div>
-                              {(a.prompt || a.question || a.reason || a.url) && (
-                                <div className="chat-dispatch-prompt">
-                                  {(() => {
-                                    const preview = a.prompt || a.question || a.reason || a.url || "";
-                                    return preview.length > 130 ? preview.slice(0, 130) + "..." : preview;
-                                  })()}
-                                </div>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
                     </div>
                   </div>
                 </div>
@@ -1745,7 +2049,7 @@ export const ChatPanel: React.FC<{
         {isProcessing && !msgs.some(m => m.streaming) && (
           <div className="chat-msg orchestrator">
             <div className="chat-msg-ai-wrap">
-              <span className="chat-avatar orchestrator"><i className="bx bx-robot" /></span>
+              <span className="chat-avatar orchestrator"><img src="/logo.svg" className="chat-avatar-logo" alt="" /></span>
               <div className="chat-msg-ai-content">
                 <div className="chat-msg-meta">
                   <span className="chat-sender">Integraded</span>

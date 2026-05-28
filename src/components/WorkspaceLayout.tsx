@@ -221,12 +221,14 @@ const RightPanel: React.FC<RightPanelProps> = ({
             terminalTranscripts={terminalTranscripts}
             externalPrompt={externalPrompt}
             mentionFiles={mentionFiles}
+            changedFiles={changedFiles}
             onSendPtyCommand={onSendPtyCommand}
             onAddSession={onAddSession}
             onCloseSession={onCloseSession}
             onRestartSession={onRestartSession}
             onChangeSessionAgent={onChangeSessionAgent}
             onOpenBrowser={openBrowser}
+            onOpenDiffFile={(path, name) => onFileSelect(path, name, baselineSnapshot[path])}
           />
         ) : (
         <ChangesViewer
@@ -275,6 +277,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
 
   // New States for Changes & Diff tracking
   const [baselineSnapshot, setBaselineSnapshot] = useState<Record<string, string>>({});
+  const [baselineReady, setBaselineReady] = useState(false);
   const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([]);
   const [terminalOutputs, setTerminalOutputs] = useState<Record<string, string>>({});
   const [terminalTranscripts, setTerminalTranscripts] = useState<Record<string, TerminalTranscriptEntry[]>>({});
@@ -319,6 +322,8 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   // ── Baseline Snapshotting ────────────────────────────────────────────────
   useEffect(() => {
     if (!directory) return;
+    setBaselineReady(false);
+    setChangedFiles([]);
     const takeBaseline = async () => {
       try {
         // Initialize secure workspace scoping in backend first
@@ -336,8 +341,11 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
           }
         }
         setBaselineSnapshot(snapshot);
+        setBaselineReady(true);
       } catch (err) {
         console.error("Failed to take baseline snapshot:", err);
+        setBaselineSnapshot({});
+        setBaselineReady(true);
       }
     };
     takeBaseline();
@@ -345,7 +353,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
 
   // ── Periodic Files Scanner (every 2.5s) ──────────────────────────────────
   useEffect(() => {
-    if (!directory || Object.keys(baselineSnapshot).length === 0) return;
+    if (!directory || !baselineReady) return;
 
     const scan = async () => {
       try {
@@ -374,9 +382,10 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
       }
     };
 
+    scan();
     const id = setInterval(scan, 2500);
     return () => clearInterval(id);
-  }, [directory, baselineSnapshot]);
+  }, [directory, baselineSnapshot, baselineReady]);
 
 
 

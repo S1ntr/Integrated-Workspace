@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
@@ -473,27 +473,81 @@ fn copy_item(src_path: String, dest_path: String, state: State<'_, WorkspaceStat
     }
 }
 
+fn chat_history_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
+    Ok(home.join("chat-history"))
+}
+
+fn legacy_chat_history_paths(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
+    let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
+    let workspace = home.join(".integraded-workspace");
+    Ok(vec![
+        workspace.join("chat-history").join("chat_history.json"),
+        workspace.join("chat_history.json"),
+    ])
+}
+
+fn safe_chat_folder_name(value: &str) -> String {
+    let clean: String = value
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    clean.trim_matches('-').chars().take(96).collect::<String>()
+}
+
+fn write_chat_session_folder(root: &Path, session: &serde_json::Value) -> Result<(), String> {
+    let fallback_created = session.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    let fallback_id = session.get("id").and_then(|v| v.as_str()).unwrap_or("chat");
+    let requested = session
+        .get("folderName")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{}_{}", fallback_created, fallback_id));
+    let folder_name = safe_chat_folder_name(&requested);
+    if folder_name.is_empty() {
+        return Ok(());
+    }
+    let dir = root.join(folder_name);
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create chat session dir: {}", e))?;
+    let pretty = serde_json::to_string_pretty(session).map_err(|e| format!("Failed to serialize chat session: {}", e))?;
+    fs::write(dir.join("chat_history.json"), pretty.as_bytes()).map_err(|e| format!("Failed to write chat session: {}", e))
+}
+
 #[tauri::command]
 fn save_chat_history(json_data: String, app: AppHandle) -> Result<(), String> {
-    let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
-    let chat_dir = home.join(".integraded-workspace").join("chat-history");
+    let chat_dir = chat_history_root(&app)?;
     fs::create_dir_all(&chat_dir).map_err(|e| format!("Failed to create chat history dir: {}", e))?;
+
     let file_path = chat_dir.join("chat_history.json");
-    fs::write(file_path, json_data.as_bytes()).map_err(|e| format!("Failed to write chat history: {}", e))
+    fs::write(&file_path, json_data.as_bytes()).map_err(|e| format!("Failed to write chat history: {}", e))?;
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_data) {
+        if let Some(current) = value.get("current_session") {
+            let _ = write_chat_session_folder(&chat_dir, current);
+        }
+        if let Some(histories) = value.get("histories").and_then(|v| v.as_array()) {
+            for session in histories {
+                let _ = write_chat_session_folder(&chat_dir, session);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
 fn load_chat_history(app: AppHandle) -> Result<Option<String>, String> {
-    let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
-    let workspace = home.join(".integraded-workspace");
-    let new_path = workspace.join("chat-history").join("chat_history.json");
-    let old_path = workspace.join("chat_history.json");
+    let chat_dir = chat_history_root(&app)?;
+    let new_path = chat_dir.join("chat_history.json");
 
-    // migrate old file location if needed
-    if !new_path.exists() && old_path.exists() {
-        let chat_dir = workspace.join("chat-history");
-        fs::create_dir_all(&chat_dir).map_err(|e| format!("Failed to create chat history dir: {}", e))?;
-        fs::rename(&old_path, &new_path).ok();
+    if !new_path.exists() {
+        for legacy in legacy_chat_history_paths(&app)? {
+            if legacy.exists() {
+                fs::create_dir_all(&chat_dir).map_err(|e| format!("Failed to create chat history dir: {}", e))?;
+                fs::copy(&legacy, &new_path).ok();
+                break;
+            }
+        }
     }
 
     if new_path.exists() {
@@ -502,6 +556,24 @@ fn load_chat_history(app: AppHandle) -> Result<Option<String>, String> {
     } else {
         Ok(None)
     }
+}
+
+#[tauri::command]
+fn clear_chat_history(app: AppHandle) -> Result<(), String> {
+    let chat_dir = chat_history_root(&app)?;
+    if chat_dir.exists() {
+        fs::remove_dir_all(&chat_dir).map_err(|e| format!("Failed to clear chat history: {}", e))?;
+    }
+    let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
+    let legacy_dir = home.join(".integraded-workspace").join("chat-history");
+    if legacy_dir.exists() {
+        let _ = fs::remove_dir_all(legacy_dir);
+    }
+    let legacy_file = home.join(".integraded-workspace").join("chat_history.json");
+    if legacy_file.exists() {
+        let _ = fs::remove_file(legacy_file);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -893,6 +965,7 @@ pub fn run() {
             copy_item,
             save_chat_history,
             load_chat_history,
+            clear_chat_history,
             check_agent_installed,
             pty_create,
             pty_write,
