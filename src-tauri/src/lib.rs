@@ -499,6 +499,17 @@ fn chat_history_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(home.join("chat-history"))
 }
 
+fn scoped_chat_history_root(app: &AppHandle, scope: Option<String>) -> Result<PathBuf, String> {
+    let root = chat_history_root(app)?;
+    if let Some(scope_value) = scope {
+        let safe = safe_chat_folder_name(&scope_value);
+        if !safe.is_empty() && safe != "default" {
+            return Ok(root.join("workspaces").join(safe));
+        }
+    }
+    Ok(root)
+}
+
 fn legacy_chat_history_paths(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
     let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
     let workspace = home.join(".integraded-workspace");
@@ -535,8 +546,8 @@ fn write_chat_session_folder(root: &Path, session: &serde_json::Value) -> Result
 }
 
 #[tauri::command]
-fn save_chat_history(json_data: String, app: AppHandle) -> Result<(), String> {
-    let chat_dir = chat_history_root(&app)?;
+fn save_chat_history(json_data: String, scope: Option<String>, app: AppHandle) -> Result<(), String> {
+    let chat_dir = scoped_chat_history_root(&app, scope)?;
     fs::create_dir_all(&chat_dir).map_err(|e| format!("Failed to create chat history dir: {}", e))?;
 
     let file_path = chat_dir.join("chat_history.json");
@@ -557,11 +568,15 @@ fn save_chat_history(json_data: String, app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn load_chat_history(app: AppHandle) -> Result<Option<String>, String> {
-    let chat_dir = chat_history_root(&app)?;
+fn load_chat_history(scope: Option<String>, app: AppHandle) -> Result<Option<String>, String> {
+    let is_scoped = scope.as_ref().map(|s| {
+        let safe = safe_chat_folder_name(s);
+        !safe.is_empty() && safe != "default"
+    }).unwrap_or(false);
+    let chat_dir = scoped_chat_history_root(&app, scope)?;
     let new_path = chat_dir.join("chat_history.json");
 
-    if !new_path.exists() {
+    if !new_path.exists() && !is_scoped {
         for legacy in legacy_chat_history_paths(&app)? {
             if legacy.exists() {
                 fs::create_dir_all(&chat_dir).map_err(|e| format!("Failed to create chat history dir: {}", e))?;

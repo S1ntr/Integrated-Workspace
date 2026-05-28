@@ -122,6 +122,13 @@ interface ChatSessionMeta {
   folderName: string;
 }
 
+interface WorkMonitor {
+  id: string;
+  startedAt: number;
+  actions: number;
+  labels: string[];
+}
+
 interface ModelEntry {
   value: string;
   label?: string;
@@ -436,6 +443,7 @@ function detectAgentCompletionSummary(text: string): string | null {
   const lines = cleaned.split("\n").map(l => l.trim()).filter(Boolean).slice(-18);
   const joined = lines.join("\n");
   if (detectTerminalQuestion(joined)) return null;
+  if (looksLikeTerminalNoise(joined)) return null;
   if (!/\b(summary|changes made|task complete|completed|finished|all set|done|implemented|fixed)\b/i.test(joined)) {
     return null;
   }
@@ -445,8 +453,11 @@ function detectAgentCompletionSummary(text: string): string | null {
   const summaryLines = lines
     .filter(line => !/^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(line))
     .filter(line => !/^thought:?/i.test(line))
+    .filter(line => !looksLikeTerminalNoise(line))
     .slice(-8);
-  return summaryLines.join("\n").slice(0, 900);
+  const summary = summaryLines.join("\n").slice(0, 900);
+  if (!summary || looksLikeTerminalNoise(summary)) return null;
+  return summary;
 }
 
 // ─── Orchestrator system prompt ───────────────────────────────────────────────
@@ -525,7 +536,10 @@ If your model has trouble with XML, a fenced JSON block named tool_call is also 
 10. When an agent finishes, convert its terminal output into a concise visible summary of changed files, integrations, tests, and remaining risks. Do not show a question card unless the terminal is clearly waiting for user input.
 11. After dispatching, briefly summarize what each agent is doing (visible to user)
 12. The user may mention files with @filename, @path/file, or quoted @"path with spaces". Pass exact resolved paths to agents and tell them to inspect those files before editing. If a mention is unresolved, tell the agent to locate it with workspace search before touching files.
-13. If the task is naturally parallel and multiple agents are already open, split it across those agents. If there are not enough useful agents, use agent.request.
+13. Default to parallel coordination for non-trivial build/fix requests. When 2+ compatible agents are active and the work can be separated by file, layer, test, or review responsibility, emit multiple tool calls in the same response: one focused \`agent.send\` or \`agent.spawn\` per useful agent. Do not stop after assigning the first agent.
+14. Use all helpful active agents when possible, with non-overlapping ownership. Good splits include UI/CSS, data/API, tests/build, bug diagnosis, docs, and review. Only use a single agent when the task is clearly tiny, single-file, or unsafe to parallelize.
+15. After dispatching, keep monitoring all terminal transcripts. If agents ask simple confirmation/follow-up questions that are answered by the user's instructions, answer them with \`agent.send\`. If not clear, use \`chat.ask_user\`.
+16. When all dispatched agents are quiet and no unanswered questions remain, provide one concise final project-ready summary with changed files, verification, risks, and run/preview hints. Avoid repeating noisy terminal UI output.
 
 ## Session Context Window
 ${contextWindow || "(no prior session context)"}
@@ -587,6 +601,71 @@ function relativeTime(ts: number): string {
 function compactText(value: string, limit = 900): string {
   const clean = stripAgentTags(value || "").replace(/\s+/g, " ").trim();
   return clean.length > limit ? `${clean.slice(0, limit)}...` : clean;
+}
+
+function safeStorageScope(value: string): string {
+  const clean = (value || "default")
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96);
+  return clean || "default";
+}
+
+function normalizeMessages(raw: any): Msg[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(msg => msg && typeof msg === "object")
+    .filter(msg => msg.agent !== "diff") as Msg[];
+}
+
+function summarySignature(text: string): string {
+  return compactText(
+    stripAnsi(text)
+      .toLowerCase()
+      .replace(/[^a-z0-9 .,;:!?()[\]{}@#%&+=_\-/\\|<>]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+    360,
+  );
+}
+
+function looksLikeTerminalNoise(text: string): boolean {
+  const compact = stripAnsi(text).replace(/\s/g, "");
+  if (compact.length < 24) return false;
+  if (/[█▄▀▌▐░▒▓■□▪▫●○◆◇]{2,}/.test(compact)) return true;
+  const unusual = compact.replace(/[a-zA-Z0-9.,:;!?()[\]{}'"`@#%&+=_\-/\\|<>~$*]/g, "").length;
+  return unusual / compact.length > 0.34;
+}
+
+function extractLocalUrls(outputs: Record<string, string>): string[] {
+  const text = Object.values(outputs).join("\n");
+  const matches = text.match(/\bhttps?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?[^\s'"<>)]*/gi) || [];
+  return Array.from(new Set(matches.map(raw =>
+    raw.replace(/^http:\/\/0\.0\.0\.0/i, "http://127.0.0.1").replace(/^https:\/\/0\.0\.0\.0/i, "https://127.0.0.1")
+  ))).slice(0, 4);
+}
+
+function buildAgentsReadySummary(
+  monitor: WorkMonitor,
+  sessions: Session[],
+  outputs: Record<string, string>,
+  changedFiles: ChatDiffFile[],
+): string {
+  const labels = monitor.labels.length ? monitor.labels.join(", ") : `${monitor.actions} agent action${monitor.actions === 1 ? "" : "s"}`;
+  const files = changedFiles.slice(0, 10).map(file => `- ${file.status === "new" ? "NEW" : "MOD"} ${file.name}`);
+  const urls = extractLocalUrls(outputs).map(url => `- ${url}`);
+  const active = sessions.map(s => `- ${s.label} (${s.status || "unknown"})`).slice(0, 8);
+  return [
+    "**Agents look done**",
+    "",
+    "No terminal has produced fresh activity for a moment and there are no open agent questions.",
+    "",
+    `**Coordinated work**: ${labels}`,
+    active.length ? `\n**Sessions**\n${active.join("\n")}` : "",
+    files.length ? `\n**Changed files**\n${files.join("\n")}${changedFiles.length > files.length ? `\n- ...and ${changedFiles.length - files.length} more` : ""}` : "",
+    urls.length ? `\n**Local preview**\n${urls.join("\n")}` : "",
+    "\nOpen `Changes` to review the diff before you run or commit it.",
+  ].filter(Boolean).join("\n");
 }
 
 function formatAttachmentsForPrompt(attachments?: ChatAttachment[]): string {
@@ -651,10 +730,11 @@ function normalizeHistory(raw: any): ChatHistory | null {
   if (!raw || !Array.isArray(raw.msgs)) return null;
   const createdAt = typeof raw.createdAt === "number" ? raw.createdAt : Date.now();
   const id = typeof raw.id === "string" ? raw.id : `h${createdAt}`;
+  const msgs = normalizeMessages(raw.msgs);
   return {
     id,
     name: typeof raw.name === "string" ? raw.name : "Chat",
-    msgs: raw.msgs,
+    msgs,
     contextWindow: typeof raw.contextWindow === "string" ? raw.contextWindow : "",
     createdAt,
     folderName: typeof raw.folderName === "string" ? raw.folderName : chatFolderName(createdAt, id),
@@ -799,6 +879,7 @@ export const ChatPanel: React.FC<{
   terminalOutputs?: Record<string, string>;
   terminalTranscripts?: Record<string, TerminalTranscriptEntry[]>;
   externalPrompt?: ExternalChatPrompt | null;
+  chatStorageScope?: string;
   mentionFiles?: MentionFile[];
   changedFiles?: ChatDiffFile[];
   onSendPtyCommand?: (sessId: string, cmd: string) => void;
@@ -815,6 +896,7 @@ export const ChatPanel: React.FC<{
   terminalOutputs: terminalOutputsProp = {},
   terminalTranscripts: terminalTranscriptsProp = {},
   externalPrompt,
+  chatStorageScope,
   mentionFiles = [],
   changedFiles = [],
   onSendPtyCommand,
@@ -825,18 +907,21 @@ export const ChatPanel: React.FC<{
   onOpenBrowser,
   onOpenDiffFile,
 }) => {
+  const chatScopeKey = safeStorageScope(chatStorageScope || workspaceDir || "default");
+  const storageKey = (name: string) => `integraded_chat_${chatScopeKey}_${name}`;
+
   // ── Core state ───────────────────────────────────────────────────────────────
   const [msgs, setMsgs] = useState<Msg[]>(() => {
     try {
-      const stored = localStorage.getItem("integraded_chat_current_msgs");
-      return stored ? JSON.parse(stored) : [];
+      const stored = localStorage.getItem(storageKey("current_msgs"));
+      return stored ? normalizeMessages(JSON.parse(stored)) : [];
     } catch {
       return [];
     }
   });
   const [input, setInput] = useState("");
   const [contextWindow, setContextWindow] = useState<string>(() => {
-    try { return localStorage.getItem("integraded_chat_context_window") || ""; } catch { return ""; }
+    try { return localStorage.getItem(storageKey("context_window")) || ""; } catch { return ""; }
   });
   const [composerAttachments, setComposerAttachments] = useState<ChatAttachment[]>([]);
   const [imagePreview, setImagePreview] = useState<ChatAttachment | null>(null);
@@ -844,7 +929,7 @@ export const ChatPanel: React.FC<{
   const [isRecording, setIsRecording] = useState(false);
   const [toolCalls, setToolCalls] = useState<ToolCallLog[]>(() => {
     try {
-      const stored = localStorage.getItem("integraded_tool_calls");
+      const stored = localStorage.getItem(storageKey("tool_calls"));
       return stored ? JSON.parse(stored) : [];
     } catch {
       return [];
@@ -856,8 +941,8 @@ export const ChatPanel: React.FC<{
   // ── Chat history ─────────────────────────────────────────────────────────────
   const [histories, setHistories] = useState<ChatHistory[]>(() => {
     try {
-      const stored = localStorage.getItem("integraded_chat_histories");
-      return stored ? JSON.parse(stored) : [];
+      const stored = localStorage.getItem(storageKey("histories"));
+      return stored ? (JSON.parse(stored) || []).map(normalizeHistory).filter(Boolean) as ChatHistory[] : [];
     } catch {
       return [];
     }
@@ -887,9 +972,14 @@ export const ChatPanel: React.FC<{
   const modelDropdownRef = useRef<HTMLDivElement>(null);
   const pillBtnRef = useRef<HTMLButtonElement>(null);
   const [dropdownPos, setDropdownPos] = useState<{top:number;left:number} | null>(null);
+  const [modeDropdownOpen, setModeDropdownOpen] = useState(false);
+  const modeDropdownRef = useRef<HTMLDivElement>(null);
+  const modeBtnRef = useRef<HTMLButtonElement>(null);
+  const [modeDropdownPos, setModeDropdownPos] = useState<{top:number;left:number} | null>(null);
 
   // ── Refs ─────────────────────────────────────────────────────────────────────
   const endRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
   const chatPanelRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -897,9 +987,14 @@ export const ChatPanel: React.FC<{
   const streamUnlistenRef = useRef<(() => void) | null>(null);
   const streamTextRef = useRef("");
   const streamThinkingRef = useRef("");
-  const streamThinkingStartRef = useRef(0);
+  const streamThinkingStartRef = useRef<number | null>(null);
   const streamThinkingElapsedRef = useRef<number | null>(null);
   const activeStreamIdRef = useRef<string | null>(null);
+  const [chatAtBottom, setChatAtBottom] = useState(true);
+  const chatAtBottomRef = useRef(true);
+  const [workMonitor, setWorkMonitor] = useState<WorkMonitor | null>(null);
+  const workMonitorRef = useRef<WorkMonitor | null>(null);
+  const isProcessingRef = useRef(isProcessing);
 
   const onSendPtyCommandRef = useRef(onSendPtyCommand);
   const onAddSessionRef = useRef(onAddSession);
@@ -918,7 +1013,9 @@ export const ChatPanel: React.FC<{
   const changedFilesRef = useRef(changedFiles);
   const seenQuestionKeysRef = useRef<Set<string>>(new Set());
   const seenSummaryKeysRef = useRef<Set<string>>(new Set());
+  const lastSummaryBySessionRef = useRef<Record<string, { sig: string; at: number }>>({});
   const lastDiffSignatureRef = useRef("");
+  const lastReadySummaryRef = useRef("");
   const usedPromptSessionIdsRef = useRef<Set<string>>(new Set());
   const handledExternalPromptRef = useRef<string | null>(null);
   const lastContextMsgIdRef = useRef<string | null>(null);
@@ -940,11 +1037,29 @@ export const ChatPanel: React.FC<{
   mentionFilesRef.current = mentionFiles;
   changedFilesRef.current = changedFiles;
   currentChatMetaRef.current = currentChatMeta;
+  workMonitorRef.current = workMonitor;
+  isProcessingRef.current = isProcessing;
+
+  const updateChatAtBottom = () => {
+    const el = messagesRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 28;
+    chatAtBottomRef.current = atBottom;
+    setChatAtBottom(atBottom);
+  };
+
+  const scrollChatToBottom = (behavior: ScrollBehavior = "smooth") => {
+    const el = messagesRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+    chatAtBottomRef.current = true;
+    setChatAtBottom(true);
+  };
 
   // ── Effects ──────────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (chatAtBottomRef.current) requestAnimationFrame(() => scrollChatToBottom("smooth"));
     requestAnimationFrame(() => {
       const bodies = chatPanelRef.current?.querySelectorAll<HTMLElement>(".chat-thinking.open .chat-thinking-body");
       bodies?.forEach(body => {
@@ -974,6 +1089,9 @@ export const ChatPanel: React.FC<{
       const inPill = modelDropdownRef.current?.contains(target);
       const inDropdown = (target as Element)?.closest?.('[data-model-dropdown]');
       if (!inPill && !inDropdown) setModelDropdownOpen(false);
+      const inModePill = modeDropdownRef.current?.contains(target);
+      const inModeDropdown = (target as Element)?.closest?.('[data-mode-dropdown]');
+      if (!inModePill && !inModeDropdown) setModeDropdownOpen(false);
 
       if (historyRef.current && !historyRef.current.contains(target)) setHistoryOpen(false);
       if (termPickerRef.current && !termPickerRef.current.contains(target)) setTermPickerOpen(false);
@@ -997,13 +1115,13 @@ export const ChatPanel: React.FC<{
     loadConfig();
     window.addEventListener("__integradedConfigUpdated", loadConfig);
     return () => window.removeEventListener("__integradedConfigUpdated", loadConfig);
-  }, []);
+  }, [chatScopeKey]);
 
   useEffect(() => {
     let active = true;
     (async () => {
       try {
-        const raw = await invoke<string | null>("load_chat_history");
+        const raw = await invoke<string | null>("load_chat_history", { scope: chatScopeKey });
         if (!active) return;
         if (raw) {
           const payload = JSON.parse(raw);
@@ -1018,11 +1136,12 @@ export const ChatPanel: React.FC<{
                 createdAt: current.createdAt,
                 folderName: current.folderName || chatFolderName(current.createdAt, current.id),
               });
-              setMsgs(current.msgs || []);
-              setContextWindow(current.contextWindow || current.msgs.reduce((ctx, msg) => appendContextWindow(ctx, msg), ""));
+              const cleanMsgs = normalizeMessages(current.msgs || []);
+              setMsgs(cleanMsgs);
+              setContextWindow(current.contextWindow || cleanMsgs.reduce((ctx, msg) => appendContextWindow(ctx, msg), ""));
             }
           } else if (Array.isArray(payload.current_msgs)) {
-            setMsgs(payload.current_msgs);
+            setMsgs(normalizeMessages(payload.current_msgs));
             setContextWindow(typeof payload.current_context === "string" ? payload.current_context : "");
           }
           if (diskHistories.length) setHistories(diskHistories);
@@ -1039,17 +1158,18 @@ export const ChatPanel: React.FC<{
   }, []);
 
   const buildHistoryPayload = (nextMsgs = msgs, nextContext = contextWindow, nextHistories = histories) => {
-    const currentName = nextMsgs.find(m => m.role === "user")?.body.slice(0, 60) || "Current chat";
+    const cleanMsgs = normalizeMessages(nextMsgs);
+    const currentName = cleanMsgs.find(m => m.role === "user")?.body.slice(0, 60) || "Current chat";
     return JSON.stringify({
-      current_msgs: nextMsgs,
+      current_msgs: cleanMsgs,
       current_context: nextContext,
       current_session: {
         ...currentChatMetaRef.current,
         name: currentName,
-        msgs: nextMsgs,
+        msgs: cleanMsgs,
         contextWindow: nextContext,
       },
-      histories: nextHistories,
+      histories: nextHistories.map(h => ({ ...h, msgs: normalizeMessages(h.msgs) })),
     });
   };
 
@@ -1057,30 +1177,30 @@ export const ChatPanel: React.FC<{
   useEffect(() => {
     if (!historyHydrated) return;
     try {
-      localStorage.setItem("integraded_chat_current_msgs", JSON.stringify(msgs));
+      localStorage.setItem(storageKey("current_msgs"), JSON.stringify(normalizeMessages(msgs)));
     } catch {}
     const payload = buildHistoryPayload(msgs, contextWindow, histories);
-    invoke("save_chat_history", { jsonData: payload }).catch(() => {});
-  }, [msgs, contextWindow, historyHydrated]);
+    invoke("save_chat_history", { jsonData: payload, scope: chatScopeKey }).catch(() => {});
+  }, [msgs, contextWindow, historyHydrated, chatScopeKey]);
 
   useEffect(() => {
     if (!historyHydrated) return;
     try {
-      localStorage.setItem("integraded_chat_histories", JSON.stringify(histories));
+      localStorage.setItem(storageKey("histories"), JSON.stringify(histories));
     } catch {}
     const payload = buildHistoryPayload(msgs, contextWindow, histories);
-    invoke("save_chat_history", { jsonData: payload }).catch(() => {});
-  }, [histories, contextWindow, msgs, currentChatMeta, historyHydrated]);
+    invoke("save_chat_history", { jsonData: payload, scope: chatScopeKey }).catch(() => {});
+  }, [histories, contextWindow, msgs, currentChatMeta, historyHydrated, chatScopeKey]);
 
   useEffect(() => {
-    try { localStorage.setItem("integraded_chat_context_window", contextWindow); } catch {}
-  }, [contextWindow]);
+    try { localStorage.setItem(storageKey("context_window"), contextWindow); } catch {}
+  }, [contextWindow, chatScopeKey]);
 
   useEffect(() => {
     try {
-      localStorage.setItem("integraded_tool_calls", JSON.stringify(toolCalls.slice(0, 80)));
+      localStorage.setItem(storageKey("tool_calls"), JSON.stringify(toolCalls.slice(0, 80)));
     } catch {}
-  }, [toolCalls]);
+  }, [toolCalls, chatScopeKey]);
 
   useEffect(() => {
     const handleClear = () => {
@@ -1092,7 +1212,10 @@ export const ChatPanel: React.FC<{
       setAgentQuestions([]);
       setPendingAgentRequests([]);
       setCurrentChatMeta(createChatMeta());
+      setWorkMonitor(null);
       lastDiffSignatureRef.current = "";
+      lastReadySummaryRef.current = "";
+      lastSummaryBySessionRef.current = {};
     };
     window.addEventListener("__integradedChatHistoryCleared", handleClear);
     return () => window.removeEventListener("__integradedChatHistoryCleared", handleClear);
@@ -1193,9 +1316,15 @@ export const ChatPanel: React.FC<{
       if (!wasPrompted) continue;
       const summary = detectAgentCompletionSummary(terminalOutputsProp[session.sessionId] || "");
       if (!summary) continue;
-      const key = `${session.sessionId}:${summary.slice(-220)}`;
+      const sig = summarySignature(summary);
+      const last = lastSummaryBySessionRef.current[session.sessionId];
+      if (last && (last.sig === sig || last.sig.includes(sig) || sig.includes(last.sig) || Date.now() - last.at < 15000)) {
+        continue;
+      }
+      const key = `${session.sessionId}:${sig}`;
       if (seenSummaryKeysRef.current.has(key)) continue;
       seenSummaryKeysRef.current.add(key);
+      lastSummaryBySessionRef.current[session.sessionId] = { sig, at: Date.now() };
       additions.push({
         id: `sum-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         role: "ai",
@@ -1207,29 +1336,14 @@ export const ChatPanel: React.FC<{
     if (additions.length) setMsgs(prev => [...prev, ...additions]);
   }, [sessionsProp, terminalOutputsProp, terminalTranscriptsProp]);
 
-  // Keep diff-view changes as regular chat history entries so every chat session
-  // carries the file-change context that happened during that session.
+  // Keep only the latest diff signature here. The full diff belongs in Changes,
+  // not in the chat transcript.
   useEffect(() => {
     if (!historyHydrated) return;
     const files = changedFiles.slice(0, 12);
     const signature = diffSignature(files);
     if (signature === lastDiffSignatureRef.current) return;
     lastDiffSignatureRef.current = signature;
-    if (!files.length) return;
-    const log: DiffLog = {
-      id: `diff-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      files,
-      total: changedFiles.length,
-      ts: ts(),
-    };
-    setMsgs(prev => [...prev, {
-      id: log.id,
-      role: "ai",
-      agent: "diff",
-      body: formatDiffLogBody(log),
-      diffLog: log,
-      ts: log.ts,
-    }]);
   }, [changedFiles, historyHydrated]);
 
   // Fulfill queued agent requests as soon as the user adds matching terminals.
@@ -1248,6 +1362,12 @@ export const ChatPanel: React.FC<{
         fulfilled.push(session.sessionId);
         if (request.prompt) {
           sendToSession(session, request.prompt, request.id);
+          setWorkMonitor({
+            id: `wm-${Date.now()}-${request.id}`,
+            startedAt: Date.now(),
+            actions: 1,
+            labels: [session.label],
+          });
         }
       }
       if (fulfilled.length >= request.count) {
@@ -1265,6 +1385,38 @@ export const ChatPanel: React.FC<{
     }
     setPendingAgentRequests(nextRequests);
   }, [sessionsProp]);
+
+  useEffect(() => {
+    if (!workMonitor) return;
+    const timer = window.setInterval(() => {
+      const transcripts = Object.values(terminalTranscriptsRef.current).flat();
+      const relevant = transcripts.filter(entry => entry.ts >= workMonitor.startedAt - 2000);
+      if (!relevant.length) return;
+      const lastActivity = Math.max(...relevant.map(entry => entry.ts), workMonitor.startedAt);
+      if (Date.now() - lastActivity < 9000) return;
+      if (agentQuestionsRef.current.some(q => !q.answered)) return;
+      if (isProcessingRef.current) return;
+
+      const signature = `${workMonitor.id}:${lastActivity}:${changedFilesRef.current.length}`;
+      if (lastReadySummaryRef.current === signature) return;
+      lastReadySummaryRef.current = signature;
+      const body = buildAgentsReadySummary(
+        workMonitor,
+        sessionsRef.current,
+        terminalOutputsRef.current,
+        changedFilesRef.current,
+      );
+      setMsgs(prev => [...prev, {
+        id: `ready-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        role: "ai",
+        agent: "orchestrator",
+        body,
+        ts: ts(),
+      }]);
+      setWorkMonitor(null);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [workMonitor]);
 
   const { notifyError } = useNotify();
 
@@ -1303,11 +1455,12 @@ export const ChatPanel: React.FC<{
 
   const saveAndNewChat = () => {
     if (msgs.length > 0) {
-      const name = msgs.find(m => m.role === "user")?.body.slice(0, 60) || "Chat";
+      const cleanMsgs = normalizeMessages(msgs);
+      const name = cleanMsgs.find(m => m.role === "user")?.body.slice(0, 60) || "Chat";
       setHistories(prev => [{
         id: currentChatMeta.id,
         name,
-        msgs: [...msgs],
+        msgs: cleanMsgs,
         contextWindow,
         createdAt: currentChatMeta.createdAt,
         folderName: currentChatMeta.folderName,
@@ -1321,17 +1474,19 @@ export const ChatPanel: React.FC<{
     lastContextMsgIdRef.current = null;
     lastDiffSignatureRef.current = diffSignature(changedFilesRef.current);
     setAgentQuestions([]);
+    setWorkMonitor(null);
     setHistoryOpen(false);
   };
 
   const loadHistory = (h: ChatHistory) => {
     if (msgs.length > 0) {
-      const name = msgs.find(m => m.role === "user")?.body.slice(0, 60) || "Chat";
+      const cleanCurrentMsgs = normalizeMessages(msgs);
+      const name = cleanCurrentMsgs.find(m => m.role === "user")?.body.slice(0, 60) || "Chat";
       setHistories(prev => [
         {
           id: currentChatMeta.id,
           name,
-          msgs: [...msgs],
+          msgs: cleanCurrentMsgs,
           contextWindow,
           createdAt: currentChatMeta.createdAt,
           folderName: currentChatMeta.folderName,
@@ -1342,15 +1497,16 @@ export const ChatPanel: React.FC<{
       setHistories(prev => prev.filter(x => x.id !== h.id));
     }
     const folderName = h.folderName || chatFolderName(h.createdAt, h.id);
+    const cleanHistoryMsgs = normalizeMessages(h.msgs);
     setCurrentChatMeta({ id: h.id, createdAt: h.createdAt, folderName });
-    setMsgs(h.msgs);
-    setContextWindow(h.contextWindow || h.msgs.reduce((ctx, msg) => appendContextWindow(ctx, msg), ""));
+    setMsgs(cleanHistoryMsgs);
+    setContextWindow(h.contextWindow || cleanHistoryMsgs.reduce((ctx, msg) => appendContextWindow(ctx, msg), ""));
     setComposerAttachments([]);
     setImagePreview(null);
-    lastContextMsgIdRef.current = h.msgs[h.msgs.length - 1]?.id || null;
-    const lastDiff = [...h.msgs].reverse().find(msg => msg.diffLog)?.diffLog;
-    lastDiffSignatureRef.current = lastDiff ? diffSignature(lastDiff.files) : diffSignature(changedFilesRef.current);
+    lastContextMsgIdRef.current = cleanHistoryMsgs[cleanHistoryMsgs.length - 1]?.id || null;
+    lastDiffSignatureRef.current = diffSignature(changedFilesRef.current);
     setAgentQuestions([]);
+    setWorkMonitor(null);
     setHistoryOpen(false);
   };
 
@@ -1422,15 +1578,17 @@ export const ChatPanel: React.FC<{
     activeStreamIdRef.current = sid;
     streamTextRef.current = "";
     streamThinkingRef.current = "";
-    streamThinkingStartRef.current = Date.now();
+    streamThinkingStartRef.current = null;
     streamThinkingElapsedRef.current = null;
 
     streamUnlistenRef.current = (await listen<string>(`stream-chunk-${sid}`, (e) => {
       if (activeStreamIdRef.current !== sid) return;
       const thinkingDelta = parseStreamThinking(e.payload, req.provider);
       if (thinkingPreviewEnabled && thinkingDelta) {
+        if (streamThinkingStartRef.current === null) streamThinkingStartRef.current = Date.now();
         streamThinkingRef.current += thinkingDelta;
-        const elapsedMs = streamThinkingElapsedRef.current ?? Date.now() - streamThinkingStartRef.current;
+        const thinkingStart = streamThinkingStartRef.current ?? Date.now();
+        const elapsedMs = Date.now() - thinkingStart;
         setMsgs(p => p.map(m => m.id === msgId ? {
           ...m,
           thinking: { text: streamThinkingRef.current, elapsedMs, open: m.thinking?.open ?? true, done: false },
@@ -1439,16 +1597,17 @@ export const ChatPanel: React.FC<{
       const delta = parseStreamDelta(e.payload, req.provider);
       if (delta) {
         streamTextRef.current += delta;
-        const justFinishedThinking = streamThinkingElapsedRef.current === null;
+        const hadThinking = streamThinkingStartRef.current !== null || streamThinkingRef.current.length > 0;
+        const justFinishedThinking = hadThinking && streamThinkingElapsedRef.current === null;
         if (justFinishedThinking) {
-          streamThinkingElapsedRef.current = Math.max(0, Date.now() - streamThinkingStartRef.current);
+          streamThinkingElapsedRef.current = Math.max(0, Date.now() - (streamThinkingStartRef.current ?? Date.now()));
         }
         const elapsedMs = streamThinkingElapsedRef.current ?? 0;
         setMsgs(p => p.map(m => m.id === msgId ? {
           ...m,
           body: visibleStreamText(streamTextRef.current),
-          thinking: thinkingPreviewEnabled
-            ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: justFinishedThinking ? false : (m.thinking?.open ?? false), done: true }
+          thinking: thinkingPreviewEnabled && hadThinking
+            ? { text: streamThinkingRef.current, elapsedMs, open: justFinishedThinking ? false : (m.thinking?.open ?? false), done: true }
             : m.thinking,
         } : m));
       }
@@ -1460,14 +1619,15 @@ export const ChatPanel: React.FC<{
       activeStreamIdRef.current = null;
       streamUnlistenRef.current?.();
       streamUnlistenRef.current = null;
-      const elapsedMs = streamThinkingElapsedRef.current ?? Math.max(0, Date.now() - streamThinkingStartRef.current);
+      const hadThinking = streamThinkingStartRef.current !== null || streamThinkingRef.current.length > 0;
+      const elapsedMs = streamThinkingElapsedRef.current ?? (hadThinking ? Math.max(0, Date.now() - (streamThinkingStartRef.current ?? Date.now())) : 0);
       streamThinkingElapsedRef.current = elapsedMs;
       setMsgs(p => p.map(m => m.id === msgId ? {
         ...m,
         streaming: false,
         body: visibleStreamText(streamTextRef.current),
-        thinking: thinkingPreviewEnabled
-          ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: m.thinking?.open ?? false, done: true }
+        thinking: thinkingPreviewEnabled && hadThinking
+          ? { text: streamThinkingRef.current, elapsedMs, open: m.thinking?.open ?? false, done: true }
           : m.thinking,
       } : m));
     }
@@ -1481,13 +1641,14 @@ export const ChatPanel: React.FC<{
     streamUnlistenRef.current?.();
     streamUnlistenRef.current = null;
     setIsProcessing(false);
-    const elapsedMs = streamThinkingElapsedRef.current ?? Math.max(0, Date.now() - streamThinkingStartRef.current);
+    const hadThinking = streamThinkingStartRef.current !== null || streamThinkingRef.current.length > 0;
+    const elapsedMs = streamThinkingElapsedRef.current ?? (hadThinking ? Math.max(0, Date.now() - (streamThinkingStartRef.current ?? Date.now())) : 0);
     streamThinkingElapsedRef.current = elapsedMs;
     setMsgs(p => p.map(m => m.streaming ? {
       ...m,
       streaming: false,
       body: visibleStreamText(streamTextRef.current),
-      thinking: m.thinking ? { ...m.thinking, elapsedMs, open: m.thinking.open, done: true } : m.thinking,
+      thinking: hadThinking && m.thinking ? { ...m.thinking, elapsedMs, open: m.thinking.open, done: true } : m.thinking,
     } : m));
   };
 
@@ -1560,6 +1721,7 @@ export const ChatPanel: React.FC<{
 
   const autoDispatchActions = (actions: AgentAction[]) => {
     const usedSessionIds = new Set<string>();
+    const monitorLabels: string[] = [];
 
     for (const action of actions) {
       const logId = addToolLog(action, "queued");
@@ -1601,6 +1763,7 @@ export const ChatPanel: React.FC<{
         updateToolLog(logId, "running", `Dispatching to ${targets.length} active agent${targets.length > 1 ? "s" : ""}.`);
         targets.forEach(session => {
           usedSessionIds.add(session.sessionId);
+          monitorLabels.push(session.label);
           sendToSession(session, action.prompt || "", logId);
         });
         updateToolLog(logId, "done", `Sent to ${targets.length} active agent${targets.length > 1 ? "s" : ""}.`);
@@ -1617,6 +1780,7 @@ export const ChatPanel: React.FC<{
         const newSessionId = onChangeSessionAgentRef.current(target.id, action.label, nextCommand, true);
         updateToolLog(logId, "done", `Switched ${target.label} to ${nextCommand}.`);
         if (action.prompt && newSessionId) {
+          monitorLabels.push(target.label);
           setTimeout(() => onSendPtyCommandRef.current?.(newSessionId, action.prompt || ""), 4000);
         }
         continue;
@@ -1666,12 +1830,14 @@ export const ChatPanel: React.FC<{
 
         if (target) {
           usedSessionIds.add(target.sessionId);
+          monitorLabels.push(target.label);
           updateToolLog(logId, "running", `Dispatching to ${target.label}.`);
           sendToSession(target, promptText, logId);
         } else if (action.type === "spawn" && action.agentType) {
           const spawned = onAddSessionRef.current?.(action.label, action.agentType);
           if (spawned && spawned.sessionId) {
             usedSessionIds.add(spawned.sessionId);
+            monitorLabels.push(spawned.label);
             updateToolLog(logId, "running", `Spawned ${spawned.label}.`);
             setTimeout(() => sendToSession(spawned, promptText, logId), 4000);
           } else {
@@ -1692,6 +1858,14 @@ export const ChatPanel: React.FC<{
           updateToolLog(logId, "failed", "No matching session found.");
         }
       }
+    }
+    if (monitorLabels.length) {
+      setWorkMonitor({
+        id: `wm-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        startedAt: Date.now(),
+        actions: monitorLabels.length,
+        labels: Array.from(new Set(monitorLabels)),
+      });
     }
   };
 
@@ -1794,7 +1968,6 @@ export const ChatPanel: React.FC<{
       body: "",
       streaming: streamingEnabled,
       ts: ts(),
-      thinking: streamingEnabled && thinkingPreviewEnabled ? { text: "Preparing a standalone implementation plan.", elapsedMs: 0, open: true } : undefined,
     }]);
 
     let planText = "";
@@ -1891,7 +2064,6 @@ export const ChatPanel: React.FC<{
           body:"",
           streaming:true,
           ts: ts(),
-          thinking: thinkingPreviewEnabled ? { text: "Preparing agent context and tool plan.", elapsedMs: 0, open: true } : undefined,
         }]);
         await streamLLM(aiMsgId, llmMsgs);
         const finalText = streamTextRef.current;
@@ -1907,7 +2079,15 @@ export const ChatPanel: React.FC<{
         if (actions.length) autoDispatchActions(actions);
       }
     } catch (err: any) {
-      setMsgs(p => [...p, { id:`e${Date.now()}`, role:"ai", agent:"system", body:`**Error:** ${err.message||"Failed to get AI response."}`, ts: ts() }]);
+      const detail = err?.message || String(err || "Failed to get AI response.");
+      const modelHint = selectedModelRef.current ? `\n\nModel: \`${selectedModelRef.current}\`` : "";
+      setMsgs(p => [...p, {
+        id:`e${Date.now()}`,
+        role:"ai",
+        agent:"system",
+        body:`**Error:** Failed to get AI response.\n\n${detail}${modelHint}`,
+        ts: ts(),
+      }]);
     } finally {
       setIsProcessing(false);
     }
@@ -2185,7 +2365,8 @@ export const ChatPanel: React.FC<{
         </div>
       )}
 
-      <div className="chat-messages">
+      <div className="chat-messages-shell">
+      <div className="chat-messages" ref={messagesRef} onScroll={updateChatAtBottom}>
         {msgs.length === 0 ? (
           <div className="chat-empty-state">
             <div className="chat-empty-icon"><i className="bx bx-network-chart" /></div>
@@ -2234,7 +2415,7 @@ export const ChatPanel: React.FC<{
                 <div className={`chat-bubble-ai${m.agent === "system" ? " system-msg" : ""}${m.agent === "tool" ? " tool-msg" : ""}${m.agent === "diff" ? " diff-msg" : ""}`}>
                       {m.thinking && (
                         <div className={`chat-thinking ${m.thinking.open ? "open" : ""}`}>
-                          <button type="button" className="chat-thinking-head" onClick={() => toggleThinking(m.id)}>
+                          <button type="button" className="chat-thinking-head" onClick={() => !m.streaming && toggleThinking(m.id)} disabled={!!m.streaming}>
                             <span>Thought - {(m.thinking.elapsedMs / 1000).toFixed(1)}s</span>
                             <i className={`bx bx-chevron-${m.thinking.open ? "up" : "down"}`} />
                           </button>
@@ -2274,6 +2455,17 @@ export const ChatPanel: React.FC<{
           </div>
         )}
         <div ref={endRef} />
+      </div>
+      {!chatAtBottom && (
+        <button
+          type="button"
+          className="chat-scroll-bottom"
+          onClick={() => scrollChatToBottom("smooth")}
+          title="Jump to latest message"
+        >
+          <i className="bx bx-down-arrow-alt" />
+        </button>
+      )}
       </div>
 
       {/* ── Composer ── */}
@@ -2379,21 +2571,63 @@ export const ChatPanel: React.FC<{
                 className="chat-file-input"
                 onChange={event => attachFiles(event.target.files)}
               />
-              <div className="chat-mode-segment" title="Choose how the chatbot handles the next message">
+              <div className="chat-mode-pill" ref={modeDropdownRef} title="Choose how the chatbot handles the next message">
                 <button
+                  ref={modeBtnRef}
                   type="button"
-                  className={chatMode === "build" ? "active" : ""}
-                  onClick={() => setChatMode("build")}
+                  className="chat-pill-btn chat-mode-btn"
+                  onClick={() => {
+                    setModeDropdownOpen(o => {
+                      if (!o) {
+                        const rect = modeBtnRef.current?.getBoundingClientRect();
+                        if (rect) {
+                          setModeDropdownPos({
+                            top: rect.top - 8,
+                            left: Math.max(8, Math.min(rect.left, window.innerWidth - 190)),
+                          });
+                        }
+                      }
+                      return !o;
+                    });
+                  }}
                 >
-                  Build
+                  <i className={`bx ${chatMode === "build" ? "bx-hammer" : "bx-list-check"}`} />
+                  <span className="chat-mode-name">{chatMode === "build" ? "Build" : "Plan"}</span>
+                  <i className={`bx bx-chevron-up ${modeDropdownOpen ? "open" : ""}`} />
                 </button>
-                <button
-                  type="button"
-                  className={chatMode === "plan" ? "active" : ""}
-                  onClick={() => setChatMode("plan")}
-                >
-                  Plan
-                </button>
+                {modeDropdownOpen && modeDropdownPos && (
+                  <div
+                    className="chat-pill-dropdown chat-mode-dropdown"
+                    data-mode-dropdown="true"
+                    style={{
+                      top: modeDropdownPos.top,
+                      left: modeDropdownPos.left,
+                      transform: "translateY(-100%)",
+                    }}
+                  >
+                    {([
+                      { value: "build" as const, label: "Build", icon: "bx-hammer", desc: "Coordinate agents and implement" },
+                      { value: "plan" as const, label: "Plan", icon: "bx-list-check", desc: "Draft an implementation plan in chat" },
+                    ]).map(option => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        className={`chat-pill-item chat-mode-item ${chatMode === option.value ? "active" : ""}`}
+                        onClick={() => {
+                          setChatMode(option.value);
+                          setModeDropdownOpen(false);
+                        }}
+                      >
+                        <i className={`bx ${option.icon}`} />
+                        <span className="chat-pill-item-text">
+                          <strong>{option.label}</strong>
+                          <small>{option.desc}</small>
+                        </span>
+                        {chatMode === option.value && <i className="bx bx-check" />}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
               <button
                 type="button"

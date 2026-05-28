@@ -193,6 +193,7 @@ function App() {
               aria-hidden={workspace.id !== activeId}
             >
               <WorkspaceLayout
+                workspaceId={workspace.id}
                 directory={workspace.directory}
                 initialSessions={workspace.sessions}
                 isActive={workspace.id === activeId}

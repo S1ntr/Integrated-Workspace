@@ -13,6 +13,7 @@ import { FileViewerDialog } from "./FileViewerDialog";
 import { useNotify } from "./Notification";
 
 interface WorkspaceLayoutProps {
+  workspaceId?: string;
   directory: string;
   initialSessions: AgentSession[];
   isActive?: boolean;
@@ -122,6 +123,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onC
 // ── Right Panel with tabs ──────────────────────────────────────────────────────
 interface RightPanelProps {
   width: number;
+  workspaceId?: string;
   directory: string;
   sessions: Session[];
   terminalOutputs: Record<string, string>;
@@ -138,6 +140,7 @@ interface RightPanelProps {
 
 const RightPanel: React.FC<RightPanelProps> = ({
   width,
+  workspaceId,
   directory,
   sessions,
   terminalOutputs,
@@ -219,6 +222,7 @@ const RightPanel: React.FC<RightPanelProps> = ({
           <ChatPanel
             embedded
             workspaceDir={directory}
+            chatStorageScope={workspaceId || directory}
             sessions={sessions}
             terminalOutputs={terminalOutputs}
             terminalTranscripts={terminalTranscripts}
@@ -261,6 +265,7 @@ let globalSessionCounter = 0;
 
 // ── Main Component ─────────────────────────────────────────────────────────────
 export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
+  workspaceId,
   directory,
   initialSessions,
   isActive = true,
@@ -691,6 +696,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
             <div className="resize-handle h" onMouseDown={resizeRight} />
             <RightPanel
               width={rightW}
+              workspaceId={workspaceId}
               directory={directory}
               sessions={sessions}
               terminalOutputs={terminalOutputs}
