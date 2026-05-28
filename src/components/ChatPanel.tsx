@@ -14,10 +14,50 @@ export interface Session {
 }
 
 interface AgentAction {
-  type: "spawn" | "send" | "kill";
+  type: "spawn" | "send" | "kill" | "request" | "ask_user";
   agentType?: string;
   label: string;
   prompt?: string;
+  count?: number;
+  reason?: string;
+  question?: string;
+}
+
+interface ToolCallLog {
+  id: string;
+  action: AgentAction;
+  status: "queued" | "running" | "waiting" | "done" | "failed";
+  ts: string;
+  note?: string;
+}
+
+interface AgentQuestion {
+  id: string;
+  sessionId: string;
+  label: string;
+  question: string;
+  ts: string;
+  answered?: boolean;
+}
+
+interface PendingAgentRequest {
+  id: string;
+  label: string;
+  agentType: string;
+  count: number;
+  prompt?: string;
+  reason?: string;
+  existingSessionIds: string[];
+  fulfilledSessionIds: string[];
+}
+
+export interface TerminalTranscriptEntry {
+  id: string;
+  sessionId: string;
+  label: string;
+  kind: "output" | "input" | "system";
+  text: string;
+  ts: number;
 }
 
 interface Msg {
@@ -119,7 +159,7 @@ function formatInline(line: string): React.ReactNode[] {
 }
 
 function formatBody(body: string): React.ReactNode {
-  const lines = body.split("\n").filter(l => !/^\[AGENT:(spawn|send|kill):/.test(l.trim()));
+  const lines = stripAgentTags(body).split("\n");
   const els: React.ReactNode[] = [];
   let inCode = false, codeBuf: string[] = [], codeLang = "";
 
@@ -167,8 +207,47 @@ function parseStreamDelta(line: string, provider: string): string | null {
 
 // ─── Agent action parser ──────────────────────────────────────────────────────
 
+function normalizeToolAction(raw: any): AgentAction | null {
+  if (!raw || typeof raw !== "object") return null;
+  const tool = String(raw.tool || raw.type || "").toLowerCase().replace(/^(agent|chat)\./, "");
+  const label = String(raw.label || raw.session || raw.target || raw.agent || "").trim();
+  const prompt = typeof raw.prompt === "string" ? raw.prompt : typeof raw.message === "string" ? raw.message : undefined;
+  const agentType = typeof raw.agentType === "string" ? raw.agentType : typeof raw.agent_type === "string" ? raw.agent_type : typeof raw.command === "string" ? raw.command : undefined;
+  const count = Number.isFinite(Number(raw.count)) ? Math.max(1, Math.min(16, Number(raw.count))) : undefined;
+  const reason = typeof raw.reason === "string" ? raw.reason : undefined;
+  const question = typeof raw.question === "string" ? raw.question : typeof raw.body === "string" ? raw.body : undefined;
+
+  if (tool === "spawn") return { type: "spawn", label: label || agentType || "Agent", agentType, prompt };
+  if (tool === "send") return { type: "send", label: label || "Agent", prompt };
+  if (tool === "kill") return { type: "kill", label: label || "Agent" };
+  if (tool === "request") return { type: "request", label: label || agentType || "Agent", agentType, count: count || 1, prompt, reason };
+  if (tool === "ask_user" || tool === "ask" || tool === "question") {
+    return { type: "ask_user", label: label || "User", question: question || prompt || reason || "Need more information.", reason };
+  }
+  return null;
+}
+
 function parseAgentActions(text: string): AgentAction[] {
   const actions: AgentAction[] = [];
+
+  const parseJsonBlock = (raw: string) => {
+    try {
+      const parsed = JSON.parse(raw.trim());
+      const list = Array.isArray(parsed) ? parsed : [parsed];
+      for (const item of list) {
+        const normalized = normalizeToolAction(item);
+        if (normalized) actions.push(normalized);
+      }
+    } catch {}
+  };
+
+  for (const match of text.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/gi)) {
+    parseJsonBlock(match[1]);
+  }
+  for (const match of text.matchAll(/```tool_call\s*([\s\S]*?)```/gi)) {
+    parseJsonBlock(match[1]);
+  }
+
   for (const line of text.split("\n")) {
     const t = line.trim();
     const spawn = t.match(/^\[AGENT:spawn:([^:]+):([^\]]+)\]\s*([\s\S]*)/);
@@ -177,30 +256,77 @@ function parseAgentActions(text: string): AgentAction[] {
     if (send) { actions.push({ type:"send", label: send[1].trim(), prompt: send[2].trim() }); continue; }
     const kill = t.match(/^\[AGENT:kill:([^\]]+)\]/);
     if (kill) actions.push({ type:"kill", label: kill[1].trim() });
+    const toolLine = t.match(/^\[TOOL_CALL\]\s*(\{.*\})$/);
+    if (toolLine) parseJsonBlock(toolLine[1]);
   }
   return actions;
 }
 
 function stripAgentTags(text: string): string {
-  return text.split("\n").filter(l => !/^\[AGENT:(spawn|send|kill):/.test(l.trim())).join("\n").trim();
+  return text
+    .replace(/```tool_call\s*[\s\S]*?```/gi, "")
+    .replace(/```tool_call[\s\S]*$/gi, "")
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
+    .replace(/<tool_call>[\s\S]*$/gi, "")
+    .split("\n")
+    .filter(l => !/^\[(AGENT|TOOL_CALL)(:|\])/.test(l.trim()))
+    .join("\n")
+    .trim();
+}
+
+function visibleStreamText(text: string): string {
+  return stripAgentTags(text).replace(/\n{3,}/g, "\n\n");
+}
+
+function detectTerminalQuestion(text: string): string | null {
+  const cleaned = text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").trim();
+  if (!cleaned) return null;
+  const tail = cleaned.split("\n").map(l => l.trim()).filter(Boolean).slice(-8);
+  const candidate = tail.reverse().find(line =>
+    /\?$/.test(line) ||
+    /\[(y\/n|Y\/n|y\/N|yes\/no|Yes\/No)\]/i.test(line) ||
+    /\b(continue|proceed|confirm|approve|select|choose|overwrite|permission)\b.*[?:]/i.test(line)
+  );
+  return candidate && candidate.length < 280 ? candidate : null;
 }
 
 // ─── Orchestrator system prompt ───────────────────────────────────────────────
 
-function buildOrchestratorPrompt(sessions: Session[], outputs: Record<string, string>): string {
+function buildOrchestratorPrompt(
+  sessions: Session[],
+  outputs: Record<string, string>,
+  transcripts: Record<string, TerminalTranscriptEntry[]> = {},
+  toolCalls: ToolCallLog[] = [],
+  pendingQuestions: AgentQuestion[] = [],
+): string {
   const sessionList = sessions.length > 0
     ? sessions.map(s => `- ${s.label} (${s.command})`).join("\n")
     : "(none — use spawn actions to create terminals)";
 
   const outputBlocks = sessions
-    .filter(s => outputs[s.sessionId]?.trim())
-    .map(s => `### ${s.label}\n\`\`\`\n${(outputs[s.sessionId]||"").slice(-800).trim()}\n\`\`\``)
+    .filter(s => outputs[s.sessionId]?.trim() || transcripts[s.sessionId]?.length)
+    .map(s => {
+      const structured = (transcripts[s.sessionId] || []).slice(-18).map(entry => {
+        const prefix = entry.kind === "input" ? "user->agent" : entry.kind;
+        return `${prefix}: ${entry.text.replace(/\s+/g, " ").slice(-700)}`;
+      }).join("\n");
+      const fallback = (outputs[s.sessionId] || "").slice(-1200).trim();
+      return `### ${s.label} (${s.command}, ${s.status || "unknown"})\n\`\`\`\n${structured || fallback}\n\`\`\``;
+    })
     .join("\n\n");
+
+  const recentTools = toolCalls.slice(-12).map(t =>
+    `- ${t.ts} ${t.action.type.toUpperCase()} ${t.action.label} [${t.status}]${t.note ? `: ${t.note}` : ""}`
+  ).join("\n");
+
+  const questionBlocks = pendingQuestions.filter(q => !q.answered).slice(-5).map(q =>
+    `- ${q.label}: ${q.question}`
+  ).join("\n");
 
   return `You are the **Orchestrator** in "Integraded" — an integrated multi-agent development workspace.
 
 ## Role
-Break user requests into parallel sub-tasks. Dispatch each to a dedicated CLI coding agent in a real terminal. Ensure all agents produce compatible, integrating work.
+Break user requests into parallel sub-tasks. Dispatch each to dedicated CLI coding agents in real terminals, monitor their transcript, answer their follow-up questions when the user's intent is clear, and ask the user when it is not.
 
 ## Active Sessions
 ${sessionList}
@@ -212,26 +338,35 @@ ${sessionList}
 - \`shell\` — PowerShell/bash (commands, installs, scripts)
 - \`antigravity\` — Antigravity CLI
 
-## Tool Actions — execute automatically, hidden from UI
-\`[AGENT:spawn:agenttype:Label]\` Prompt
-→ Opens new terminal with that agent type, sends prompt after 2.5s startup
+## Tool Calls
+Tool calls execute automatically and are hidden from the normal chat bubble. Put every tool call in its own block exactly like this:
 
-\`[AGENT:send:Label]\` Message
-→ Sends follow-up to existing session
+<tool_call>{"tool":"agent.send","label":"Existing Agent Label","prompt":"Message to send to the CLI agent"}</tool_call>
+<tool_call>{"tool":"agent.spawn","agentType":"opencode","label":"Frontend Agent","prompt":"Focused task for this new agent"}</tool_call>
+<tool_call>{"tool":"agent.request","agentType":"claude","label":"Review Agent","count":1,"reason":"Need another reviewer","prompt":"Task to send once the user adds that agent"}</tool_call>
+<tool_call>{"tool":"agent.kill","label":"Agent Label"}</tool_call>
+<tool_call>{"tool":"chat.ask_user","question":"Precise question for the user"}</tool_call>
 
-\`[AGENT:kill:Label]\`
-→ Terminates session
+Never show raw tool calls in visible prose. Visible prose should summarize what is happening and what you need from the user.
 
 ## Coordination Rules
-1. **REUSE ACTIVE SESSIONS**: ALWAYS prefer sending tasks to already active sessions. If a running active session (e.g. "HTML Builder" or "CSS Stylist") listed under "Active Sessions" above can handle the task, you MUST use \`[AGENT:send:Label]\` to send the prompt to it. DO NOT spawn a new session using \`[AGENT:spawn:...\` if a matching/compatible session already exists.
+1. **REUSE ACTIVE SESSIONS**: ALWAYS prefer sending tasks to already active sessions. If a running active session (e.g. "HTML Builder" or "CSS Stylist") listed under "Active Sessions" above can handle the task, use \`agent.send\` to send the prompt to it. Do not spawn a new session if a matching/compatible session already exists.
 2. Unique descriptive labels: "HTML Builder", "CSS Stylist", "JS Developer", etc.
 3. Each agent gets ONE focused task with FULL context: file names, shared types, conventions
 4. Never assign two agents to the same file
 5. If agent A defines a shared type, paste the full definition into agent B's prompt
-6. After dispatching, briefly summarize what each agent is building (visible to user)
+6. If more agents are needed but you should not create them yourself, use \`agent.request\`; the app will detect newly added matching agents and dispatch your queued prompt.
+7. If a CLI agent asks a question and the answer follows from the user's instruction, answer it with \`agent.send\`. If uncertain, use \`chat.ask_user\`.
+8. After dispatching, briefly summarize what each agent is doing (visible to user)
 
 ## Current Agent Output
-${outputBlocks || "(no output captured yet)"}`;
+${outputBlocks || "(no output captured yet)"}
+
+## Pending Agent Questions
+${questionBlocks || "(none)"}
+
+## Recent Tool Calls
+${recentTools || "(none)"}`;
 }
 
 // ─── Time helpers ─────────────────────────────────────────────────────────────
@@ -252,6 +387,7 @@ export const ChatPanel: React.FC<{
   embedded?: boolean;
   sessions?: Session[];
   terminalOutputs?: Record<string, string>;
+  terminalTranscripts?: Record<string, TerminalTranscriptEntry[]>;
   onSendPtyCommand?: (sessId: string, cmd: string) => void;
   onAddSession?: (label: string, command: string) => Session;
   onCloseSession?: (id: number) => void;
@@ -260,6 +396,7 @@ export const ChatPanel: React.FC<{
   embedded,
   sessions: sessionsProp = [],
   terminalOutputs: terminalOutputsProp = {},
+  terminalTranscripts: terminalTranscriptsProp = {},
   onSendPtyCommand,
   onAddSession,
   onCloseSession,
@@ -270,6 +407,17 @@ export const ChatPanel: React.FC<{
   const [input, setInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
+  const [toolCalls, setToolCalls] = useState<ToolCallLog[]>(() => {
+    try {
+      const stored = localStorage.getItem("integraded_tool_calls");
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [toolPanelOpen, setToolPanelOpen] = useState(false);
+  const [agentQuestions, setAgentQuestions] = useState<AgentQuestion[]>([]);
+  const [pendingAgentRequests, setPendingAgentRequests] = useState<PendingAgentRequest[]>([]);
 
   // ── Chat history ─────────────────────────────────────────────────────────────
   const [histories, setHistories] = useState<ChatHistory[]>(() => {
@@ -286,6 +434,7 @@ export const ChatPanel: React.FC<{
   // ── Terminal picker ──────────────────────────────────────────────────────────
   const [termPickerOpen, setTermPickerOpen] = useState(false);
   const termPickerRef = useRef<HTMLDivElement>(null);
+  const toolPanelRef = useRef<HTMLDivElement>(null);
 
   // ── Model selection ──────────────────────────────────────────────────────────
   const [config, setConfig] = useState<any>(null);
@@ -315,6 +464,12 @@ export const ChatPanel: React.FC<{
   const onRestartSessionRef = useRef(onRestartSession);
   const sessionsRef = useRef(sessionsProp);
   const terminalOutputsRef = useRef(terminalOutputsProp);
+  const terminalTranscriptsRef = useRef(terminalTranscriptsProp);
+  const toolCallsRef = useRef<ToolCallLog[]>([]);
+  const agentQuestionsRef = useRef<AgentQuestion[]>([]);
+  const pendingAgentRequestsRef = useRef<PendingAgentRequest[]>([]);
+  const seenQuestionKeysRef = useRef<Set<string>>(new Set());
+  const usedPromptSessionIdsRef = useRef<Set<string>>(new Set());
   
   onSendPtyCommandRef.current = onSendPtyCommand;
   onAddSessionRef.current = onAddSession;
@@ -322,6 +477,10 @@ export const ChatPanel: React.FC<{
   onRestartSessionRef.current = onRestartSession;
   sessionsRef.current = sessionsProp;
   terminalOutputsRef.current = terminalOutputsProp;
+  terminalTranscriptsRef.current = terminalTranscriptsProp;
+  toolCallsRef.current = toolCalls;
+  agentQuestionsRef.current = agentQuestions;
+  pendingAgentRequestsRef.current = pendingAgentRequests;
 
   // ── Effects ──────────────────────────────────────────────────────────────────
 
@@ -344,6 +503,7 @@ export const ChatPanel: React.FC<{
 
       if (historyRef.current && !historyRef.current.contains(target)) setHistoryOpen(false);
       if (termPickerRef.current && !termPickerRef.current.contains(target)) setTermPickerOpen(false);
+      if (toolPanelRef.current && !toolPanelRef.current.contains(target)) setToolPanelOpen(false);
     };
     window.addEventListener("mousedown", fn);
     return () => window.removeEventListener("mousedown", fn);
@@ -383,9 +543,18 @@ export const ChatPanel: React.FC<{
   }, [histories]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem("integraded_tool_calls", JSON.stringify(toolCalls.slice(0, 80)));
+    } catch {}
+  }, [toolCalls]);
+
+  useEffect(() => {
     const handleClear = () => {
       setMsgs([]);
       setHistories([]);
+      setToolCalls([]);
+      setAgentQuestions([]);
+      setPendingAgentRequests([]);
     };
     window.addEventListener("__integradedChatHistoryCleared", handleClear);
     return () => window.removeEventListener("__integradedChatHistoryCleared", handleClear);
@@ -441,6 +610,76 @@ export const ChatPanel: React.FC<{
     };
   }, []);
 
+  // Detect CLI-agent questions from terminal transcripts and surface them to chat.
+  useEffect(() => {
+    const additions: AgentQuestion[] = [];
+    for (const session of sessionsProp) {
+      const question = detectTerminalQuestion(terminalOutputsProp[session.sessionId] || "");
+      if (!question) continue;
+      const recentInputs = (terminalTranscriptsProp[session.sessionId] || [])
+        .filter(entry => entry.kind === "input")
+        .slice(-6)
+        .map(entry => entry.text);
+      if (recentInputs.some(text => text.includes(question))) continue;
+      const key = `${session.sessionId}:${question}`;
+      if (seenQuestionKeysRef.current.has(key)) continue;
+      seenQuestionKeysRef.current.add(key);
+      additions.push({
+        id: `aq-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        sessionId: session.sessionId,
+        label: session.label,
+        question,
+        ts: ts(),
+      });
+    }
+    if (!additions.length) return;
+    setAgentQuestions(prev => [...additions, ...prev].slice(0, 20));
+    setMsgs(prev => [
+      ...prev,
+      ...additions.map(q => ({
+        id: q.id,
+        role: "ai" as const,
+        agent: "system" as const,
+        body: `**${q.label} asks:** ${q.question}\n\nMůžeš odpovědět přímo tady v chatu, nebo použít tlačítko u otázky pro poslání rozepsané odpovědi do terminálu.`,
+        ts: q.ts,
+      })),
+    ]);
+  }, [sessionsProp, terminalOutputsProp]);
+
+  // Fulfill queued agent requests as soon as the user adds matching terminals.
+  useEffect(() => {
+    if (!pendingAgentRequestsRef.current.length) return;
+    const nextRequests: PendingAgentRequest[] = [];
+    for (const request of pendingAgentRequestsRef.current) {
+      const fulfilled = [...request.fulfilledSessionIds];
+      const matches = sessionsProp.filter(s =>
+        commandMatchesAgent(s.command, request.agentType) &&
+        !request.existingSessionIds.includes(s.sessionId) &&
+        !fulfilled.includes(s.sessionId)
+      );
+      for (const session of matches) {
+        if (fulfilled.length >= request.count) break;
+        fulfilled.push(session.sessionId);
+        if (request.prompt) {
+          sendToSession(session, request.prompt, request.id);
+        }
+      }
+      if (fulfilled.length >= request.count) {
+        updateToolLog(request.id, "done", `Detected ${fulfilled.length} ${request.agentType} agent${fulfilled.length > 1 ? "s" : ""}.`);
+        setMsgs(prev => [...prev, {
+          id: `det-${Date.now()}-${request.id}`,
+          role: "ai",
+          agent: "system",
+          body: `Detekoval jsem nově přidané ${request.agentType} agent${fulfilled.length > 1 ? "y" : "a"} a navázal jsem na ně připravený úkol.`,
+          ts: ts(),
+        }]);
+      } else {
+        nextRequests.push({ ...request, fulfilledSessionIds: fulfilled });
+      }
+    }
+    setPendingAgentRequests(nextRequests);
+  }, [sessionsProp]);
+
   const { notifyError } = useNotify();
 
   const toggleRecording = () => {
@@ -459,6 +698,7 @@ export const ChatPanel: React.FC<{
       setHistories(prev => [{ id: `h${Date.now()}`, name, msgs: [...msgs], createdAt: Date.now() }, ...prev]);
     }
     setMsgs([]);
+    setAgentQuestions([]);
     setHistoryOpen(false);
   };
 
@@ -473,6 +713,7 @@ export const ChatPanel: React.FC<{
       setHistories(prev => prev.filter(x => x.id !== h.id));
     }
     setMsgs(h.msgs);
+    setAgentQuestions([]);
     setHistoryOpen(false);
   };
 
@@ -539,7 +780,10 @@ export const ChatPanel: React.FC<{
     streamUnlistenRef.current = (await listen<string>(`stream-chunk-${sid}`, (e) => {
       if (activeStreamIdRef.current !== sid) return;
       const delta = parseStreamDelta(e.payload, req.provider);
-      if (delta) { streamTextRef.current += delta; setMsgs(p => p.map(m => m.id === msgId ? { ...m, body: streamTextRef.current } : m)); }
+      if (delta) {
+        streamTextRef.current += delta;
+        setMsgs(p => p.map(m => m.id === msgId ? { ...m, body: visibleStreamText(streamTextRef.current) } : m));
+      }
     })) as unknown as () => void;
 
     try {
@@ -548,7 +792,7 @@ export const ChatPanel: React.FC<{
       activeStreamIdRef.current = null;
       streamUnlistenRef.current?.();
       streamUnlistenRef.current = null;
-      setMsgs(p => p.map(m => m.id === msgId ? { ...m, streaming: false, body: streamTextRef.current } : m));
+      setMsgs(p => p.map(m => m.id === msgId ? { ...m, streaming: false, body: visibleStreamText(streamTextRef.current) } : m));
     }
   };
 
@@ -560,7 +804,7 @@ export const ChatPanel: React.FC<{
     streamUnlistenRef.current?.();
     streamUnlistenRef.current = null;
     setIsProcessing(false);
-    setMsgs(p => p.map(m => m.streaming ? { ...m, streaming: false, body: streamTextRef.current } : m));
+    setMsgs(p => p.map(m => m.streaming ? { ...m, streaming: false, body: visibleStreamText(streamTextRef.current) } : m));
   };
 
   const callLLM = async (messages: { role: string; content: string }[]): Promise<string> => {
@@ -572,95 +816,158 @@ export const ChatPanel: React.FC<{
     return d.choices?.[0]?.message?.content || "_(no response)_";
   };
 
+  const addToolLog = (action: AgentAction, status: ToolCallLog["status"], note?: string) => {
+    const id = `tc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    setToolCalls(prev => [{ id, action, status, ts: ts(), note }, ...prev].slice(0, 80));
+    return id;
+  };
+
+  const updateToolLog = (id: string, status: ToolCallLog["status"], note?: string) => {
+    setToolCalls(prev => prev.map(t => t.id === id ? { ...t, status, note: note ?? t.note } : t));
+  };
+
+  const commandMatchesAgent = (command: string, agentType?: string) => {
+    if (!agentType) return false;
+    return command.toLowerCase().split(/\s+/)[0] === agentType.toLowerCase();
+  };
+
+  const sendToSession = (session: Session, promptText: string, logId: string) => {
+    usedPromptSessionIdsRef.current.add(session.sessionId);
+    if (session.status === "exited") {
+      const newSessId = onRestartSessionRef.current?.(session.id);
+      if (!newSessId) {
+        updateToolLog(logId, "failed", "Could not restart exited session.");
+        return;
+      }
+      updateToolLog(logId, "queued", `Restarting ${session.label}.`);
+      setTimeout(() => {
+        onSendPtyCommandRef.current?.(newSessId, promptText);
+        updateToolLog(logId, "done", `Sent to restarted ${session.label}.`);
+      }, 4000);
+      return;
+    }
+    if (session.status === "booting") {
+      updateToolLog(logId, "queued", `Waiting for ${session.label} to boot.`);
+      setTimeout(() => {
+        onSendPtyCommandRef.current?.(session.sessionId, promptText);
+        updateToolLog(logId, "done", `Sent to ${session.label}.`);
+      }, 4000);
+      return;
+    }
+    onSendPtyCommandRef.current?.(session.sessionId, promptText);
+    updateToolLog(logId, "done", `Sent to ${session.label}.`);
+  };
+
   const autoDispatchActions = (actions: AgentAction[]) => {
     const usedSessionIds = new Set<string>();
 
     for (const action of actions) {
-      if (action.type === "spawn" && action.agentType && action.prompt) {
+      const logId = addToolLog(action, "queued");
+
+      if (action.type === "ask_user") {
+        updateToolLog(logId, "waiting", action.question || action.reason || "Waiting for user input.");
+        setMsgs(p => [...p, {
+          id: `q${Date.now()}`,
+          role: "ai",
+          agent: "system",
+          body: `**Need more info:** ${action.question || action.reason || "I need one more detail before continuing."}`,
+          ts: ts(),
+        }]);
+        continue;
+      }
+
+      if (action.type === "request" && action.agentType) {
+        const count = action.count || 1;
+        const request: PendingAgentRequest = {
+          id: logId,
+          label: action.label,
+          agentType: action.agentType,
+          count,
+          prompt: action.prompt,
+          reason: action.reason,
+          existingSessionIds: sessionsRef.current.map(s => s.sessionId),
+          fulfilledSessionIds: [],
+        };
+        setPendingAgentRequests(prev => [...prev, request]);
+        updateToolLog(logId, "waiting", `Waiting for ${count} ${action.agentType} agent${count > 1 ? "s" : ""}.`);
+        setMsgs(p => [...p, {
+          id: `req${Date.now()}`,
+          role: "ai",
+          agent: "system",
+          body: `Potřebuju ${count} další ${action.agentType} agent${count > 1 ? "y" : "a"} pro: ${action.reason || action.label}. Jakmile ho přidáš přes +, automaticky ho detekuju a pošlu mu úkol.`,
+          ts: ts(),
+        }]);
+        continue;
+      }
+
+      if ((action.type === "spawn" || action.type === "send") && action.prompt) {
         const promptText = action.prompt;
-        // 1. Try to find a matching active session by label (case-insensitive) that isn't already targeted
-        let existing = sessionsRef.current.find(s =>
+        let target = sessionsRef.current.find(s =>
           !usedSessionIds.has(s.sessionId) &&
           s.label.toLowerCase() === action.label.toLowerCase()
         );
 
-        // 2. Fallback to finding by command/type
-        if (!existing) {
-          existing = sessionsRef.current.find(s =>
+        if (!target && action.type === "spawn") {
+          target = sessionsRef.current.find(s =>
             !usedSessionIds.has(s.sessionId) &&
-            s.command.toLowerCase() === action.agentType!.toLowerCase()
+            commandMatchesAgent(s.command, action.agentType)
           );
         }
 
-        if (existing) {
-          // Reuse this active session!
-          usedSessionIds.add(existing.sessionId);
-          if (existing.status === "exited") {
-            console.log(`[autoDispatchActions] Targeted spawn session ${existing.label} has exited. Restarting...`);
-            const newSessId = onRestartSessionRef.current?.(existing.id);
-            if (newSessId) {
-              setTimeout(() => {
-                console.log(`[autoDispatchActions] Sending prompt to restarted session: ${newSessId}`);
-                onSendPtyCommandRef.current?.(newSessId, promptText);
-              }, 4000);
-            }
-          } else if (existing.status === "booting") {
-            console.log(`[autoDispatchActions] Targeted spawn session ${existing.label} is booting. Waiting...`);
-            setTimeout(() => {
-              console.log(`[autoDispatchActions] Sending prompt to booted session: ${existing.sessionId}`);
-              onSendPtyCommandRef.current?.(existing.sessionId, promptText);
-            }, 4000);
+        if (!target && action.type === "send") {
+          target = sessionsRef.current.find(s => !usedSessionIds.has(s.sessionId));
+        }
+
+        if (target) {
+          usedSessionIds.add(target.sessionId);
+          updateToolLog(logId, "running", `Dispatching to ${target.label}.`);
+          sendToSession(target, promptText, logId);
+        } else if (action.type === "spawn" && action.agentType) {
+          const spawned = onAddSessionRef.current?.(action.label, action.agentType);
+          if (spawned && spawned.sessionId) {
+            usedSessionIds.add(spawned.sessionId);
+            updateToolLog(logId, "running", `Spawned ${spawned.label}.`);
+            setTimeout(() => sendToSession(spawned, promptText, logId), 4000);
           } else {
-            onSendPtyCommandRef.current?.(existing.sessionId, promptText);
+            updateToolLog(logId, "failed", "No session was created.");
           }
         } else {
-          // Spawn a new session
-          const s = onAddSessionRef.current?.(action.label, action.agentType);
-          if (s) {
-            usedSessionIds.add(s.sessionId);
-            const sessId = s.sessionId;
-            setTimeout(() => { onSendPtyCommandRef.current?.(sessId, promptText); }, 4000);
-          }
+          updateToolLog(logId, "failed", "No matching session found.");
         }
-      } else if (action.type === "send" && action.prompt) {
-        const promptText = action.prompt;
-        // 1. Try to find a matching active session by exact label (case-insensitive) that isn't already used
-        let t = sessionsRef.current.find(s =>
-          !usedSessionIds.has(s.sessionId) &&
-          s.label.toLowerCase() === action.label.toLowerCase()
-        );
+        continue;
+      }
 
-        // 2. Fallback to finding by sequential index (first unused session)
-        if (!t) {
-          t = sessionsRef.current.find(s => !usedSessionIds.has(s.sessionId));
+      if (action.type === "kill") {
+        const target = sessionsRef.current.find(s => s.label.toLowerCase() === action.label.toLowerCase());
+        if (target) {
+          onCloseSessionRef.current?.(target.id);
+          updateToolLog(logId, "done", `Closed ${target.label}.`);
+        } else {
+          updateToolLog(logId, "failed", "No matching session found.");
         }
-
-        if (t) {
-          usedSessionIds.add(t.sessionId);
-          if (t.status === "exited") {
-            console.log(`[autoDispatchActions] Targeted send session ${t.label} has exited. Restarting...`);
-            const newSessId = onRestartSessionRef.current?.(t.id);
-            if (newSessId) {
-              setTimeout(() => {
-                console.log(`[autoDispatchActions] Sending prompt to restarted session: ${newSessId}`);
-                onSendPtyCommandRef.current?.(newSessId, promptText);
-              }, 4000);
-            }
-          } else if (t.status === "booting") {
-            console.log(`[autoDispatchActions] Targeted send session ${t.label} is booting. Waiting...`);
-            setTimeout(() => {
-              console.log(`[autoDispatchActions] Sending prompt to booted session: ${t.sessionId}`);
-              onSendPtyCommandRef.current?.(t.sessionId, promptText);
-            }, 4000);
-          } else {
-            onSendPtyCommandRef.current?.(t.sessionId, promptText);
-          }
-        }
-      } else if (action.type === "kill") {
-        const t = sessionsRef.current.find(s => s.label.toLowerCase() === action.label.toLowerCase());
-        if (t) onCloseSessionRef.current?.(t.id);
       }
     }
+  };
+
+  const answerAgentQuestion = (question: AgentQuestion, answer: string) => {
+    const text = answer.trim();
+    if (!text) return;
+    const session = sessionsRef.current.find(s => s.sessionId === question.sessionId);
+    if (!session) {
+      notifyError("That agent session is no longer available.");
+      return;
+    }
+    const action: AgentAction = { type: "send", label: session.label, prompt: text };
+    const logId = addToolLog(action, "running", `Answering ${session.label}.`);
+    sendToSession(session, text, logId);
+    setAgentQuestions(prev => prev.map(q => q.id === question.id ? { ...q, answered: true } : q));
+    setMsgs(prev => [...prev, {
+      id: `ans-${Date.now()}`,
+      role: "user",
+      body: `@${session.label}: ${text}`,
+      ts: ts(),
+    }]);
+    setInput("");
   };
 
   // ── Send ──────────────────────────────────────────────────────────────────────
@@ -673,13 +980,21 @@ export const ChatPanel: React.FC<{
     setInput("");
     setIsProcessing(true);
     try {
-      const sysPrompt = buildOrchestratorPrompt(sessionsRef.current, terminalOutputsRef.current);
+      const sysPrompt = buildOrchestratorPrompt(
+        sessionsRef.current,
+        terminalOutputsRef.current,
+        terminalTranscriptsRef.current,
+        toolCallsRef.current,
+        agentQuestionsRef.current,
+      );
       const history = msgs.filter(m => m.role === "user" || m.role === "ai").slice(-20).map(m => {
-        let content = m.body;
+        let content = stripAgentTags(m.body);
         if (m.role === "ai" && m.actions?.length) {
           content += "\n\n" + m.actions.map(a =>
             a.type === "spawn" ? `[Spawned: ${a.label} via ${a.agentType}]`
             : a.type === "send" ? `[Sent to: ${a.label}]`
+            : a.type === "request" ? `[Requested: ${a.count || 1} ${a.agentType} agent(s)]`
+            : a.type === "ask_user" ? `[Asked user: ${a.question || a.reason}]`
             : `[Killed: ${a.label}]`
           ).join(", ");
         }
@@ -733,7 +1048,7 @@ export const ChatPanel: React.FC<{
               type="button"
               className="chat-hdr-btn"
               title="New terminal"
-              onClick={() => { setTermPickerOpen(o => !o); setHistoryOpen(false); }}
+              onClick={() => { setTermPickerOpen(o => !o); setHistoryOpen(false); setToolPanelOpen(false); }}
             >
               <i className="bx bx-plus-circle" />
             </button>
@@ -758,13 +1073,51 @@ export const ChatPanel: React.FC<{
             )}
           </div>
 
+          {/* Tool calls */}
+          <div className="chat-header-dropdown-wrap" ref={toolPanelRef}>
+            <button
+              type="button"
+              className={`chat-hdr-btn ${toolPanelOpen ? "active" : ""}`}
+              title="Tool call history"
+              onClick={() => { setToolPanelOpen(o => !o); setTermPickerOpen(false); setHistoryOpen(false); }}
+            >
+              <i className="bx bx-list-check" />
+              {toolCalls.length > 0 && <span className="chat-hdr-badge">{Math.min(toolCalls.length, 9)}</span>}
+            </button>
+            {toolPanelOpen && (
+              <div className="chat-dropdown chat-tool-panel">
+                <div className="chat-history-header">
+                  <span className="chat-dropdown-label">Tool calls</span>
+                  <span className="chat-tool-count">{toolCalls.length}</span>
+                </div>
+                {toolCalls.length === 0 ? (
+                  <div className="chat-history-empty">No tool calls yet</div>
+                ) : (
+                  <div className="chat-tool-list">
+                    {toolCalls.slice(0, 18).map(t => (
+                      <div key={t.id} className={`chat-tool-item tool-${t.status}`}>
+                        <div className="chat-tool-row">
+                          <span className={`chat-tool-status tool-status-${t.status}`}>{t.status}</span>
+                          <span className="chat-tool-type">{t.action.type}</span>
+                          <span className="chat-tool-target">{t.action.label}</span>
+                        </div>
+                        <div className="chat-tool-note">{t.note || t.action.reason || t.action.prompt || t.action.question || "Queued"}</div>
+                        <div className="chat-tool-time">{t.ts}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* History */}
           <div className="chat-header-dropdown-wrap" ref={historyRef}>
             <button
               type="button"
               className={`chat-hdr-btn ${historyOpen ? "active" : ""}`}
               title="Chat history"
-              onClick={() => { setHistoryOpen(o => !o); setTermPickerOpen(false); }}
+              onClick={() => { setHistoryOpen(o => !o); setTermPickerOpen(false); setToolPanelOpen(false); }}
             >
               <i className="bx bx-history" />
               {histories.length > 0 && <span className="chat-hdr-badge">{histories.length}</span>}
@@ -820,8 +1173,9 @@ export const ChatPanel: React.FC<{
       {sessionsProp.length > 0 && (
         <div className="chat-sessions-strip">
           {sessionsProp.slice(0, 4).map(s => (
-            <span key={s.sessionId} className="chat-sess-chip" title={`${s.command} — ${s.sessionId}`}>
+            <span key={s.sessionId} className={`chat-sess-chip sess-${s.status || "unknown"}`} title={`${s.command} — ${s.sessionId}\n${(terminalOutputsProp[s.sessionId] || "").slice(-220)}`}>
               <i className="bx bx-terminal" />{s.label}
+              <span className="chat-sess-status">{s.status || "live"}</span>
             </span>
           ))}
           {sessionsProp.length > 4 && (
@@ -831,6 +1185,38 @@ export const ChatPanel: React.FC<{
       )}
 
       {/* ── Messages ── */}
+      {agentQuestions.some(q => !q.answered) && (
+        <div className="chat-question-stack">
+          {agentQuestions.filter(q => !q.answered).slice(0, 3).map(q => (
+            <div key={q.id} className="chat-question-card">
+              <div className="chat-question-main">
+                <span className="chat-question-label">{q.label}</span>
+                <span className="chat-question-text">{q.question}</span>
+              </div>
+              <div className="chat-question-actions">
+                <button
+                  type="button"
+                  className="chat-question-btn"
+                  disabled={!input.trim()}
+                  onClick={() => answerAgentQuestion(q, input)}
+                  title="Send typed answer to this CLI agent"
+                >
+                  <i className="bx bx-send" />
+                </button>
+                <button
+                  type="button"
+                  className="chat-question-btn"
+                  onClick={() => setAgentQuestions(prev => prev.map(x => x.id === q.id ? { ...x, answered: true } : x))}
+                  title="Dismiss"
+                >
+                  <i className="bx bx-check" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="chat-messages">
         {msgs.length === 0 ? (
           <div className="chat-empty-state">
@@ -839,7 +1225,7 @@ export const ChatPanel: React.FC<{
             <span className="chat-empty-sub">Describe what to build — agents spawn and work in parallel</span>
             <div className="chat-empty-tips">
               <span><i className="bx bx-plus-circle" /> Use + to add a terminal</span>
-              <span><i className="bx bx-history" /> History shows past chats</span>
+              <span><i className="bx bx-list-check" /> Tool calls stay tracked</span>
             </div>
           </div>
         ) : (
@@ -882,7 +1268,14 @@ export const ChatPanel: React.FC<{
                                 {a.agentType && <span className="chat-dispatch-agent">{a.agentType}</span>}
                                 <i className="bx bx-check-circle chat-dispatch-ok" />
                               </div>
-                              {a.prompt && <div className="chat-dispatch-prompt">{a.prompt.length > 130 ? a.prompt.slice(0,130)+"…" : a.prompt}</div>}
+                              {(a.prompt || a.question || a.reason) && (
+                                <div className="chat-dispatch-prompt">
+                                  {(() => {
+                                    const preview = a.prompt || a.question || a.reason || "";
+                                    return preview.length > 130 ? preview.slice(0, 130) + "…" : preview;
+                                  })()}
+                                </div>
+                              )}
                             </div>
                           ))}
                         </div>
@@ -923,7 +1316,7 @@ export const ChatPanel: React.FC<{
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={isRecording ? "Listening…" : "Describe the task…"}
+              placeholder={isRecording ? "Listening…" : agentQuestions.some(q => !q.answered) ? "Type an answer for the waiting agent…" : "Describe the task…"}
               rows={1}
               disabled={isRecording || isProcessing}
             />

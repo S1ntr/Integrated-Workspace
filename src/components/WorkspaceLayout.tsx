@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Sidebar, FileEntry } from "./Sidebar";
-import { ChatPanel } from "./ChatPanel";
+import { ChatPanel, type TerminalTranscriptEntry } from "./ChatPanel";
 import { TerminalGrid, Session } from "./TerminalGrid";
 import { ChangesViewer, ChangedFile } from "./ChangesViewer";
 import type { AgentSession } from "./Onboarding";
@@ -120,6 +120,7 @@ interface RightPanelProps {
   width: number;
   sessions: Session[];
   terminalOutputs: Record<string, string>;
+  terminalTranscripts: Record<string, TerminalTranscriptEntry[]>;
   changedFiles: ChangedFile[];
   baselineSnapshot: Record<string, string>;
   onFileSelect: (path: string, name: string) => void;
@@ -133,6 +134,7 @@ const RightPanel: React.FC<RightPanelProps> = ({
   width,
   sessions,
   terminalOutputs,
+  terminalTranscripts,
   changedFiles,
   baselineSnapshot,
   onFileSelect,
@@ -169,6 +171,7 @@ const RightPanel: React.FC<RightPanelProps> = ({
             embedded
             sessions={sessions}
             terminalOutputs={terminalOutputs}
+            terminalTranscripts={terminalTranscripts}
             onSendPtyCommand={onSendPtyCommand}
             onAddSession={onAddSession}
             onCloseSession={onCloseSession}
@@ -212,6 +215,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const [baselineSnapshot, setBaselineSnapshot] = useState<Record<string, string>>({});
   const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([]);
   const [terminalOutputs, setTerminalOutputs] = useState<Record<string, string>>({});
+  const [terminalTranscripts, setTerminalTranscripts] = useState<Record<string, TerminalTranscriptEntry[]>>({});
 
   // Helper to recursively collect all file entries (leaves only)
   const collectAllFiles = (entries: FileEntry[]): FileEntry[] => {
@@ -227,6 +231,27 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     };
     recurse(entries);
     return result;
+  };
+
+  const appendTerminalTranscript = (
+    session: Pick<Session, "sessionId" | "label">,
+    kind: TerminalTranscriptEntry["kind"],
+    text: string,
+  ) => {
+    const trimmed = text.replace(/\s+$/g, "");
+    if (!trimmed) return;
+    setTerminalTranscripts(prev => {
+      const entry: TerminalTranscriptEntry = {
+        id: `${session.sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        sessionId: session.sessionId,
+        label: session.label,
+        kind,
+        text: trimmed.slice(-1600),
+        ts: Date.now(),
+      };
+      const current = prev[session.sessionId] || [];
+      return { ...prev, [session.sessionId]: [...current, entry].slice(-120) };
+    });
   };
 
   // ── Baseline Snapshotting ────────────────────────────────────────────────
@@ -305,6 +330,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
           .replace(/\x1b\[[0-9;]*[mGKHFJA-Za-z]/g, "")
           .replace(/\x1b\][^\x07]*\x07/g, "")
           .replace(/\r/g, "");
+        appendTerminalTranscript(session, "output", cleaned);
         setTerminalOutputs(prev => {
           const current = prev[session.sessionId] || "";
           const updated = (current + cleaned).slice(-4000);
@@ -371,6 +397,19 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   }, []);
 
   const closeSession = (termId: number) => {
+    const target = sessions.find(s => s.id === termId);
+    if (target) {
+      setTerminalOutputs(outputs => {
+        const next = { ...outputs };
+        delete next[target.sessionId];
+        return next;
+      });
+      setTerminalTranscripts(transcripts => {
+        const next = { ...transcripts };
+        delete next[target.sessionId];
+        return next;
+      });
+    }
     setSessions(prev => prev.filter(s => s.id !== termId));
   };
 
@@ -431,6 +470,12 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
       return s;
     }));
     return newSessId;
+  };
+
+  const sendPtyCommand = (sessId: string, cmd: string) => {
+    const session = sessions.find(s => s.sessionId === sessId);
+    if (session) appendTerminalTranscript(session, "input", cmd);
+    invoke("pty_write", { sessionId: sessId, data: cmd + "\r" }).catch(() => {});
   };
 
 
@@ -564,12 +609,11 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
               width={rightW}
               sessions={sessions}
               terminalOutputs={terminalOutputs}
+              terminalTranscripts={terminalTranscripts}
               changedFiles={changedFiles}
               baselineSnapshot={baselineSnapshot}
               onFileSelect={(path, name) => setActiveFile({ path, name, baselineContent: baselineSnapshot[path] })}
-              onSendPtyCommand={(sessId, cmd) => {
-                invoke("pty_write", { sessionId: sessId, data: cmd + "\r" }).catch(() => {});
-              }}
+              onSendPtyCommand={sendPtyCommand}
               onAddSession={addSession}
               onCloseSession={closeSession}
               onRestartSession={restartSession}
