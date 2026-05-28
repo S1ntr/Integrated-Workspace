@@ -98,6 +98,81 @@ html[data-theme="light"] .chat-bubble-user { background: rgba(0,0,0,0.04); borde
 html[data-theme="light"] .diff-scroll { background: #f0f0f0; }
 html[data-theme="light"] .term-agent-dropdown-menu { background: #ffffff; }
 
+/* ── DESERT MODE ─────────────────────────────────────────── */
+/* Warm near-black with sandy brown undertone — amber accent only,
+   backgrounds are dark charcoal with a subtle warm cast. */
+html[data-theme="desert"] {
+  --bg-base: #181410;   /* dark warm charcoal */
+  --bg-1:    #201a14;   /* panel background */
+  --bg-2:    #2a211a;   /* elevated surface */
+  --bg-3:    #342820;   /* hover / input */
+  --bg-4:    #3e3028;   /* border */
+  --bg-5:    #4c3c30;   /* strong border */
+  --bg-6:    #5c4c3e;   /* divider visible */
+
+  --text-1:  #ede5d8;   /* primary — warm cream */
+  --text-2:  #a09080;   /* secondary — warm tan */
+  --text-3:  #6a5848;   /* muted */
+  --text-4:  #453830;   /* disabled */
+
+  --accent:        #e8a043;  /* amber — the warm color shows here */
+  --accent-subtle: rgba(232,160,67,0.07);
+  --accent-border: rgba(232,160,67,0.20);
+  --accent-bright: #f5c070;
+
+  --ok:        #4ade80;
+  --ok-dim:    rgba(74,222,128,0.08);
+  --ok-border: rgba(74,222,128,0.18);
+  --warn:      #fbbf24;
+  --warn-dim:  rgba(251,191,36,0.08);
+  --err:       #f87171;
+  --err-dim:   rgba(248,113,113,0.08);
+  --err-border:rgba(248,113,113,0.20);
+
+  --shadow-sm: 0 1px 4px rgba(0,0,0,0.70);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.72);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.78), 0 0 0 1px rgba(232,160,67,0.06);
+  --shadow-xl: 0 20px 60px rgba(0,0,0,0.88), 0 0 0 1px rgba(232,160,67,0.09);
+}
+
+/* ── OCEAN MODE ──────────────────────────────────────────── */
+/* Predominantly dark/neutral — blue shows only as a cool undertone
+   and through the accent color. Backgrounds are near-black with
+   a subtle blue cast; text is near-white/gray, not blue-tinted. */
+html[data-theme="ocean"] {
+  --bg-base: #0c0e12;   /* near-black, faint blue cast */
+  --bg-1:    #12161f;   /* panel background */
+  --bg-2:    #181d29;   /* elevated surface */
+  --bg-3:    #1e2435;   /* hover / input */
+  --bg-4:    #252c3e;   /* border */
+  --bg-5:    #2e3750;   /* strong border */
+  --bg-6:    #384460;   /* divider visible */
+
+  --text-1:  #eaecf0;   /* primary — neutral near-white */
+  --text-2:  #8a96a8;   /* secondary — cool gray */
+  --text-3:  #505a6e;   /* muted */
+  --text-4:  #2c3446;   /* disabled */
+
+  --accent:        #38bdf8;  /* sky blue — the blue shows here */
+  --accent-subtle: rgba(56,189,248,0.07);
+  --accent-border: rgba(56,189,248,0.18);
+  --accent-bright: #7dd3fc;
+
+  --ok:        #4ade80;
+  --ok-dim:    rgba(74,222,128,0.08);
+  --ok-border: rgba(74,222,128,0.18);
+  --warn:      #fbbf24;
+  --warn-dim:  rgba(251,191,36,0.08);
+  --err:       #f87171;
+  --err-dim:   rgba(248,113,113,0.08);
+  --err-border:rgba(248,113,113,0.20);
+
+  --shadow-sm: 0 1px 4px rgba(0,0,0,0.70);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.72);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.78), 0 0 0 1px rgba(56,189,248,0.06);
+  --shadow-xl: 0 20px 60px rgba(0,0,0,0.88), 0 0 0 1px rgba(56,189,248,0.09);
+}
+
 /* ── RESET ──────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html, body, #root { width: 100vw; height: 100vh; overflow: hidden; }
@@ -2549,17 +2624,66 @@ input, textarea { font-family: var(--font-ui); }
 .stng-toggle.on .stng-toggle-thumb { transform: translateX(16px); background: var(--bg-base); }
 
 /* Theme picker */
-.theme-picker { display: flex; gap: 6px; }
+.theme-picker { display: flex; gap: 10px; flex-wrap: wrap; }
 .theme-option {
-  display: flex; align-items: center; gap: 6px;
-  padding: 8px 14px; border: 1px solid var(--bg-5);
-  border-radius: var(--radius-sm); background: var(--bg-2);
+  display: flex; flex-direction: column; align-items: stretch;
+  padding: 0; border: 1.5px solid var(--bg-5);
+  border-radius: var(--radius-md); background: var(--bg-2);
   color: var(--text-2); font-size: 12px; font-weight: 400; cursor: pointer;
-  transition: all 0.12s; font-family: var(--font-ui);
+  transition: all 0.15s; font-family: var(--font-ui);
+  overflow: hidden; width: 96px; flex-shrink: 0;
 }
-.theme-option i { font-size: 14px; }
-.theme-option:hover { background: var(--bg-3); color: var(--text-1); border-color: var(--bg-6); }
-.theme-option.active { border-color: var(--accent-border); background: var(--accent-subtle); color: var(--accent); }
+.theme-option:hover { border-color: var(--bg-6); transform: translateY(-2px); box-shadow: var(--shadow-md); }
+.theme-option.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-border); }
+
+/* Color preview swatch */
+.theme-swatch { width: 100%; height: 56px; flex-shrink: 0; position: relative; overflow: hidden; }
+
+/* Dark swatch: deep black with subtle panel lines */
+.theme-swatch-dark {
+  background:
+    linear-gradient(#0f0f0f 0px, #0f0f0f 10px, transparent 10px),
+    linear-gradient(to right, #0f0f0f 0px, #0f0f0f 24px, #080808 24px);
+}
+
+/* Light swatch: clean white with subtle panels */
+.theme-swatch-light {
+  background:
+    linear-gradient(#e4e4e4 0px, #e4e4e4 10px, transparent 10px),
+    linear-gradient(to right, #e4e4e4 0px, #e4e4e4 24px, #f5f5f5 24px);
+}
+
+/* Auto swatch: diagonal split dark / light */
+.theme-swatch-auto {
+  background: linear-gradient(135deg, #0f0f0f 50%, #f0f0f0 50%);
+}
+
+/* Ocean swatch: deep navy with cyan accent stripe */
+.theme-swatch-ocean {
+  background:
+    linear-gradient(#38bdf8 0px, #38bdf8 3px, transparent 3px),
+    linear-gradient(#0c1a30 3px, #0c1a30 13px, transparent 13px),
+    linear-gradient(to right, #0c1a30 0px, #0c1a30 24px, #060f1e 24px);
+}
+
+/* Desert swatch: warm charcoal with amber accent stripe */
+.theme-swatch-desert {
+  background:
+    linear-gradient(#e8a043 0px, #e8a043 3px, transparent 3px),
+    linear-gradient(#2a211a 3px, #2a211a 13px, transparent 13px),
+    linear-gradient(to right, #2a211a 0px, #2a211a 24px, #181410 24px);
+}
+
+/* Label row inside each theme card */
+.theme-label {
+  display: flex; align-items: center; gap: 5px;
+  padding: 7px 10px; font-size: 11px; font-weight: 500;
+  color: var(--text-2); border-top: 1px solid var(--bg-4);
+  background: var(--bg-2);
+}
+.theme-label i { font-size: 12px; }
+.theme-option:hover .theme-label { color: var(--text-1); }
+.theme-option.active .theme-label { color: var(--accent); background: var(--accent-subtle); }
 
 /* Loading */
 .stng-loading {

@@ -2591,7 +2591,6 @@ export const ChatPanel: React.FC<{
                     });
                   }}
                 >
-                  <i className={`bx ${chatMode === "build" ? "bx-hammer" : "bx-list-check"}`} />
                   <span className="chat-mode-name">{chatMode === "build" ? "Build" : "Plan"}</span>
                   <i className={`bx bx-chevron-up ${modeDropdownOpen ? "open" : ""}`} />
                 </button>
@@ -2606,8 +2605,8 @@ export const ChatPanel: React.FC<{
                     }}
                   >
                     {([
-                      { value: "build" as const, label: "Build", icon: "bx-hammer", desc: "Coordinate agents and implement" },
-                      { value: "plan" as const, label: "Plan", icon: "bx-list-check", desc: "Draft an implementation plan in chat" },
+                      { value: "build" as const, label: "Build", icon: null, desc: "Coordinate agents and implement" },
+                      { value: "plan" as const, label: "Plan", icon: null, desc: "Draft an implementation plan in chat" },
                     ]).map(option => (
                       <button
                         key={option.value}
@@ -2618,7 +2617,7 @@ export const ChatPanel: React.FC<{
                           setModeDropdownOpen(false);
                         }}
                       >
-                        <i className={`bx ${option.icon}`} />
+                        {option.icon && <i className={`bx ${option.icon}`} />}
                         <span className="chat-pill-item-text">
                           <strong>{option.label}</strong>
                           <small>{option.desc}</small>

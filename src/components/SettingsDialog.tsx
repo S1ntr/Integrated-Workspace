@@ -174,13 +174,15 @@ const Toggle: React.FC<ToggleProps> = ({ label, desc, checked, onChange }) => (
   </div>
 );
 
-type ThemeMode = "dark" | "light" | "auto";
+type ThemeMode = "dark" | "light" | "auto" | "ocean" | "desert";
 
 function applyTheme(mode: ThemeMode) {
   const root = document.documentElement;
-  if (mode === "dark")  root.setAttribute("data-theme", "dark");
-  else if (mode === "light") root.setAttribute("data-theme", "light");
-  else root.removeAttribute("data-theme");
+  if (mode === "dark")        root.setAttribute("data-theme", "dark");
+  else if (mode === "light")  root.setAttribute("data-theme", "light");
+  else if (mode === "ocean")  root.setAttribute("data-theme", "ocean");
+  else if (mode === "desert") root.setAttribute("data-theme", "desert");
+  else                        root.removeAttribute("data-theme");
   try { localStorage.setItem("__integraded_theme", mode); } catch {}
 }
 
@@ -643,30 +645,26 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                     Choose how Integraded looks. Auto follows your system preference.
                   </p>
                   <div className="theme-picker">
-                    <button
-                      type="button"
-                      className={`theme-option ${themeMode === "dark" ? "active" : ""}`}
-                      onClick={() => changeTheme("dark")}
-                    >
-                      <i className="bx bx-moon" />
-                      Dark
-                    </button>
-                    <button
-                      type="button"
-                      className={`theme-option ${themeMode === "light" ? "active" : ""}`}
-                      onClick={() => changeTheme("light")}
-                    >
-                      <i className="bx bx-sun" />
-                      Light
-                    </button>
-                    <button
-                      type="button"
-                      className={`theme-option ${themeMode === "auto" ? "active" : ""}`}
-                      onClick={() => changeTheme("auto")}
-                    >
-                      <i className="bx bx-adjust" />
-                      Auto
-                    </button>
+                    {([
+                      { value: "dark"  as const, label: "Dark",  icon: "bx-moon",   swatchClass: "theme-swatch-dark"  },
+                      { value: "light" as const, label: "Light", icon: "bx-sun",    swatchClass: "theme-swatch-light" },
+                      { value: "auto"  as const, label: "Auto",  icon: "bx-adjust", swatchClass: "theme-swatch-auto"  },
+                      { value: "ocean"  as const, label: "Ocean",  icon: "bx-water",     swatchClass: "theme-swatch-ocean"  },
+                      { value: "desert" as const, label: "Desert", icon: "bx-landscape", swatchClass: "theme-swatch-desert" },
+                    ]).map(t => (
+                      <button
+                        key={t.value}
+                        type="button"
+                        className={`theme-option ${themeMode === t.value ? "active" : ""}`}
+                        onClick={() => changeTheme(t.value)}
+                      >
+                        <div className={`theme-swatch ${t.swatchClass}`} />
+                        <span className="theme-label">
+                          <i className={`bx ${t.icon}`} />
+                          {t.label}
+                        </span>
+                      </button>
+                    ))}
                   </div>
                 </div>
               </div>
