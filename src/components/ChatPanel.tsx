@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useNotify } from "./Notification";
+import type { BrowserOpenRequest, ExternalChatPrompt } from "../types/browser";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -14,13 +15,15 @@ export interface Session {
 }
 
 interface AgentAction {
-  type: "spawn" | "send" | "kill" | "request" | "ask_user";
+  type: "spawn" | "send" | "kill" | "request" | "ask_user" | "browser_open";
   agentType?: string;
   label: string;
   prompt?: string;
   count?: number;
   reason?: string;
   question?: string;
+  url?: string;
+  device?: string;
 }
 
 interface ToolCallLog {
@@ -209,18 +212,24 @@ function parseStreamDelta(line: string, provider: string): string | null {
 
 function normalizeToolAction(raw: any): AgentAction | null {
   if (!raw || typeof raw !== "object") return null;
-  const tool = String(raw.tool || raw.type || "").toLowerCase().replace(/^(agent|chat)\./, "");
+  const rawTool = String(raw.tool || raw.type || "").toLowerCase();
+  const tool = rawTool.replace(/^(agent|chat|browser)\./, "");
   const label = String(raw.label || raw.session || raw.target || raw.agent || "").trim();
   const prompt = typeof raw.prompt === "string" ? raw.prompt : typeof raw.message === "string" ? raw.message : undefined;
   const agentType = typeof raw.agentType === "string" ? raw.agentType : typeof raw.agent_type === "string" ? raw.agent_type : typeof raw.command === "string" ? raw.command : undefined;
   const count = Number.isFinite(Number(raw.count)) ? Math.max(1, Math.min(16, Number(raw.count))) : undefined;
   const reason = typeof raw.reason === "string" ? raw.reason : undefined;
   const question = typeof raw.question === "string" ? raw.question : typeof raw.body === "string" ? raw.body : undefined;
+  const url = typeof raw.url === "string" ? raw.url : typeof raw.href === "string" ? raw.href : undefined;
+  const device = typeof raw.device === "string" ? raw.device : typeof raw.viewport === "string" ? raw.viewport : undefined;
 
   if (tool === "spawn") return { type: "spawn", label: label || agentType || "Agent", agentType, prompt };
   if (tool === "send") return { type: "send", label: label || "Agent", prompt };
   if (tool === "kill") return { type: "kill", label: label || "Agent" };
   if (tool === "request") return { type: "request", label: label || agentType || "Agent", agentType, count: count || 1, prompt, reason };
+  if (rawTool.startsWith("browser.") && (tool === "open" || tool === "navigate")) {
+    return { type: "browser_open", label: label || "Browser", url, device, prompt, reason };
+  }
   if (tool === "ask_user" || tool === "ask" || tool === "question") {
     return { type: "ask_user", label: label || "User", question: question || prompt || reason || "Need more information.", reason };
   }
@@ -345,6 +354,7 @@ Tool calls execute automatically and are hidden from the normal chat bubble. Put
 <tool_call>{"tool":"agent.spawn","agentType":"opencode","label":"Frontend Agent","prompt":"Focused task for this new agent"}</tool_call>
 <tool_call>{"tool":"agent.request","agentType":"claude","label":"Review Agent","count":1,"reason":"Need another reviewer","prompt":"Task to send once the user adds that agent"}</tool_call>
 <tool_call>{"tool":"agent.kill","label":"Agent Label"}</tool_call>
+<tool_call>{"tool":"browser.open","url":"http://localhost:3000","device":"responsive","label":"Project Preview"}</tool_call>
 <tool_call>{"tool":"chat.ask_user","question":"Precise question for the user"}</tool_call>
 
 Never show raw tool calls in visible prose. Visible prose should summarize what is happening and what you need from the user.
@@ -357,7 +367,9 @@ Never show raw tool calls in visible prose. Visible prose should summarize what 
 5. If agent A defines a shared type, paste the full definition into agent B's prompt
 6. If more agents are needed but you should not create them yourself, use \`agent.request\`; the app will detect newly added matching agents and dispatch your queued prompt.
 7. If a CLI agent asks a question and the answer follows from the user's instruction, answer it with \`agent.send\`. If uncertain, use \`chat.ask_user\`.
-8. After dispatching, briefly summarize what each agent is doing (visible to user)
+8. If the user asks to open, inspect, test, or preview a web/app UI, use \`browser.open\` with the best local URL from terminal output. If no URL is known, ask the user for it.
+9. Browser feedback may include a URL, viewport, selected element/region, and user note. Use that context to prompt agents with precise visual/UI fixes.
+10. After dispatching, briefly summarize what each agent is doing (visible to user)
 
 ## Current Agent Output
 ${outputBlocks || "(no output captured yet)"}
@@ -388,19 +400,23 @@ export const ChatPanel: React.FC<{
   sessions?: Session[];
   terminalOutputs?: Record<string, string>;
   terminalTranscripts?: Record<string, TerminalTranscriptEntry[]>;
+  externalPrompt?: ExternalChatPrompt | null;
   onSendPtyCommand?: (sessId: string, cmd: string) => void;
   onAddSession?: (label: string, command: string) => Session;
   onCloseSession?: (id: number) => void;
   onRestartSession?: (id: number) => string;
+  onOpenBrowser?: (request: BrowserOpenRequest) => void;
 }> = ({
   embedded,
   sessions: sessionsProp = [],
   terminalOutputs: terminalOutputsProp = {},
   terminalTranscripts: terminalTranscriptsProp = {},
+  externalPrompt,
   onSendPtyCommand,
   onAddSession,
   onCloseSession,
   onRestartSession,
+  onOpenBrowser,
 }) => {
   // ── Core state ───────────────────────────────────────────────────────────────
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -415,7 +431,6 @@ export const ChatPanel: React.FC<{
       return [];
     }
   });
-  const [toolPanelOpen, setToolPanelOpen] = useState(false);
   const [agentQuestions, setAgentQuestions] = useState<AgentQuestion[]>([]);
   const [pendingAgentRequests, setPendingAgentRequests] = useState<PendingAgentRequest[]>([]);
 
@@ -434,7 +449,6 @@ export const ChatPanel: React.FC<{
   // ── Terminal picker ──────────────────────────────────────────────────────────
   const [termPickerOpen, setTermPickerOpen] = useState(false);
   const termPickerRef = useRef<HTMLDivElement>(null);
-  const toolPanelRef = useRef<HTMLDivElement>(null);
 
   // ── Model selection ──────────────────────────────────────────────────────────
   const [config, setConfig] = useState<any>(null);
@@ -462,6 +476,7 @@ export const ChatPanel: React.FC<{
   const onAddSessionRef = useRef(onAddSession);
   const onCloseSessionRef = useRef(onCloseSession);
   const onRestartSessionRef = useRef(onRestartSession);
+  const onOpenBrowserRef = useRef(onOpenBrowser);
   const sessionsRef = useRef(sessionsProp);
   const terminalOutputsRef = useRef(terminalOutputsProp);
   const terminalTranscriptsRef = useRef(terminalTranscriptsProp);
@@ -470,11 +485,13 @@ export const ChatPanel: React.FC<{
   const pendingAgentRequestsRef = useRef<PendingAgentRequest[]>([]);
   const seenQuestionKeysRef = useRef<Set<string>>(new Set());
   const usedPromptSessionIdsRef = useRef<Set<string>>(new Set());
+  const handledExternalPromptRef = useRef<string | null>(null);
   
   onSendPtyCommandRef.current = onSendPtyCommand;
   onAddSessionRef.current = onAddSession;
   onCloseSessionRef.current = onCloseSession;
   onRestartSessionRef.current = onRestartSession;
+  onOpenBrowserRef.current = onOpenBrowser;
   sessionsRef.current = sessionsProp;
   terminalOutputsRef.current = terminalOutputsProp;
   terminalTranscriptsRef.current = terminalTranscriptsProp;
@@ -503,7 +520,6 @@ export const ChatPanel: React.FC<{
 
       if (historyRef.current && !historyRef.current.contains(target)) setHistoryOpen(false);
       if (termPickerRef.current && !termPickerRef.current.contains(target)) setTermPickerOpen(false);
-      if (toolPanelRef.current && !toolPanelRef.current.contains(target)) setToolPanelOpen(false);
     };
     window.addEventListener("mousedown", fn);
     return () => window.removeEventListener("mousedown", fn);
@@ -876,6 +892,21 @@ export const ChatPanel: React.FC<{
         continue;
       }
 
+      if (action.type === "browser_open") {
+        if (!onOpenBrowserRef.current) {
+          updateToolLog(logId, "failed", "Browser bridge is not available.");
+          continue;
+        }
+        onOpenBrowserRef.current({
+          id: logId,
+          url: action.url,
+          label: action.label,
+          device: action.device,
+        });
+        updateToolLog(logId, "done", action.url ? `Opened ${action.url}.` : "Opened integrated browser.");
+        continue;
+      }
+
       if (action.type === "request" && action.agentType) {
         const count = action.count || 1;
         const request: PendingAgentRequest = {
@@ -972,12 +1003,12 @@ export const ChatPanel: React.FC<{
 
   // ── Send ──────────────────────────────────────────────────────────────────────
 
-  const send = async (e?: React.FormEvent) => {
+  const send = async (e?: React.FormEvent, overrideText?: string) => {
     if (e) e.preventDefault();
-    const text = input.trim();
+    const text = (overrideText ?? input).trim();
     if (!text || isProcessing) return;
     setMsgs(p => [...p, { id: `u${Date.now()}`, role:"user", body: text, ts: ts() }]);
-    setInput("");
+    if (!overrideText) setInput("");
     setIsProcessing(true);
     try {
       const sysPrompt = buildOrchestratorPrompt(
@@ -995,6 +1026,7 @@ export const ChatPanel: React.FC<{
             : a.type === "send" ? `[Sent to: ${a.label}]`
             : a.type === "request" ? `[Requested: ${a.count || 1} ${a.agentType} agent(s)]`
             : a.type === "ask_user" ? `[Asked user: ${a.question || a.reason}]`
+            : a.type === "browser_open" ? `[Opened browser: ${a.url || a.label}]`
             : `[Killed: ${a.label}]`
           ).join(", ");
         }
@@ -1029,6 +1061,18 @@ export const ChatPanel: React.FC<{
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   };
 
+  useEffect(() => {
+    if (!externalPrompt || handledExternalPromptRef.current === externalPrompt.id) return;
+    handledExternalPromptRef.current = externalPrompt.id;
+    if (isProcessing) {
+      setInput(externalPrompt.text);
+      notifyError("Chat is busy. I placed the browser feedback in the composer.");
+      return;
+    }
+    void send(undefined, externalPrompt.text);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [externalPrompt?.id]);
+
   // ─── Render ───────────────────────────────────────────────────────────────────
 
   return (
@@ -1048,7 +1092,7 @@ export const ChatPanel: React.FC<{
               type="button"
               className="chat-hdr-btn"
               title="New terminal"
-              onClick={() => { setTermPickerOpen(o => !o); setHistoryOpen(false); setToolPanelOpen(false); }}
+              onClick={() => { setTermPickerOpen(o => !o); setHistoryOpen(false); }}
             >
               <i className="bx bx-plus-circle" />
             </button>
@@ -1073,51 +1117,13 @@ export const ChatPanel: React.FC<{
             )}
           </div>
 
-          {/* Tool calls */}
-          <div className="chat-header-dropdown-wrap" ref={toolPanelRef}>
-            <button
-              type="button"
-              className={`chat-hdr-btn ${toolPanelOpen ? "active" : ""}`}
-              title="Tool call history"
-              onClick={() => { setToolPanelOpen(o => !o); setTermPickerOpen(false); setHistoryOpen(false); }}
-            >
-              <i className="bx bx-list-check" />
-              {toolCalls.length > 0 && <span className="chat-hdr-badge">{Math.min(toolCalls.length, 9)}</span>}
-            </button>
-            {toolPanelOpen && (
-              <div className="chat-dropdown chat-tool-panel">
-                <div className="chat-history-header">
-                  <span className="chat-dropdown-label">Tool calls</span>
-                  <span className="chat-tool-count">{toolCalls.length}</span>
-                </div>
-                {toolCalls.length === 0 ? (
-                  <div className="chat-history-empty">No tool calls yet</div>
-                ) : (
-                  <div className="chat-tool-list">
-                    {toolCalls.slice(0, 18).map(t => (
-                      <div key={t.id} className={`chat-tool-item tool-${t.status}`}>
-                        <div className="chat-tool-row">
-                          <span className={`chat-tool-status tool-status-${t.status}`}>{t.status}</span>
-                          <span className="chat-tool-type">{t.action.type}</span>
-                          <span className="chat-tool-target">{t.action.label}</span>
-                        </div>
-                        <div className="chat-tool-note">{t.note || t.action.reason || t.action.prompt || t.action.question || "Queued"}</div>
-                        <div className="chat-tool-time">{t.ts}</div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
           {/* History */}
           <div className="chat-header-dropdown-wrap" ref={historyRef}>
             <button
               type="button"
               className={`chat-hdr-btn ${historyOpen ? "active" : ""}`}
               title="Chat history"
-              onClick={() => { setHistoryOpen(o => !o); setTermPickerOpen(false); setToolPanelOpen(false); }}
+              onClick={() => { setHistoryOpen(o => !o); setTermPickerOpen(false); }}
             >
               <i className="bx bx-history" />
               {histories.length > 0 && <span className="chat-hdr-badge">{histories.length}</span>}
@@ -1217,6 +1223,28 @@ export const ChatPanel: React.FC<{
         </div>
       )}
 
+      {toolCalls.length > 0 && (
+        <div className="chat-tool-timeline" aria-label="Tool call history">
+          <div className="chat-tool-timeline-head">
+            <span><i className="bx bx-list-check" /> Tool calls</span>
+            <span>{toolCalls.length}</span>
+          </div>
+          <div className="chat-tool-timeline-list">
+            {toolCalls.slice(0, 6).map(t => {
+              const note = t.note || t.action.url || t.action.reason || t.action.prompt || t.action.question || "Queued";
+              return (
+                <div key={t.id} className={`chat-tool-inline tool-${t.status}`}>
+                  <span className={`chat-tool-status tool-status-${t.status}`}>{t.status}</span>
+                  <span className="chat-tool-type">{t.action.type}</span>
+                  <span className="chat-tool-target">{t.action.label}</span>
+                  <span className="chat-tool-note-inline">{note}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       <div className="chat-messages">
         {msgs.length === 0 ? (
           <div className="chat-empty-state">
@@ -1268,11 +1296,11 @@ export const ChatPanel: React.FC<{
                                 {a.agentType && <span className="chat-dispatch-agent">{a.agentType}</span>}
                                 <i className="bx bx-check-circle chat-dispatch-ok" />
                               </div>
-                              {(a.prompt || a.question || a.reason) && (
+                              {(a.prompt || a.question || a.reason || a.url) && (
                                 <div className="chat-dispatch-prompt">
                                   {(() => {
-                                    const preview = a.prompt || a.question || a.reason || "";
-                                    return preview.length > 130 ? preview.slice(0, 130) + "…" : preview;
+                                    const preview = a.prompt || a.question || a.reason || a.url || "";
+                                    return preview.length > 130 ? preview.slice(0, 130) + "..." : preview;
                                   })()}
                                 </div>
                               )}
