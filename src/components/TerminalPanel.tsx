@@ -52,6 +52,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
 
     destroyed.current = false;
     ptyReady.current  = false;
+    const isWindows = navigator.userAgent.includes("Windows");
 
     // ── 1. Create Terminal ────────────────────────────────────────────────────
     // Uses canvas renderer by default (no WebGL addon loaded — avoids texture atlas bugs in WebView2)
@@ -84,8 +85,17 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       cursorBlink:       true,
       cursorStyle:       "block",
       scrollback:        5000,
+      // The app uses a 3px custom xterm scrollbar. FitAddon otherwise assumes
+      // the default 14px gutter and under-counts columns in narrow panes.
+      overviewRuler:     { width: 3 },
+      // Keep xterm's buffer behavior aligned with Windows ConPTY. This avoids
+      // wrapped-line reflow heuristics that can leave stale text after resizes.
+      windowsPty:        isWindows ? { backend: "conpty" } : undefined,
       allowTransparency: false,
-      convertEol:        true,
+      // PTY output already carries the terminal's intended CR/LF behavior.
+      // For TUI apps, converting LF to CRLF in the renderer can move the cursor
+      // differently than a real terminal and create apparent indentation.
+      convertEol:        false,
     });
 
     const fit = new FitAddon();
@@ -105,6 +115,18 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       try { fit.fit(); } catch {}
     };
 
+    const readSafeTerminalSize = () => ({
+      rows: Math.max(10, term.rows > 0 ? term.rows : 24),
+      cols: Math.max(40, term.cols > 0 ? term.cols : 80),
+    });
+
+    const sendPtyResize = (rows: number, cols: number) => {
+      if (destroyed.current || !ptyReady.current) return;
+      if (rows === lastSentSize.current.rows && cols === lastSentSize.current.cols) return;
+      lastSentSize.current = { rows, cols };
+      invoke("pty_resize", { sessionId, rows, cols }).catch(() => {});
+    };
+
     // scheduleRefresh — deferred canvas repaint.
     // fit.fit() resizes xterm's internal buffer immediately, but the canvas
     // DOM element resize is applied asynchronously by xterm's renderer.
@@ -120,7 +142,16 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
 
     // doFit — RAF-debounced fit + deferred refresh.
     // Used by ResizeObserver and drag handlers.
-    let resizeTimeout: any = null;
+    let resizeTimeout: ReturnType<typeof setTimeout> | null = null;
+    const schedulePtyResize = (delay = 160, refit = true) => {
+      if (resizeTimeout) clearTimeout(resizeTimeout);
+      resizeTimeout = setTimeout(() => {
+        if (destroyed.current || !ptyReady.current) return;
+        if (refit) fitSync();
+        const { rows, cols } = readSafeTerminalSize();
+        sendPtyResize(rows, cols);
+      }, delay);
+    };
     const doFit = () => {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = requestAnimationFrame(() => {
@@ -131,15 +162,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           // before we force a repaint — prevents black bars in WebView2.
           scheduleRefresh();
           if (ptyReady.current) {
-            if (resizeTimeout) clearTimeout(resizeTimeout);
-            resizeTimeout = setTimeout(() => {
-              if (destroyed.current || !ptyReady.current) return;
-              const rows = term.rows;
-              const cols = term.cols;
-              if (rows === lastSentSize.current.rows && cols === lastSentSize.current.cols) return;
-              lastSentSize.current = { rows, cols };
-              invoke("pty_resize", { sessionId, rows, cols }).catch(() => {});
-            }, 200);
+            schedulePtyResize(200, false);
           }
         } catch {}
       });
@@ -240,14 +263,16 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       const handleFocus = () => {
         if (destroyed.current || !ptyReady.current) return;
         fitSync();
-        const rows = term.rows;
-        const cols = term.cols;
-        if (rows === lastSentSize.current.rows && cols === lastSentSize.current.cols) return;
-        lastSentSize.current = { rows, cols };
-        invoke("pty_resize", { sessionId, rows, cols }).catch(() => {});
+        const { rows, cols } = readSafeTerminalSize();
+        sendPtyResize(rows, cols);
       };
       term.textarea?.addEventListener("focus", handleFocus);
       cleanupFns.push(() => term.textarea?.removeEventListener("focus", handleFocus));
+
+      // Also mirror any xterm-side resize caused by direct FitAddon calls
+      // (drag-end refreshes, layout restoration, or future callers).
+      const resizeDisposable = term.onResize(() => schedulePtyResize(160, false));
+      cleanupFns.push(() => resizeDisposable.dispose());
 
       // ── 5b. ResizeObserver — refit whenever container changes size ────────
       const ro = new ResizeObserver(doFit);
@@ -259,8 +284,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       fitSync();
 
       // Enforce a safe minimum size of 40 cols and 10 rows when launching ConPTY
-      const rows = Math.max(10, term.rows > 0 ? term.rows : 24);
-      const cols = Math.max(40, term.cols > 0 ? term.cols : 80);
+      const { rows, cols } = readSafeTerminalSize();
 
       lastSentSize.current = { rows, cols };
       invoke("pty_create", { sessionId, command, cwd: workspaceDir, rows, cols })
@@ -288,12 +312,9 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
               setTimeout(() => {
                 if (destroyed.current || !ptyReady.current) return;
                 fitSync();
-                const r = Math.max(10, term.rows > 0 ? term.rows : 24);
-                const c = Math.max(40, term.cols > 0 ? term.cols : 80);
+                const { rows: r, cols: c } = readSafeTerminalSize();
                 // Bail out if nothing changed — avoids spurious SIGWINCH.
-                if (r === lastSentSize.current.rows && c === lastSentSize.current.cols) return;
-                lastSentSize.current = { rows: r, cols: c };
-                invoke("pty_resize", { sessionId, rows: r, cols: c }).catch(() => {});
+                sendPtyResize(r, c);
               }, delay);
             };
             scheduleConditionalResize(700);   // after TUI queries initial size
