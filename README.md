@@ -141,5 +141,6 @@ Contributions are welcome. Feel free to open issues or submit pull requests on G
 
 ## Author
 
-**S1ntr** -- [GitHub](https://github.com/S1ntr)\n
+**S1ntr** -- [GitHub](https://github.com/S1ntr)
+
 **dawgeek** -- [GitHub](https://github.com/seshdogik)
