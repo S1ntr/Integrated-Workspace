@@ -126,7 +126,7 @@ interface RightPanelProps {
   terminalTranscripts: Record<string, TerminalTranscriptEntry[]>;
   changedFiles: ChangedFile[];
   baselineSnapshot: Record<string, string>;
-  onFileSelect: (path: string, name: string) => void;
+  onFileSelect: (path: string, name: string, baselineContent?: string) => void;
   onSendPtyCommand: (sessId: string, cmd: string) => void;
   onAddSession: (label: string, command: string) => Session;
   onCloseSession: (id: number) => void;
@@ -214,7 +214,7 @@ const RightPanel: React.FC<RightPanelProps> = ({
             onOpenBrowser={openBrowser}
           />
         ) : (
-          <ChangesViewer
+        <ChangesViewer
             changedFiles={changedFiles}
             baselineSnapshot={baselineSnapshot}
             onFileSelect={onFileSelect}
@@ -339,7 +339,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
         const changes: ChangedFile[] = [];
 
         for (const f of currentFiles) {
-          if (!(f.path in baselineSnapshot)) {
+          if (!Object.prototype.hasOwnProperty.call(baselineSnapshot, f.path)) {
             // Created file
             changes.push({ name: f.name, path: f.path, status: "new" });
           } else {
@@ -660,7 +660,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
               terminalTranscripts={terminalTranscripts}
               changedFiles={changedFiles}
               baselineSnapshot={baselineSnapshot}
-              onFileSelect={(path, name) => setActiveFile({ path, name, baselineContent: baselineSnapshot[path] })}
+              onFileSelect={(path, name, baselineContent) => setActiveFile({ path, name, baselineContent: baselineContent ?? baselineSnapshot[path] })}
               onSendPtyCommand={sendPtyCommand}
               onAddSession={addSession}
               onCloseSession={closeSession}

@@ -10,50 +10,43 @@ export interface ChangedFile {
 export interface DiffLine {
   type: "added" | "removed" | "unchanged";
   text: string;
+  oldLine?: number;
+  newLine?: number;
 }
 
-// ── O(N) Lookahead Line-by-Line Diff Generator ───────────────────────────────
-export function computeLineDiff(oldText: string, newText: string): DiffLine[] {
-  const oldLines = oldText.split(/\r?\n/);
-  const newLines = newText.split(/\r?\n/);
+function splitLines(text: string): string[] {
+  if (text.length === 0) return [];
+  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+}
 
+function computeFallbackDiff(oldLines: string[], newLines: string[]): DiffLine[] {
   const diffs: DiffLine[] = [];
   let o = 0;
   let n = 0;
 
-  // If old is entirely empty (new file), mark all as added
-  if (oldText === "") {
-    return newLines.map(line => ({ type: "added", text: line }));
-  }
-
   while (o < oldLines.length || n < newLines.length) {
     if (o >= oldLines.length) {
-      diffs.push({ type: "added", text: newLines[n] });
+      diffs.push({ type: "added", text: newLines[n], newLine: n + 1 });
       n++;
     } else if (n >= newLines.length) {
-      diffs.push({ type: "removed", text: oldLines[o] });
+      diffs.push({ type: "removed", text: oldLines[o], oldLine: o + 1 });
       o++;
     } else if (oldLines[o] === newLines[n]) {
-      diffs.push({ type: "unchanged", text: oldLines[o] });
+      diffs.push({ type: "unchanged", text: oldLines[o], oldLine: o + 1, newLine: n + 1 });
       o++;
       n++;
     } else {
-      const nextMatchInNew = newLines.indexOf(oldLines[o], n);
-      const nextMatchInOld = oldLines.indexOf(newLines[n], o);
-
-      if (nextMatchInNew !== -1 && (nextMatchInOld === -1 || nextMatchInNew - n < nextMatchInOld - o)) {
-        while (n < nextMatchInNew) {
-          diffs.push({ type: "added", text: newLines[n] });
-          n++;
-        }
-      } else if (nextMatchInOld !== -1 && (nextMatchInNew === -1 || nextMatchInOld - o <= nextMatchInNew - n)) {
-        while (o < nextMatchInOld) {
-          diffs.push({ type: "removed", text: oldLines[o] });
-          o++;
-        }
+      const nextNew = newLines.indexOf(oldLines[o], n + 1);
+      const nextOld = oldLines.indexOf(newLines[n], o + 1);
+      if (nextNew !== -1 && (nextOld === -1 || nextNew - n < nextOld - o)) {
+        diffs.push({ type: "added", text: newLines[n], newLine: n + 1 });
+        n++;
+      } else if (nextOld !== -1) {
+        diffs.push({ type: "removed", text: oldLines[o], oldLine: o + 1 });
+        o++;
       } else {
-        diffs.push({ type: "removed", text: oldLines[o] });
-        diffs.push({ type: "added", text: newLines[n] });
+        diffs.push({ type: "removed", text: oldLines[o], oldLine: o + 1 });
+        diffs.push({ type: "added", text: newLines[n], newLine: n + 1 });
         o++;
         n++;
       }
@@ -63,10 +56,59 @@ export function computeLineDiff(oldText: string, newText: string): DiffLine[] {
   return diffs;
 }
 
+// Stable line-by-line LCS diff. The previous lookahead diff drifted on nearby
+// repeated lines, which made old/new hunks look unrelated.
+export function computeLineDiff(oldText: string, newText: string): DiffLine[] {
+  const oldLines = splitLines(oldText);
+  const newLines = splitLines(newText);
+
+  if (oldLines.length === 0) return newLines.map((line, i) => ({ type: "added", text: line, newLine: i + 1 }));
+  if (newLines.length === 0) return oldLines.map((line, i) => ({ type: "removed", text: line, oldLine: i + 1 }));
+
+  const work = oldLines.length * newLines.length;
+  if (work > 1_800_000) return computeFallbackDiff(oldLines, newLines);
+
+  const table = Array.from({ length: oldLines.length + 1 }, () => new Uint32Array(newLines.length + 1));
+  for (let o = oldLines.length - 1; o >= 0; o--) {
+    for (let n = newLines.length - 1; n >= 0; n--) {
+      table[o][n] = oldLines[o] === newLines[n]
+        ? table[o + 1][n + 1] + 1
+        : Math.max(table[o + 1][n], table[o][n + 1]);
+    }
+  }
+
+  const diffs: DiffLine[] = [];
+  let o = 0;
+  let n = 0;
+  while (o < oldLines.length && n < newLines.length) {
+    if (oldLines[o] === newLines[n]) {
+      diffs.push({ type: "unchanged", text: oldLines[o], oldLine: o + 1, newLine: n + 1 });
+      o++;
+      n++;
+    } else if (table[o + 1][n] >= table[o][n + 1]) {
+      diffs.push({ type: "removed", text: oldLines[o], oldLine: o + 1 });
+      o++;
+    } else {
+      diffs.push({ type: "added", text: newLines[n], newLine: n + 1 });
+      n++;
+    }
+  }
+  while (o < oldLines.length) {
+    diffs.push({ type: "removed", text: oldLines[o], oldLine: o + 1 });
+    o++;
+  }
+  while (n < newLines.length) {
+    diffs.push({ type: "added", text: newLines[n], newLine: n + 1 });
+    n++;
+  }
+
+  return diffs;
+}
+
 interface ChangesViewerProps {
   changedFiles: ChangedFile[];
-  baselineSnapshot: Record<string, string>; // path -> content snapshot
-  onFileSelect: (path: string, name: string) => void;
+  baselineSnapshot: Record<string, string>;
+  onFileSelect: (path: string, name: string, baselineContent?: string) => void;
 }
 
 export const ChangesViewer: React.FC<ChangesViewerProps> = ({
@@ -78,6 +120,8 @@ export const ChangesViewer: React.FC<ChangesViewerProps> = ({
   const [diffData, setDiffData] = useState<DiffLine[] | null>(null);
   const [loading, setLoading] = useState(false);
 
+  const baselineFor = (file: ChangedFile) => file.status === "new" ? "" : baselineSnapshot[file.path] ?? "";
+
   const toggleExpand = async (file: ChangedFile) => {
     if (expandedFile === file.path) {
       setExpandedFile(null);
@@ -88,13 +132,8 @@ export const ChangesViewer: React.FC<ChangesViewerProps> = ({
     setLoading(true);
     setExpandedFile(file.path);
     try {
-      // Read current file content
       const content = await invoke<string>("read_file_content", { filePath: file.path });
-
-      // Compute diff against baseline
-      const oldContent = baselineSnapshot[file.path] || "";
-      const diffResult = computeLineDiff(oldContent, content);
-      setDiffData(diffResult);
+      setDiffData(computeLineDiff(baselineFor(file), content));
     } catch (err) {
       setDiffData([{ type: "unchanged", text: `Error generating diff: ${err}` }]);
     } finally {
@@ -125,20 +164,18 @@ export const ChangesViewer: React.FC<ChangesViewerProps> = ({
             const isExpanded = expandedFile === file.path;
             return (
               <div key={file.path} className={`change-card ${isExpanded ? "expanded" : ""}`}>
-                {/* Header / Accordion Trigger */}
                 <div className="change-card-header" onClick={() => toggleExpand(file)}>
                   <i className={`bx ${file.status === "new" ? "bx-file-blank text-ok" : "bx-edit-alt text-warn"} change-status-icon`} />
                   <div className="change-file-details">
                     <span className="change-file-name">{file.name}</span>
-                    <span className="change-file-path">{file.path.split(/[\\/]/).pop()}</span>
+                    <span className="change-file-path">{file.path}</span>
                   </div>
                   <span className={`change-badge ${file.status}`}>
-                    {file.status === "new" ? "CREATED" : "EDITED"}
+                    {file.status === "new" ? "NEW" : "MODIFIED"}
                   </span>
                   <i className={`bx bx-chevron-${isExpanded ? "down" : "right"} change-chevron`} />
                 </div>
 
-                {/* Expanded Accordion Body — Diff Area */}
                 {isExpanded && (
                   <div className="change-card-body">
                     {loading ? (
@@ -152,10 +189,10 @@ export const ChangesViewer: React.FC<ChangesViewerProps> = ({
                             className="btn btn-ghost btn-sm"
                             onClick={(e) => {
                               e.stopPropagation();
-                              onFileSelect(file.path, file.name);
+                              onFileSelect(file.path, file.name, baselineFor(file));
                             }}
                           >
-                            <i className="bx bx-expand-alt" /> Open Full File
+                            <i className="bx bx-expand-alt" /> Open Full Diff
                           </button>
                         </div>
                         <div className="diff-scroll">
@@ -164,7 +201,8 @@ export const ChangesViewer: React.FC<ChangesViewerProps> = ({
                             const prefix = line.type === "added" ? "+" : line.type === "removed" ? "-" : " ";
                             return (
                               <div key={index} className={`diff-line ${lineClass}`}>
-                                <span className="diff-ln">{index + 1}</span>
+                                <span className="diff-ln diff-ln-old">{line.oldLine ?? ""}</span>
+                                <span className="diff-ln diff-ln-new">{line.newLine ?? ""}</span>
                                 <span className="diff-marker">{prefix}</span>
                                 <span className="diff-code">{line.text || " "}</span>
                               </div>
