@@ -17,6 +17,20 @@ function escapeHtml(text: string): string {
     .replace(/>/g, "&gt;");
 }
 
+function tokenIndex(index: number): string {
+  let n = index;
+  let out = "";
+  do {
+    out = String.fromCharCode(65 + (n % 26)) + out;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return out;
+}
+
+function highlightToken(kind: string, index: number): string {
+  return `___${kind}_${tokenIndex(index)}___`;
+}
+
 export function highlightCode(
   code: string,
   fileName: string,
@@ -32,7 +46,7 @@ export function highlightCode(
     const regex = new RegExp(escapedQuery.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'gi');
     escaped = escaped.replace(regex, (match) => {
       searchMatches.push(match);
-      return `___SEARCH_${searchMatches.length - 1}___`;
+      return highlightToken("SEARCH", searchMatches.length - 1);
     });
   }
 
@@ -46,7 +60,7 @@ export function highlightCode(
     result = result.replace(/("(\\u[a-zA-F0-9]{4}|\\[^u]|[^\\"])*")(\s*:)?/g, (_match, p1, _p2, p3) => {
       strings.push(p1);
       isKey.push(!!p3);
-      return `___STR_${strings.length - 1}___${p3 || ""}`;
+      return `${highlightToken("STR", strings.length - 1)}${p3 || ""}`;
     });
 
     // 2. Highlight numbers, booleans, nulls
@@ -57,14 +71,14 @@ export function highlightCode(
     // 3. Restore strings with correct classes
     for (let i = 0; i < strings.length; i++) {
       const cls = isKey[i] ? "hl-keyword" : "hl-string";
-      result = result.replace(`___STR_${i}___`, `<span class="${cls}">${strings[i]}</span>`);
+      result = result.replace(highlightToken("STR", i), `<span class="${cls}">${strings[i]}</span>`);
     }
   } else if (ext === "html" || ext === "xml") {
     // 1. Extract comments
     const comments: string[] = [];
     result = result.replace(/&lt;!--[\s\S]*?--&gt;/g, (match) => {
       comments.push(`<span class="hl-comment">${match}</span>`);
-      return `___COMMENT_${comments.length - 1}___`;
+      return highlightToken("COMMENT", comments.length - 1);
     });
 
     // 2. Extract tags and highlight inside them
@@ -76,29 +90,29 @@ export function highlightCode(
       });
       const highlightedTag = `<span class="hl-tag">${p1}</span>${attrs}<span class="hl-tag">${p3}</span>`;
       tags.push(highlightedTag);
-      return `___TAG_${tags.length - 1}___`;
+      return highlightToken("TAG", tags.length - 1);
     });
 
     // 3. Restore comments and tags
     for (let i = 0; i < tags.length; i++) {
-      result = result.replace(`___TAG_${i}___`, tags[i]);
+      result = result.replace(highlightToken("TAG", i), tags[i]);
     }
     for (let i = 0; i < comments.length; i++) {
-      result = result.replace(`___COMMENT_${i}___`, comments[i]);
+      result = result.replace(highlightToken("COMMENT", i), comments[i]);
     }
   } else if (ext === "css") {
     // 1. Extract comments
     const comments: string[] = [];
     result = result.replace(/\/\*[\s\S]*?\*\//g, (match) => {
       comments.push(`<span class="hl-comment">${match}</span>`);
-      return `___COMMENT_${comments.length - 1}___`;
+      return highlightToken("COMMENT", comments.length - 1);
     });
 
     // 2. Extract strings
     const strings: string[] = [];
     result = result.replace(/(".*?"|'.*?')/g, (match) => {
       strings.push(`<span class="hl-string">${match}</span>`);
-      return `___STRING_${strings.length - 1}___`;
+      return highlightToken("STRING", strings.length - 1);
     });
 
     // 3. Highlight CSS elements
@@ -110,10 +124,10 @@ export function highlightCode(
 
     // 4. Restore strings and comments
     for (let i = 0; i < strings.length; i++) {
-      result = result.replace(`___STRING_${i}___`, strings[i]);
+      result = result.replace(highlightToken("STRING", i), strings[i]);
     }
     for (let i = 0; i < comments.length; i++) {
-      result = result.replace(`___COMMENT_${i}___`, comments[i]);
+      result = result.replace(highlightToken("COMMENT", i), comments[i]);
     }
   } else {
     // C-Style / General programming languages
@@ -121,30 +135,30 @@ export function highlightCode(
     result = result
       .replace(/\/\*[\s\S]*?\*\//g, (match) => {
         comments.push(`<span class="hl-comment">${match}</span>`);
-        return `___COMMENT_${comments.length - 1}___`;
+        return highlightToken("COMMENT", comments.length - 1);
       })
       .replace(/\/\/.*$/gm, (match) => {
         comments.push(`<span class="hl-comment">${match}</span>`);
-        return `___COMMENT_${comments.length - 1}___`;
+        return highlightToken("COMMENT", comments.length - 1);
       })
       .replace(/#.*$/gm, (match) => {
         if (match.startsWith("&#")) return match;
         comments.push(`<span class="hl-comment">${match}</span>`);
-        return `___COMMENT_${comments.length - 1}___`;
+        return highlightToken("COMMENT", comments.length - 1);
       });
     const strings: string[] = [];
     result = result
       .replace(/"(\\.|[^"\\])*"/g, (match) => {
         strings.push(`<span class="hl-string">${match}</span>`);
-        return `___STRING_${strings.length - 1}___`;
+        return highlightToken("STRING", strings.length - 1);
       })
       .replace(/'(\\.|[^'\\])*'/g, (match) => {
         strings.push(`<span class="hl-string">${match}</span>`);
-        return `___STRING_${strings.length - 1}___`;
+        return highlightToken("STRING", strings.length - 1);
       })
       .replace(/`([\s\S]*?)`/g, (match) => {
         strings.push(`<span class="hl-string">${match}</span>`);
-        return `___STRING_${strings.length - 1}___`;
+        return highlightToken("STRING", strings.length - 1);
       });
     const keywords = /\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|default|class|interface|export|import|from|as|extends|implements|new|this|typeof|instanceof|void|async|await|pub|fn|struct|impl|match|use|mod|mut|ref|static|enum|type|trait|where|def|elif|try|except|finally|raise|with|global|nonlocal|pass|lambda|and|or|not|in|is|yield)\b/g;
     const types = /\b(string|number|boolean|any|unknown|never|object|u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize|f32|f64|str|String|Vec|Option|Result|Self|self|int|float|dict|list|tuple|set|bool|None|True|False)\b/g;
@@ -153,10 +167,10 @@ export function highlightCode(
       .replace(types, '<span class="hl-type">$&</span>')
       .replace(/\b(0x[a-fA-F0-9]+|\d+(?:\.\d*)?)\b/g, '<span class="hl-number">$&</span>');
     for (let i = 0; i < strings.length; i++) {
-      result = result.replace(`___STRING_${i}___`, strings[i]);
+      result = result.replace(highlightToken("STRING", i), strings[i]);
     }
     for (let i = 0; i < comments.length; i++) {
-      result = result.replace(`___COMMENT_${i}___`, comments[i]);
+      result = result.replace(highlightToken("COMMENT", i), comments[i]);
     }
   }
 
@@ -164,7 +178,7 @@ export function highlightCode(
   for (let i = 0; i < searchMatches.length; i++) {
     const isActive = i === activeMatchIndex;
     const cls = isActive ? "hl-search-match active" : "hl-search-match";
-    result = result.replace(`___SEARCH_${i}___`, `<mark class="${cls}">${searchMatches[i]}</mark>`);
+    result = result.replace(highlightToken("SEARCH", i), `<mark class="${cls}">${searchMatches[i]}</mark>`);
   }
 
   return result;
@@ -453,23 +467,12 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
                 <span style={{ fontSize: "12px", color: "var(--text-3)" }}>Loading diff...</span>
               </div>
             ) : diffLines ? (
-              <div className="code-editor-viewport" style={{ flex: 1, display: "flex", overflow: "hidden" }}>
-                <div className="editor-line-numbers" ref={linesRef} style={{ overflow: "hidden", paddingTop: "8px" }}>
-                  {diffLines.map((_, i) => (
-                    <span key={i} className="editor-line-number-item">{i + 1}</span>
-                  ))}
-                </div>
+              <div className="code-editor-viewport diff-full-viewport" style={{ flex: 1, display: "flex", overflow: "hidden" }}>
                 <div className="diff-scroll" ref={diffScrollRef} onScroll={handleDiffScroll} style={{ flex: 1, overflow: "auto", fontFamily: "var(--font-mono)", fontSize: "13px", lineHeight: "1.55", padding: "8px 0" }}>
                   {diffLines.map((line, i) => (
-                    <div
-                      key={i}
-                      style={{
-                        display: "flex",
-                        height: "20.15px",
-                        alignItems: "center",
-                        background: line.type === "added" ? "rgba(52,211,89,0.08)" : line.type === "removed" ? "rgba(248,113,113,0.08)" : "transparent",
-                      }}
-                    >
+                    <div key={i} className={`diff-line ${line.type}`} style={{ height: "20.15px" }}>
+                      <span className="diff-ln diff-ln-old">{line.oldLine ?? ""}</span>
+                      <span className="diff-ln diff-ln-new">{line.newLine ?? ""}</span>
                       <span style={{ width: "18px", flexShrink: 0, textAlign: "center", color: line.type === "added" ? "var(--ok)" : line.type === "removed" ? "var(--err)" : "var(--text-3)", fontSize: "12px", userSelect: "none" }}>
                         {line.type === "added" ? "+" : line.type === "removed" ? "−" : " "}
                       </span>

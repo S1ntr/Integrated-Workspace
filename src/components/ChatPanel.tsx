@@ -287,16 +287,48 @@ function visibleStreamText(text: string): string {
   return stripAgentTags(text).replace(/\n{3,}/g, "\n\n");
 }
 
+function stripAnsi(text: string): string {
+  return text
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[@-Z\\-_]/g, "")
+    .replace(/\r/g, "");
+}
+
 function detectTerminalQuestion(text: string): string | null {
-  const cleaned = text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").trim();
+  const cleaned = stripAnsi(text).trim();
   if (!cleaned) return null;
-  const tail = cleaned.split("\n").map(l => l.trim()).filter(Boolean).slice(-8);
-  const candidate = tail.reverse().find(line =>
-    /\?$/.test(line) ||
-    /\[(y\/n|Y\/n|y\/N|yes\/no|Yes\/No)\]/i.test(line) ||
-    /\b(continue|proceed|confirm|approve|select|choose|overwrite|permission)\b.*[?:]/i.test(line)
-  );
-  return candidate && candidate.length < 280 ? candidate : null;
+  const tail = cleaned.split("\n").map(l => l.trim()).filter(Boolean).slice(-6).reverse();
+  const progressNoise = /\b(let me|i will|i'll|checking|reading|updating|running|writing|building|installing)\b/i;
+  for (const line of tail) {
+    if (line.length < 3 || line.length > 220 || progressNoise.test(line)) continue;
+    if (/\[(y\/n|Y\/n|y\/N|yes\/no|Yes\/No)\]\s*$/i.test(line)) return line;
+    if (/\b(continue|proceed|confirm|approve|overwrite|permission)\b.*[?:]\s*$/i.test(line)) return line;
+    if (/\b(select|choose)\b.*:\s*$/i.test(line)) return line;
+    if (/\?$/.test(line) && /\b(should|do|does|is|are|can|could|would|will|may|which|what|where|when|how)\b/i.test(line)) {
+      return line;
+    }
+  }
+  return null;
+}
+
+function detectAgentCompletionSummary(text: string): string | null {
+  const cleaned = stripAnsi(text).trim();
+  if (!cleaned) return null;
+  const lines = cleaned.split("\n").map(l => l.trim()).filter(Boolean).slice(-18);
+  const joined = lines.join("\n");
+  if (detectTerminalQuestion(joined)) return null;
+  if (!/\b(summary|changes made|task complete|completed|finished|all set|done|implemented|fixed)\b/i.test(joined)) {
+    return null;
+  }
+  if (/\b(let me|i will|i'll|going to|updating todos|checking|reading)\b/i.test(lines.slice(-4).join(" "))) {
+    return null;
+  }
+  const summaryLines = lines
+    .filter(line => !/^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(line))
+    .filter(line => !/^thought:?/i.test(line))
+    .slice(-8);
+  return summaryLines.join("\n").slice(0, 900);
 }
 
 // ─── Orchestrator system prompt ───────────────────────────────────────────────
@@ -369,7 +401,8 @@ Never show raw tool calls in visible prose. Visible prose should summarize what 
 7. If a CLI agent asks a question and the answer follows from the user's instruction, answer it with \`agent.send\`. If uncertain, use \`chat.ask_user\`.
 8. If the user asks to open, inspect, test, or preview a web/app UI, use \`browser.open\` with the best local URL from terminal output. If no URL is known, ask the user for it.
 9. Browser feedback may include a URL, viewport, selected element/region, and user note. Use that context to prompt agents with precise visual/UI fixes.
-10. After dispatching, briefly summarize what each agent is doing (visible to user)
+10. When an agent finishes, convert its terminal output into a concise visible summary of changed files, integrations, tests, and remaining risks. Do not show a question card unless the terminal is clearly waiting for user input.
+11. After dispatching, briefly summarize what each agent is doing (visible to user)
 
 ## Current Agent Output
 ${outputBlocks || "(no output captured yet)"}
@@ -484,6 +517,7 @@ export const ChatPanel: React.FC<{
   const agentQuestionsRef = useRef<AgentQuestion[]>([]);
   const pendingAgentRequestsRef = useRef<PendingAgentRequest[]>([]);
   const seenQuestionKeysRef = useRef<Set<string>>(new Set());
+  const seenSummaryKeysRef = useRef<Set<string>>(new Set());
   const usedPromptSessionIdsRef = useRef<Set<string>>(new Set());
   const handledExternalPromptRef = useRef<string | null>(null);
   
@@ -661,6 +695,29 @@ export const ChatPanel: React.FC<{
       })),
     ]);
   }, [sessionsProp, terminalOutputsProp]);
+
+  // Surface agent completion notes as summaries instead of misclassifying them as questions.
+  useEffect(() => {
+    const additions: Msg[] = [];
+    for (const session of sessionsProp) {
+      const transcript = terminalTranscriptsProp[session.sessionId] || [];
+      const wasPrompted = transcript.some(entry => entry.kind === "input") || usedPromptSessionIdsRef.current.has(session.sessionId);
+      if (!wasPrompted) continue;
+      const summary = detectAgentCompletionSummary(terminalOutputsProp[session.sessionId] || "");
+      if (!summary) continue;
+      const key = `${session.sessionId}:${summary.slice(-220)}`;
+      if (seenSummaryKeysRef.current.has(key)) continue;
+      seenSummaryKeysRef.current.add(key);
+      additions.push({
+        id: `sum-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        role: "ai",
+        agent: "orchestrator",
+        body: `**${session.label} summary**\n${summary}`,
+        ts: ts(),
+      });
+    }
+    if (additions.length) setMsgs(prev => [...prev, ...additions]);
+  }, [sessionsProp, terminalOutputsProp, terminalTranscriptsProp]);
 
   // Fulfill queued agent requests as soon as the user adds matching terminals.
   useEffect(() => {
@@ -1176,7 +1233,7 @@ export const ChatPanel: React.FC<{
       </div>
 
       {/* ── Sessions strip (active terminals) ── */}
-      {sessionsProp.length > 0 && (
+      {false && sessionsProp.length > 0 && (
         <div className="chat-sessions-strip">
           {sessionsProp.slice(0, 4).map(s => (
             <span key={s.sessionId} className={`chat-sess-chip sess-${s.status || "unknown"}`} title={`${s.command} — ${s.sessionId}\n${(terminalOutputsProp[s.sessionId] || "").slice(-220)}`}>

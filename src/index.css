@@ -1769,6 +1769,16 @@ input, textarea { font-family: var(--font-ui); }
   color: var(--text-3); user-select: none; flex-shrink: 0;
   border-right: 1px solid var(--bg-4);
 }
+.diff-ln-old,
+.diff-ln-new {
+  width: 38px;
+  font-size: 9.5px;
+  background: rgba(255,255,255,0.01);
+}
+.diff-ln-old { color: rgba(248,113,113,0.58); }
+.diff-ln-new { color: rgba(74,222,128,0.62); }
+.diff-line.unchanged .diff-ln-old,
+.diff-line.unchanged .diff-ln-new { color: var(--text-4); }
 .diff-marker {
   width: 16px; text-align: center; flex-shrink: 0;
   color: var(--text-3); user-select: none;
