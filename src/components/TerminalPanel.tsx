@@ -77,9 +77,9 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       // CDN asynchronously — if it's first, FitAddon measures with the fallback
       // font on first paint (~7.2px vs 7.8px), computes wrong cols, and the PTY
       // is spawned with wrong dimensions causing text to overflow xterm's width.
-      fontFamily:        "'Cascadia Code', 'Cascadia Mono', 'Consolas', 'Courier New', monospace",
+      fontFamily:        "'Consolas', 'Cascadia Mono', 'Courier New', monospace",
       fontSize:          13,
-      lineHeight:        1.45,
+      lineHeight:        1.2,
       letterSpacing:     0,
       cursorBlink:       true,
       cursorStyle:       "block",
@@ -94,13 +94,32 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     termRef.current = term;
     fitRef.current  = fit;
 
-    // ── 2. Fit helper ────────────────────────────────────────────────────────
-    // Synchronous fit (no RAF) used when we need the result immediately.
+    // ── 2. Fit helpers ───────────────────────────────────────────────────────
+    //
+    // fitSync — pure dimension sync, NO canvas refresh.
+    // Used in the init stability loop and scheduleForceResize because calling
+    // term.refresh() there triggers a canvas repaint that can cause a CSS
+    // reflow, which changes clientWidth, which destabilises col measurement,
+    // which makes xterm and ConPTY disagree on line width → text corruption.
     const fitSync = () => {
       try { fit.fit(); } catch {}
     };
 
-    // RAF-debounced fit used by ResizeObserver and font observers.
+    // scheduleRefresh — deferred canvas repaint.
+    // fit.fit() resizes xterm's internal buffer immediately, but the canvas
+    // DOM element resize is applied asynchronously by xterm's renderer.
+    // Refreshing synchronously after fit.fit() redraws to a stale canvas.
+    // Using a second RAF ensures the canvas has actually been resized first.
+    const scheduleRefresh = () => {
+      requestAnimationFrame(() => {
+        if (!destroyed.current) {
+          try { term.refresh(0, term.rows - 1); } catch {}
+        }
+      });
+    };
+
+    // doFit — RAF-debounced fit + deferred refresh.
+    // Used by ResizeObserver and drag handlers.
     let resizeTimeout: any = null;
     const doFit = () => {
       cancelAnimationFrame(rafRef.current);
@@ -108,6 +127,9 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
         if (destroyed.current) return;
         try {
           fit.fit();
+          // Defer the canvas refresh so xterm's canvas has time to resize
+          // before we force a repaint — prevents black bars in WebView2.
+          scheduleRefresh();
           if (ptyReady.current) {
             if (resizeTimeout) clearTimeout(resizeTimeout);
             resizeTimeout = setTimeout(() => {
@@ -131,21 +153,29 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     const initTerminal = async () => {
 
       // ─ 3a. Wait until the container has stable, non-zero pixel dimensions. ──
+      // Require 8 consecutive frames of identical size before we trust the
+      // layout has settled. Flexbox/CSS transitions can take several frames to
+      // finish, and measuring too early gives wrong cols → col mismatch with
+      // ConPTY → spurious SIGWINCH after startup → text corruption.
       await new Promise<void>(resolve => {
         let lastWidth = -1;
         let lastHeight = -1;
+        let stableFrames = 0;
+        const REQUIRED_STABLE_FRAMES = 8;
         const poll = () => {
           const container = containerRef.current;
           if (!container || destroyed.current) { resolve(); return; }
           const w = container.clientWidth;
           const h = container.clientHeight;
           if (w >= 100 && h >= 50 && w === lastWidth && h === lastHeight) {
-            resolve();
+            stableFrames++;
+            if (stableFrames >= REQUIRED_STABLE_FRAMES) { resolve(); return; }
           } else {
+            stableFrames = 0;
             lastWidth = w;
             lastHeight = h;
-            requestAnimationFrame(poll);
           }
+          requestAnimationFrame(poll);
         };
         poll();
       });
@@ -153,6 +183,10 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       if (destroyed.current || !containerRef.current) return;
 
       // ─ 3b. Open xterm, then wait for FitAddon cols to stabilize. ──────────
+      // Wait for all fonts to be ready so char-width measurement is accurate.
+      await document.fonts.ready;
+      if (destroyed.current) return;
+
       // We use only system fonts (Cascadia Code / Consolas) so char width is
       // known immediately. This loop runs fitSync each frame until term.cols
       // stays the same for 3 consecutive frames — belt-and-suspenders guard
@@ -234,19 +268,36 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           if (!destroyed.current) {
             ptyReady.current = true;
 
-            // ── 6a. Staggered resize check after PTY initializes ──────────────
-            // Fires once at 250ms. Only sends pty_resize if cols/rows actually
-            // differ from what was used at spawn — skips if already correct so
-            // ResizePseudoConsole doesn't emit a spurious SIGWINCH mid-stream.
-            setTimeout(() => {
-              if (destroyed.current || !ptyReady.current) return;
-              fitSync();
-              const r = Math.max(10, term.rows > 0 ? term.rows : 24);
-              const c = Math.max(40, term.cols > 0 ? term.cols : 80);
-              if (r === lastSentSize.current.rows && c === lastSentSize.current.cols) return;
-              lastSentSize.current = { rows: r, cols: c };
-              invoke("pty_resize", { sessionId, rows: r, cols: c }).catch(() => {});
-            }, 250);
+            // ── 6a. Conditional correction resize after PTY starts ────────────
+            // On Windows, cmd.exe can briefly reset the ConPTY console buffer
+            // size before the TUI takes over. We check at 700ms and 1800ms
+            // whether cols have genuinely changed and send a correction only
+            // then.
+            //
+            // CRITICAL: Do NOT send resize unconditionally. Every pty_resize
+            // call sends SIGWINCH to the running process (e.g. opencode), which
+            // forces a full TUI redraw. If opencode is mid-stream, this causes
+            // cursor positions to desync and text to overwrite itself — the
+            // "HotovOvládání:" / partial-word bug. Only send when size actually
+            // differs from what we told ConPTY at startup.
+            //
+            // The 150 ms slot is intentionally removed: it fires before any TUI
+            // has even queried the terminal size, so it's always a no-op for the
+            // correction case but still sends a pointless SIGWINCH.
+            const scheduleConditionalResize = (delay: number) => {
+              setTimeout(() => {
+                if (destroyed.current || !ptyReady.current) return;
+                fitSync();
+                const r = Math.max(10, term.rows > 0 ? term.rows : 24);
+                const c = Math.max(40, term.cols > 0 ? term.cols : 80);
+                // Bail out if nothing changed — avoids spurious SIGWINCH.
+                if (r === lastSentSize.current.rows && c === lastSentSize.current.cols) return;
+                lastSentSize.current = { rows: r, cols: c };
+                invoke("pty_resize", { sessionId, rows: r, cols: c }).catch(() => {});
+              }, delay);
+            };
+            scheduleConditionalResize(700);   // after TUI queries initial size
+            scheduleConditionalResize(1800);  // fallback for slow TUI boot
 
             // Transition to "running" after TUI boot warmup.
             setTimeout(() => {
@@ -332,6 +383,29 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     console.log(`[DragEnd] Panel ID: ${id}`);
     (window as any).draggedTerminalId = null;
     e.currentTarget.closest(".term-pane")?.classList.remove("dragging");
+    // After drag the canvas may have stale pixels. doFit() handles the
+    // deferred refresh correctly (fit → wait one frame → refresh).
+    // We fire it twice: once immediately and once after layout fully settles.
+    if (fitRef.current && termRef.current) {
+      try { fitRef.current.fit(); } catch {}
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (!destroyed.current && termRef.current) {
+            try { termRef.current.refresh(0, termRef.current.rows - 1); } catch {}
+          }
+        });
+      });
+    }
+    setTimeout(() => {
+      if (!destroyed.current && fitRef.current && termRef.current) {
+        try { fitRef.current.fit(); } catch {}
+        requestAnimationFrame(() => {
+          if (!destroyed.current && termRef.current) {
+            try { termRef.current.refresh(0, termRef.current.rows - 1); } catch {}
+          }
+        });
+      }
+    }, 150);
   };
 
   const handleDragEnter = (e: React.DragEvent) => {

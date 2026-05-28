@@ -15,6 +15,9 @@
         "title": "Integraded Workspace",
         "width": 1280,
         "height": 850,
+        "minWidth": 800,
+        "minHeight": 560,
+        "resizable": true,
         "dragDropEnabled": false
       }
     ],

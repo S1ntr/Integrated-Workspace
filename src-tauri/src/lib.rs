@@ -476,18 +476,28 @@ fn copy_item(src_path: String, dest_path: String, state: State<'_, WorkspaceStat
 #[tauri::command]
 fn save_chat_history(json_data: String, app: AppHandle) -> Result<(), String> {
     let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
-    let dir = home.join(".integraded-workspace");
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create chat history dir: {}", e))?;
-    let file_path = dir.join("chat_history.json");
+    let chat_dir = home.join(".integraded-workspace").join("chat-history");
+    fs::create_dir_all(&chat_dir).map_err(|e| format!("Failed to create chat history dir: {}", e))?;
+    let file_path = chat_dir.join("chat_history.json");
     fs::write(file_path, json_data.as_bytes()).map_err(|e| format!("Failed to write chat history: {}", e))
 }
 
 #[tauri::command]
 fn load_chat_history(app: AppHandle) -> Result<Option<String>, String> {
     let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
-    let file_path = home.join(".integraded-workspace").join("chat_history.json");
-    if file_path.exists() {
-        let content = fs::read_to_string(file_path).map_err(|e| format!("Failed to read chat history: {}", e))?;
+    let workspace = home.join(".integraded-workspace");
+    let new_path = workspace.join("chat-history").join("chat_history.json");
+    let old_path = workspace.join("chat_history.json");
+
+    // migrate old file location if needed
+    if !new_path.exists() && old_path.exists() {
+        let chat_dir = workspace.join("chat-history");
+        fs::create_dir_all(&chat_dir).map_err(|e| format!("Failed to create chat history dir: {}", e))?;
+        fs::rename(&old_path, &new_path).ok();
+    }
+
+    if new_path.exists() {
+        let content = fs::read_to_string(new_path).map_err(|e| format!("Failed to read chat history: {}", e))?;
         Ok(Some(content))
     } else {
         Ok(None)
@@ -591,12 +601,21 @@ fn get_config_path() -> Result<std::path::PathBuf, String> {
         std::env::var("HOME").map(std::path::PathBuf::from)
     }
     .map_err(|_| "Could not find home directory".to_string())?;
-    
-    let dir = home.join(".integrated-workspace");
+
+    let dir = home.join(".integraded-workspace");
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| format!("Failed to create config dir: {}", e))?;
     }
-    Ok(dir.join("config.json"))
+
+    // migrate config from old typo'd directory
+    let old_dir = home.join(".integrated-workspace");
+    let new_path = dir.join("config.json");
+    let old_path = old_dir.join("config.json");
+    if !new_path.exists() && old_path.exists() {
+        fs::copy(&old_path, &new_path).ok();
+    }
+
+    Ok(new_path)
 }
 
 #[tauri::command]

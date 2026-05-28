@@ -507,7 +507,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
             </div>
           )}
         </div>
-        <div className="header-spacer" />
+        <div className="header-spacer" data-tauri-drag-region />
         <div className="header-path"><i className="bx bx-folder" />{dirShort}</div>
         <button
           className="hdr-btn"
