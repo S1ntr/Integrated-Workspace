@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useNotify } from "./Notification";
+import { getFileIcon } from "../utils/fileIcons";
 
 export interface FileEntry {
   name: string;
@@ -14,9 +15,10 @@ interface SidebarProps {
   activeFilePath: string | null;
   onFileSelect: (path: string, name: string) => void;
   width: number;
+  active?: boolean;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ directory, activeFilePath, onFileSelect, width }) => {
+export const Sidebar: React.FC<SidebarProps> = ({ directory, activeFilePath, onFileSelect, width, active = true }) => {
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const prevJson = useRef("");
@@ -143,14 +145,15 @@ export const Sidebar: React.FC<SidebarProps> = ({ directory, activeFilePath, onF
   }, [directory]);
 
   useEffect(() => {
+    if (!active) return;
     refresh();
-  }, [refresh]);
+  }, [refresh, active]);
 
   useEffect(() => {
-    if (!directory) return;
+    if (!directory || !active) return;
     const id = setInterval(refresh, 2500);
     return () => clearInterval(id);
-  }, [refresh, directory]);
+  }, [refresh, directory, active]);
 
   // Global click listeners to close Context Menu
   useEffect(() => {
@@ -554,6 +557,7 @@ const TreeNode: React.FC<NodeProps> = ({ node, depth, activeFilePath, onFileSele
   const itemRef = useRef<HTMLDivElement>(null);
   const dragCounter = useRef(0);
   const { notifyError } = useNotify();
+  const fileIcon = getFileIcon(node.name);
 
   const click = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -682,8 +686,8 @@ const TreeNode: React.FC<NodeProps> = ({ node, depth, activeFilePath, onFileSele
         ) : (
           <span className="tree-caret" />
         )}
-        <span className={`tree-item-icon ${node.is_dir ? "dir" : "file"}`}>
-          <i className={`bx bx${node.is_dir ? `s-folder${open ? "-open" : ""}` : "-file-blank"}`} />
+        <span className={`tree-item-icon ${node.is_dir ? "dir" : `file file-kind-icon ${fileIcon.className}`}`}>
+          <i className={`bx ${node.is_dir ? `bxs-folder${open ? "-open" : ""}` : fileIcon.icon}`} />
         </span>
         <span className="tree-item-name">{node.name}</span>
       </div>

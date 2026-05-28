@@ -15,7 +15,7 @@ export interface Session {
 }
 
 interface AgentAction {
-  type: "spawn" | "send" | "broadcast" | "kill" | "request" | "ask_user" | "browser_open" | "mode";
+  type: "spawn" | "send" | "broadcast" | "kill" | "request" | "ask_user" | "browser_open" | "mode" | "file_create";
   agentType?: string;
   label: string;
   prompt?: string;
@@ -66,6 +66,12 @@ interface PendingAgentRequest {
   reason?: string;
   existingSessionIds: string[];
   fulfilledSessionIds: string[];
+}
+
+interface PendingPlan {
+  planText: string;
+  requestedAt: number;
+  fileName: string;
 }
 
 export interface MentionFile {
@@ -536,6 +542,38 @@ ${recentTools || "(none)"}`;
 
 // ─── Time helpers ─────────────────────────────────────────────────────────────
 
+function buildPlanPrompt(
+  contextWindow = "",
+  changedFiles: ChatDiffFile[] = [],
+): string {
+  const changed = changedFiles.slice(0, 14)
+    .map(file => `- ${file.status}: ${file.path}`)
+    .join("\n");
+
+  return `You are the planning mode inside Integraded Chat.
+
+Create a practical implementation plan for the user's request. This mode is handled entirely in chat:
+- Do not call CLI agents.
+- Do not emit tool calls.
+- Do not ask another agent to do work.
+- Produce a concise but useful plan with concrete files, phases, risks, and verification steps.
+- If the user mentioned files with @filename, use the attached file contents/paths in your plan.
+- End by asking whether the user wants this plan saved as a Markdown implementation file.
+
+Preferred structure:
+## Goal
+## Implementation Plan
+## Files To Touch
+## Verification
+## Risks / Questions
+
+## Current Chat Context
+${contextWindow || "(no prior session context)"}
+
+## Current Diff Snapshot
+${changed || "(no changed files detected)"}`;
+}
+
 function relativeTime(ts: number): string {
   const diff = Date.now() - ts;
   const m = Math.floor(diff / 60000);
@@ -649,6 +687,18 @@ function toolLogNote(log: ToolCallLog): string {
   return compactText(raw, 360);
 }
 
+function isAffirmative(value: string): boolean {
+  return /^(ano|jo|jasne|jasně|yes|y|ok|okay|sure|vytvor|vytvoř|create|save)\b/i.test(value.trim());
+}
+
+function isNegative(value: string): boolean {
+  return /^(ne|no|n|skip|preskoc|přeskoč|nevytvaret|nevytvářet)\b/i.test(value.trim());
+}
+
+function joinWorkspacePath(workspaceDir: string, fileName: string): string {
+  return `${workspaceDir.replace(/[\\/]+$/, "")}/${fileName}`;
+}
+
 function cleanMentionToken(raw: string): string {
   return raw
     .trim()
@@ -744,6 +794,7 @@ async function hydrateFileMentionAttachments(attachments: ChatAttachment[]): Pro
 
 export const ChatPanel: React.FC<{
   embedded?: boolean;
+  workspaceDir?: string;
   sessions?: Session[];
   terminalOutputs?: Record<string, string>;
   terminalTranscripts?: Record<string, TerminalTranscriptEntry[]>;
@@ -759,6 +810,7 @@ export const ChatPanel: React.FC<{
   onOpenDiffFile?: (path: string, name: string) => void;
 }> = ({
   embedded,
+  workspaceDir = "",
   sessions: sessionsProp = [],
   terminalOutputs: terminalOutputsProp = {},
   terminalTranscripts: terminalTranscriptsProp = {},
@@ -828,6 +880,8 @@ export const ChatPanel: React.FC<{
   const [selectedCloudProvider, setSelectedCloudProvider] = useState("openai");
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [thinkingPreviewEnabled, setThinkingPreviewEnabled] = useState(true);
+  const [chatMode, setChatMode] = useState<"build" | "plan">("build");
+  const [pendingPlan, setPendingPlan] = useState<PendingPlan | null>(null);
   const [modelSearch, setModelSearch] = useState("");
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
@@ -1664,6 +1718,101 @@ export const ChatPanel: React.FC<{
 
   // ── Send ──────────────────────────────────────────────────────────────────────
 
+  const nextPlanFilePath = async (fileName: string): Promise<{ path: string; name: string }> => {
+    const baseDir = workspaceDir || "";
+    if (!baseDir) return { path: fileName, name: fileName };
+    const dot = fileName.lastIndexOf(".");
+    const stem = dot > 0 ? fileName.slice(0, dot) : fileName;
+    const ext = dot > 0 ? fileName.slice(dot) : ".md";
+    for (let i = 0; i < 20; i++) {
+      const candidateName = i === 0 ? fileName : `${stem}-${i + 1}${ext}`;
+      const candidatePath = joinWorkspacePath(baseDir, candidateName);
+      try {
+        await invoke<string>("read_file_content", { filePath: candidatePath });
+      } catch {
+        return { path: candidatePath, name: candidateName };
+      }
+    }
+    const fallbackName = `${stem}-${Date.now()}${ext}`;
+    return { path: joinWorkspacePath(baseDir, fallbackName), name: fallbackName };
+  };
+
+  const createImplementationPlanFile = async (plan: PendingPlan) => {
+    if (!workspaceDir) {
+      setMsgs(prev => [...prev, {
+        id: `plan-error-${Date.now()}`,
+        role: "ai",
+        agent: "system",
+        body: "Nemám aktivní workspace directory, takže nemůžu vytvořit markdown soubor.",
+        ts: ts(),
+      }]);
+      return;
+    }
+
+    const target = await nextPlanFilePath(plan.fileName);
+    const content = `# Implementation Plan\n\n${plan.planText.trim()}\n`;
+    const action: AgentAction = { type: "file_create", label: target.name, prompt: "Create implementation plan markdown file" };
+    const logId = addToolLog(action, "running", `Creating ${target.path}.`);
+    try {
+      await invoke("create_file", { filePath: target.path, content });
+      updateToolLog(logId, "done", `Created ${target.path}.`);
+      setPendingPlan(null);
+      setMsgs(prev => [...prev, {
+        id: `plan-created-${Date.now()}`,
+        role: "ai",
+        agent: "orchestrator",
+        body: `Hotovo, vytvořil jsem \`${target.name}\` v kořeni workspace.`,
+        ts: ts(),
+      }]);
+    } catch (err) {
+      updateToolLog(logId, "failed", String(err));
+      setMsgs(prev => [...prev, {
+        id: `plan-create-failed-${Date.now()}`,
+        role: "ai",
+        agent: "system",
+        body: `Soubor se nepovedlo vytvořit: ${String(err)}`,
+        ts: ts(),
+      }]);
+    }
+  };
+
+  const runPlanMode = async (userMsg: Msg) => {
+    const history = msgs.filter(m => (m.role === "user" || m.role === "ai") && !m.streaming).slice(-24).map(m => ({
+      role: m.role === "user" ? "user" as const : "assistant" as const,
+      content: messageForModel(m),
+    }));
+    const llmMsgs = [
+      { role: "system", content: buildPlanPrompt(contextWindowRef.current, changedFilesRef.current) },
+      ...history,
+      { role: "user", content: messageForModel(userMsg) },
+    ];
+    const aiMsgId = `plan-${Date.now()}`;
+    setMsgs(p => [...p, {
+      id: aiMsgId,
+      role: "ai",
+      agent: "orchestrator",
+      body: "",
+      streaming: streamingEnabled,
+      ts: ts(),
+      thinking: streamingEnabled && thinkingPreviewEnabled ? { text: "Preparing a standalone implementation plan.", elapsedMs: 0, open: true } : undefined,
+    }]);
+
+    let planText = "";
+    if (streamingEnabled) {
+      await streamLLM(aiMsgId, llmMsgs);
+      planText = stripAgentTags(streamTextRef.current).trim();
+    } else {
+      planText = stripAgentTags(await callLLM(llmMsgs)).trim();
+    }
+    const prompt = "\n\nChceš z toho vytvořit `implementation.md` soubor? Napiš `ano` nebo `ne`.";
+    setPendingPlan({ planText, requestedAt: Date.now(), fileName: "implementation.md" });
+    setMsgs(p => p.map(m => m.id === aiMsgId ? {
+      ...m,
+      streaming: false,
+      body: `${planText}${prompt}`,
+    } : m));
+  };
+
   const send = async (e?: React.FormEvent, overrideText?: string, overrideAttachments?: ChatAttachment[]) => {
     if (e) e.preventDefault();
     const text = (overrideText ?? input).trim();
@@ -1684,6 +1833,28 @@ export const ChatPanel: React.FC<{
     }
     setIsProcessing(true);
     try {
+      if (pendingPlan && !overrideText && !attachments.length && (isAffirmative(text) || isNegative(text))) {
+        if (isAffirmative(text)) {
+          await createImplementationPlanFile(pendingPlan);
+        } else {
+          setPendingPlan(null);
+          setMsgs(p => [...p, {
+            id: `plan-skip-${Date.now()}`,
+            role: "ai",
+            agent: "orchestrator",
+            body: "Jasně, markdown soubor z plánu vytvářet nebudu.",
+            ts: ts(),
+          }]);
+        }
+        return;
+      }
+
+      if (chatMode === "plan" && !overrideText) {
+        setPendingPlan(null);
+        await runPlanMode(userMsg);
+        return;
+      }
+
       const sysPrompt = buildOrchestratorPrompt(
         sessionsRef.current,
         terminalOutputsRef.current,
@@ -1703,6 +1874,7 @@ export const ChatPanel: React.FC<{
             : a.type === "mode" ? `[Changed agent mode: ${a.label} -> ${a.agentType || a.mode}]`
             : a.type === "ask_user" ? `[Asked user: ${a.question || a.reason}]`
             : a.type === "browser_open" ? `[Opened browser: ${a.url || a.label}]`
+            : a.type === "file_create" ? `[Created file: ${a.label}]`
             : `[Killed: ${a.label}]`
           ).join(", ");
         }
@@ -2207,6 +2379,22 @@ export const ChatPanel: React.FC<{
                 className="chat-file-input"
                 onChange={event => attachFiles(event.target.files)}
               />
+              <div className="chat-mode-segment" title="Choose how the chatbot handles the next message">
+                <button
+                  type="button"
+                  className={chatMode === "build" ? "active" : ""}
+                  onClick={() => setChatMode("build")}
+                >
+                  Build
+                </button>
+                <button
+                  type="button"
+                  className={chatMode === "plan" ? "active" : ""}
+                  onClick={() => setChatMode("plan")}
+                >
+                  Plan
+                </button>
+              </div>
               <button
                 type="button"
                 className="chat-mic-btn"

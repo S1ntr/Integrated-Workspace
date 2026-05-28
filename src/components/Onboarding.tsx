@@ -13,6 +13,7 @@ export interface OnboardingConfig {
 
 interface OnboardingProps {
   onComplete: (config: OnboardingConfig) => void;
+  onCancel?: () => void;
 }
 
 const AGENTS = [
@@ -24,7 +25,7 @@ const AGENTS = [
 
 type AgentKey = typeof AGENTS[number]["key"];
 
-export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
+export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) => {
   const [selectedDir, setSelectedDir] = useState("");
   // Per-agent count (0 = not selected, 1+ = how many terminals)
   const [counts, setCounts] = useState<Record<AgentKey, number>>({
@@ -88,6 +89,11 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
             <h1 className="onboarding-title">Integraded Workspace</h1>
             <p className="onboarding-subtitle">Configure your environment and launch</p>
           </div>
+          {onCancel && (
+            <button type="button" className="onboarding-close" onClick={onCancel} title="Cancel">
+              <i className="bx bx-x" />
+            </button>
+          )}
         </div>
 
         <div className="onboarding-divider" />

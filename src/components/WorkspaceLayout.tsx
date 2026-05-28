@@ -15,6 +15,8 @@ import { useNotify } from "./Notification";
 interface WorkspaceLayoutProps {
   directory: string;
   initialSessions: AgentSession[];
+  isActive?: boolean;
+  onWorkspaceActivity?: () => void;
 }
 
 // ── Agent options for dialog ───────────────────────────────────────────────────
@@ -216,6 +218,7 @@ const RightPanel: React.FC<RightPanelProps> = ({
         {tab === "chat" ? (
           <ChatPanel
             embedded
+            workspaceDir={directory}
             sessions={sessions}
             terminalOutputs={terminalOutputs}
             terminalTranscripts={terminalTranscripts}
@@ -260,6 +263,8 @@ let globalSessionCounter = 0;
 export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   directory,
   initialSessions,
+  isActive = true,
+  onWorkspaceActivity,
 }) => {
   // Default Claude bypass ON
   if (localStorage.getItem("__integraded_claude_skip_permissions") === null) {
@@ -305,6 +310,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   ) => {
     const trimmed = text.replace(/\s+$/g, "");
     if (!trimmed) return;
+    onWorkspaceActivity?.();
     setTerminalTranscripts(prev => {
       const entry: TerminalTranscriptEntry = {
         id: `${session.sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -321,7 +327,9 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
 
   // ── Baseline Snapshotting ────────────────────────────────────────────────
   useEffect(() => {
-    if (!directory) return;
+    if (!directory || !isActive) return;
+    void invoke("set_active_workspace", { dirPath: directory });
+    if (baselineReady) return;
     setBaselineReady(false);
     setChangedFiles([]);
     const takeBaseline = async () => {
@@ -349,11 +357,11 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
       }
     };
     takeBaseline();
-  }, [directory]);
+  }, [directory, isActive, baselineReady]);
 
   // ── Periodic Files Scanner (every 2.5s) ──────────────────────────────────
   useEffect(() => {
-    if (!directory || !baselineReady) return;
+    if (!directory || !baselineReady || !isActive) return;
 
     const scan = async () => {
       try {
@@ -385,7 +393,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     scan();
     const id = setInterval(scan, 2500);
     return () => clearInterval(id);
-  }, [directory, baselineSnapshot, baselineReady]);
+  }, [directory, baselineSnapshot, baselineReady, isActive]);
 
 
 
@@ -527,6 +535,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   };
 
   const handleStatusChange = (termId: number, status: "booting" | "running" | "exited") => {
+    if (status === "booting" || status === "running") onWorkspaceActivity?.();
     setSessions(prev => prev.map(s => s.id === termId ? { ...s, status } : s));
   };
 
@@ -661,6 +670,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
               activeFilePath={activeFile?.path ?? null}
               onFileSelect={(path, name) => setActiveFile({ path, name })}
               width={sidebarW}
+              active={isActive}
             />
             <div className="resize-handle h" onMouseDown={resizeSidebar} />
           </>

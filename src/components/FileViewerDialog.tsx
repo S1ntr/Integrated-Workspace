@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { computeLineDiff, DiffLine } from "./ChangesViewer";
+import { getFileExtension, getFileIcon } from "../utils/fileIcons";
 
 interface FileViewerDialogProps {
   filePath: string;
@@ -184,11 +185,108 @@ export function highlightCode(
   return result;
 }
 
+function renderInlineMarkdown(text: string): string {
+  return text
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+}
+
+function renderMarkdownPreview(markdown: string): string {
+  const fences: string[] = [];
+  const withoutFences = markdown.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_m, lang, code) => {
+    const idx = fences.length;
+    const langLabel = lang ? `<span>${escapeHtml(lang)}</span>` : "";
+    fences.push(`<pre class="md-code-block">${langLabel}<code>${escapeHtml(code).replace(/\n$/, "")}</code></pre>`);
+    return `\n@@CODE_BLOCK_${idx}@@\n`;
+  });
+
+  const lines = escapeHtml(withoutFences).split("\n");
+  const html: string[] = [];
+  let listOpen = false;
+  let orderedOpen = false;
+
+  const closeLists = () => {
+    if (listOpen) {
+      html.push("</ul>");
+      listOpen = false;
+    }
+    if (orderedOpen) {
+      html.push("</ol>");
+      orderedOpen = false;
+    }
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    const codeMatch = line.trim().match(/^@@CODE_BLOCK_(\d+)@@$/);
+    if (codeMatch) {
+      closeLists();
+      html.push(fences[Number(codeMatch[1])] || "");
+      continue;
+    }
+    if (!line.trim()) {
+      closeLists();
+      html.push('<div class="md-spacer"></div>');
+      continue;
+    }
+    const heading = line.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      closeLists();
+      const level = heading[1].length;
+      html.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      continue;
+    }
+    const unordered = line.match(/^[-*]\s+(.+)$/);
+    if (unordered) {
+      if (orderedOpen) {
+        html.push("</ol>");
+        orderedOpen = false;
+      }
+      if (!listOpen) {
+        html.push("<ul>");
+        listOpen = true;
+      }
+      html.push(`<li>${renderInlineMarkdown(unordered[1])}</li>`);
+      continue;
+    }
+    const ordered = line.match(/^\d+\.\s+(.+)$/);
+    if (ordered) {
+      if (listOpen) {
+        html.push("</ul>");
+        listOpen = false;
+      }
+      if (!orderedOpen) {
+        html.push("<ol>");
+        orderedOpen = true;
+      }
+      html.push(`<li>${renderInlineMarkdown(ordered[1])}</li>`);
+      continue;
+    }
+    const quote = line.match(/^&gt;\s?(.+)$/);
+    if (quote) {
+      closeLists();
+      html.push(`<blockquote>${renderInlineMarkdown(quote[1])}</blockquote>`);
+      continue;
+    }
+    closeLists();
+    html.push(`<p>${renderInlineMarkdown(line)}</p>`);
+  }
+
+  closeLists();
+  return html.join("");
+}
+
 export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fileName, onClose, baselineContent }) => {
   const isDiffMode = baselineContent !== undefined;
+  const fileIcon = getFileIcon(fileName);
+  const isMarkdownFile = getFileExtension(fileName) === "md" || getFileExtension(fileName) === "markdown";
   const [content, setContent] = useState<string>("");
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [markdownPreview, setMarkdownPreview] = useState<boolean>(isMarkdownFile);
   
   // Diff-specific state
   const [diffLines, setDiffLines] = useState<DiffLine[] | null>(null);
@@ -220,6 +318,7 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
       setLoading(true);
       setError(null);
       setSuccess(null);
+      setMarkdownPreview(isMarkdownFile);
       try {
         const text = await invoke<string>("read_file_content", { filePath });
         if (active) {
@@ -242,7 +341,7 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
     return () => {
       active = false;
     };
-  }, [filePath]);
+  }, [filePath, baselineContent, isDiffMode, isMarkdownFile]);
 
   const handleDiffScroll = (e: React.UIEvent<HTMLDivElement>) => {
     if (linesRef.current) {
@@ -419,26 +518,18 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
     return (
       <div className="dialog-overlay" onClick={onClose}>
         <div
-          className="stng-dialog file-viewer-dialog"
+          className="stng-dialog file-viewer-dialog file-viewer-dialog-large"
           onClick={e => e.stopPropagation()}
-          style={{
-            width: "95vw",
-            height: "90vh",
-            maxWidth: "1800px",
-            display: "flex",
-            flexDirection: "column",
-            paddingBottom: "16px",
-          }}
         >
-          <div className="stng-header" style={{ padding: "16px 20px" }}>
+          <div className="stng-header file-viewer-header">
             <div className="stng-header-left">
-              <div className="stng-header-icon" style={{ background: "var(--accent-subtle)", color: "var(--accent)" }}>
+              <div className="stng-header-icon file-viewer-file-icon file-ext-diff">
                 <i className="bx bx-git-compare" />
               </div>
-              <div style={{ display: "flex", alignItems: "baseline", gap: "10px" }}>
+              <div className="file-viewer-title-stack">
                 <span className="stng-header-title">{fileName}</span>
                 {!loading && !error && diffLines && (
-                  <span style={{ fontSize: "11px", color: "var(--text-3)" }}>
+                  <span className="file-viewer-subtitle">
                     <span style={{ color: "var(--ok)" }}>+{diffLines.filter(l => l.type === "added").length}</span>
                     {" "}
                     <span style={{ color: "var(--err)" }}>-{diffLines.filter(l => l.type === "removed").length}</span>
@@ -453,7 +544,7 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
             </button>
           </div>
 
-          <div className="stng-body" style={{ flex: 1, padding: 0, overflow: "hidden", display: "flex", flexDirection: "column", background: "var(--bg-1)" }}>
+          <div className="stng-body file-viewer-body">
             {error && (
               <div className="stng-alert err" style={{ margin: "12px 16px" }}>
                 <i className="bx bx-error-circle" />
@@ -462,12 +553,12 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
             )}
 
             {loading ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: "10px", alignItems: "center", justifyContent: "center", flex: 1 }}>
+              <div className="file-viewer-loading">
                 <i className="bx bx-loader-alt bx-spin" style={{ fontSize: "24px", color: "var(--accent)" }} />
                 <span style={{ fontSize: "12px", color: "var(--text-3)" }}>Loading diff...</span>
               </div>
             ) : diffLines ? (
-              <div className="code-editor-viewport diff-full-viewport" style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+              <div className="code-editor-viewport diff-full-viewport">
                 <div className="diff-scroll" ref={diffScrollRef} onScroll={handleDiffScroll} style={{ flex: 1, overflow: "auto", fontFamily: "var(--font-mono)", fontSize: "13px", lineHeight: "1.55", padding: "8px 0" }}>
                   {diffLines.length === 0 && (
                     <div className="diff-empty-line">This file is empty, so there are no changed lines to display yet.</div>
@@ -493,30 +584,23 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
 
   const lines = editedContent.split("\n");
   const highlighted = highlightCode(editedContent, fileName, searchQuery, activeMatchIndex);
+  const markdownHtml = markdownPreview ? renderMarkdownPreview(editedContent) : "";
 
   return (
     <div className="dialog-overlay" onClick={handleRequestClose}>
       <div
-        className="stng-dialog file-viewer-dialog"
+        className="stng-dialog file-viewer-dialog file-viewer-dialog-large"
         onClick={e => e.stopPropagation()}
-        style={{
-          width: "95vw",
-          height: "90vh",
-          maxWidth: "1800px",
-          display: "flex",
-          flexDirection: "column",
-          paddingBottom: "16px",
-        }}
       >
         {/* Header */}
-        <div className="stng-header" style={{ padding: "16px 20px" }}>
+        <div className="stng-header file-viewer-header">
           <div className="stng-header-left">
-            <div className="stng-header-icon" style={{ background: "var(--accent-subtle)", color: "var(--accent)" }}>
-              <i className="bx bx-file" />
+            <div className={`stng-header-icon file-viewer-file-icon ${fileIcon.className}`}>
+              <i className={`bx ${fileIcon.icon}`} />
             </div>
-            <div style={{ display: "flex", alignItems: "baseline", gap: "10px" }}>
+            <div className="file-viewer-title-stack">
               <span className="stng-header-title">{fileName}</span>
-              <span style={{ fontSize: "11px", color: "var(--text-3)", fontFamily: "var(--font-mono)" }}>
+              <span className="file-viewer-subtitle">
                 {saving ? (
                   <span style={{ color: "var(--accent)", display: "inline-flex", alignItems: "center" }}>
                     <i className="bx bx-loader-alt bx-spin" style={{ marginRight: "4px" }} />Saving...
@@ -528,25 +612,24 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
             </div>
           </div>
 
-          <div style={{ display: "flex", alignItems: "center" }}>
+          <div className="file-viewer-actions">
+            {isMarkdownFile && !loading && !error && (
+              <button
+                type="button"
+                className={`stng-btn ${markdownPreview ? "stng-btn-primary" : "stng-btn-ghost"}`}
+                onClick={() => setMarkdownPreview(v => !v)}
+              >
+                <i className={`bx ${markdownPreview ? "bx-edit-alt" : "bxl-markdown"}`} />
+                {markdownPreview ? "Edit markdown" : "View as markdown"}
+              </button>
+            )}
             {/* Restored Text-Only Save Changes button in Header */}
             {!loading && !error && (
               <button
                 className="stng-btn"
                 onClick={handleSave}
                 disabled={saving || editedContent === content}
-                style={{
-                  fontSize: "12px",
-                  padding: "6px 14px",
-                  marginRight: "16px",
-                  border: "none",
-                  borderRadius: "var(--radius-sm)",
-                  background: editedContent === content ? "var(--bg-3)" : "var(--accent)",
-                  color: editedContent === content ? "var(--text-3)" : "var(--bg-base)",
-                  fontWeight: 600,
-                  cursor: editedContent === content ? "not-allowed" : "pointer",
-                  transition: "all 0.15s ease",
-                }}
+                data-primary={editedContent !== content}
               >
                 Save Changes
               </button>
@@ -560,16 +643,7 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
 
         {/* Body */}
         <div
-          className="stng-body"
-          style={{
-            flex: 1,
-            padding: 0,
-            overflow: "hidden",
-            display: "flex",
-            flexDirection: "column",
-            background: "var(--bg-1)",
-            position: "relative",
-          }}
+          className="stng-body file-viewer-body"
         >
           {error && (
             <div className="stng-alert err" style={{ margin: "12px 16px" }}>
@@ -586,19 +660,13 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
 
           {loading ? (
             <div
-              className="stng-loading"
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "10px",
-                alignItems: "center",
-                justifyContent: "center",
-                flex: 1,
-              }}
+              className="stng-loading file-viewer-loading"
             >
               <i className="bx bx-loader-alt bx-spin" style={{ fontSize: "24px", color: "var(--accent)" }} />
               <span style={{ fontSize: "12px", color: "var(--text-3)" }}>Loading file content...</span>
             </div>
+          ) : markdownPreview ? (
+            <div className="markdown-preview file-viewer-scroll" dangerouslySetInnerHTML={{ __html: markdownHtml }} />
           ) : (
             <div className="code-editor-viewport" style={{ flex: 1, display: "flex", position: "relative" }}>
               
