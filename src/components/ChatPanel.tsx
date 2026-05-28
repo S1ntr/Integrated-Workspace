@@ -1155,15 +1155,16 @@ export const ChatPanel: React.FC<{
       const delta = parseStreamDelta(e.payload, req.provider);
       if (delta) {
         streamTextRef.current += delta;
-        if (streamThinkingElapsedRef.current === null) {
+        const justFinishedThinking = streamThinkingElapsedRef.current === null;
+        if (justFinishedThinking) {
           streamThinkingElapsedRef.current = Math.max(0, Date.now() - streamThinkingStartRef.current);
         }
-        const elapsedMs = streamThinkingElapsedRef.current;
+        const elapsedMs = streamThinkingElapsedRef.current ?? 0;
         setMsgs(p => p.map(m => m.id === msgId ? {
           ...m,
           body: visibleStreamText(streamTextRef.current),
           thinking: thinkingPreviewEnabled
-            ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: m.thinking?.open ?? false, done: true }
+            ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: justFinishedThinking ? false : (m.thinking?.open ?? false), done: true }
             : m.thinking,
         } : m));
       }
