@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import type { Webview } from "@tauri-apps/api/webview";
 import type { BrowserOpenRequest, ChatAttachment, ExternalChatPrompt } from "../types/browser";
 
 type BrowserMode = "app" | "web";
@@ -81,6 +82,9 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const handledRequestRef = useRef<string | null>(null);
+  const embeddedWebviewRef = useRef<Webview | null>(null);
+  const embeddedWebviewUrlRef = useRef("");
+  const embeddedWebviewRequestRef = useRef(0);
 
   const [mode, setMode] = useState<BrowserMode>("app");
   const [address, setAddress] = useState("");
@@ -97,7 +101,9 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   const [note, setNote] = useState("");
   const [sentHint, setSentHint] = useState("");
   const [frameTitle, setFrameTitle] = useState("");
-  const [nativeHint, setNativeHint] = useState("");
+  const [browserHint, setBrowserHint] = useState("");
+  const [embeddedBrowserError, setEmbeddedBrowserError] = useState("");
+  const [embeddedBrowserReady, setEmbeddedBrowserReady] = useState(false);
   const [tabs, setTabs] = useState<BrowserTab[]>([
     { id: "project", label: "Current project", url: "", kind: "project" },
   ]);
@@ -123,6 +129,120 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   );
 
   const currentProjectUrl = cleanedSuggestions[0] || "";
+
+  function readViewportBounds() {
+    const rect = viewportRef.current?.getBoundingClientRect();
+    if (!rect || rect.width < 2 || rect.height < 2) return null;
+    return {
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      width: Math.max(1, Math.round(rect.width)),
+      height: Math.max(1, Math.round(rect.height)),
+    };
+  }
+
+  async function closeEmbeddedWebview(resetState = true) {
+    const webview = embeddedWebviewRef.current;
+    embeddedWebviewRef.current = null;
+    embeddedWebviewUrlRef.current = "";
+    if (resetState) setEmbeddedBrowserReady(false);
+    if (!webview) return;
+    try {
+      await webview.close();
+    } catch {
+      // The webview may already be gone after a tab/window transition.
+    }
+  }
+
+  async function syncEmbeddedWebviewBounds() {
+    const webview = embeddedWebviewRef.current;
+    const bounds = readViewportBounds();
+    if (!webview || !bounds) return;
+    try {
+      const { LogicalPosition, LogicalSize } = await import("@tauri-apps/api/dpi");
+      await webview.setPosition(new LogicalPosition(bounds.x, bounds.y));
+      await webview.setSize(new LogicalSize(bounds.width, bounds.height));
+    } catch {
+      setEmbeddedBrowserError("Embedded browser lost its layout. Reopen the tab to reset it.");
+    }
+  }
+
+  async function openEmbeddedWebview(raw: string, targetTabId = activeTabId) {
+    const url = normalizeUrl(raw);
+    const bounds = readViewportBounds();
+    if (!url || !bounds) return;
+
+    const requestId = embeddedWebviewRequestRef.current + 1;
+    embeddedWebviewRequestRef.current = requestId;
+    setLoading(true);
+    setEmbeddedBrowserReady(false);
+    setEmbeddedBrowserError("");
+
+    if (embeddedWebviewRef.current && embeddedWebviewUrlRef.current === url) {
+      try {
+        await syncEmbeddedWebviewBounds();
+        await embeddedWebviewRef.current.show();
+        await embeddedWebviewRef.current.setFocus();
+        setEmbeddedBrowserReady(true);
+        setLoading(false);
+        return;
+      } catch {
+        await closeEmbeddedWebview();
+      }
+    } else {
+      await closeEmbeddedWebview();
+    }
+
+    if (embeddedWebviewRequestRef.current !== requestId) return;
+
+    try {
+      const { Webview } = await import("@tauri-apps/api/webview");
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const label = `integraded-browser-${targetTabId}-${Date.now()}`
+        .replace(/[^a-zA-Z0-9\-/:_]/g, "-")
+        .slice(0, 96);
+      const webview = new Webview(getCurrentWindow(), label, {
+        url,
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        focus: true,
+        dragDropEnabled: false,
+        backgroundColor: "#ffffff",
+      });
+
+      embeddedWebviewRef.current = webview;
+      embeddedWebviewUrlRef.current = url;
+
+      void webview.once("tauri://created", () => {
+        if (embeddedWebviewRef.current !== webview) return;
+        setEmbeddedBrowserReady(true);
+        setEmbeddedBrowserError("");
+        setLoading(false);
+        void syncEmbeddedWebviewBounds();
+        void webview.setFocus();
+      });
+
+      void webview.once<string>("tauri://error", event => {
+        if (embeddedWebviewRef.current !== webview) return;
+        const detail = typeof event.payload === "string" && event.payload.trim()
+          ? ` ${event.payload.trim()}`
+          : "";
+        embeddedWebviewRef.current = null;
+        embeddedWebviewUrlRef.current = "";
+        setEmbeddedBrowserReady(false);
+        setLoading(false);
+        setEmbeddedBrowserError(`Embedded browser could not be opened.${detail}`);
+      });
+    } catch (error) {
+      embeddedWebviewRef.current = null;
+      embeddedWebviewUrlRef.current = "";
+      setEmbeddedBrowserReady(false);
+      setLoading(false);
+      setEmbeddedBrowserError(error instanceof Error ? error.message : "Embedded browser could not be opened.");
+    }
+  }
 
   useEffect(() => {
     if (!open || !request || handledRequestRef.current === request.id) return;
@@ -156,6 +276,39 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose, selection, tool]);
+
+  useEffect(() => {
+    if (open) return;
+    void closeEmbeddedWebview();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleResize = () => {
+      void syncEmbeddedWebviewBounds();
+    };
+    const node = viewportRef.current;
+    const observer = node && typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(handleResize)
+      : null;
+    if (node) observer?.observe(node);
+    window.addEventListener("resize", handleResize);
+    const timer = window.setTimeout(handleResize, 0);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("resize", handleResize);
+      observer?.disconnect();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, mode, device, currentUrl, address, activeTabId]);
+
+  useEffect(() => {
+    return () => {
+      void closeEmbeddedWebview(false);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (!open) return null;
 
@@ -196,18 +349,20 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
 
     setAddress(next);
     setMode(nextKind === "project" ? "app" : "web");
-    setNativeHint("");
+    setBrowserHint("");
+    setEmbeddedBrowserError("");
     setSelection(null);
     setDraft(null);
     updateTabForNavigation(targetTabId, next, nextKind, external);
     commitHistory(next, navMode);
 
     if (external) {
+      setTool("browse");
       setCurrentUrl("");
-      setLoading(false);
       setFrameTitle(compactUrl(next));
-      void openNativeWindow(next, false);
+      void openEmbeddedWebview(next, targetTabId);
     } else {
+      void closeEmbeddedWebview();
       setCurrentUrl(next);
       setLoading(true);
       setFrameTitle("");
@@ -226,11 +381,12 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     setDraft(null);
     updateTabForNavigation(activeTabId, next, external ? "web" : "project", external);
     if (external) {
+      setTool("browse");
       setCurrentUrl("");
-      setLoading(false);
       setFrameTitle(compactUrl(next));
-      void openNativeWindow(next, false);
+      void openEmbeddedWebview(next);
     } else {
+      void closeEmbeddedWebview();
       setCurrentUrl(next);
       setLoading(true);
       setFrameTitle("");
@@ -239,38 +395,11 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
 
   function reload() {
     if (!currentUrl) {
-      if (address) void openNativeWindow(address, mode === "app");
+      if (address && mode === "web") void openEmbeddedWebview(address);
       return;
     }
     setLoading(true);
     setFrameKey(key => key + 1);
-  }
-
-  async function openNativeWindow(raw = currentUrl || address, incognito = mode === "app") {
-    const url = normalizeUrl(raw);
-    if (!url) return;
-    setNativeHint("Opening native webview...");
-    try {
-      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-      const label = `integraded-browser-${Date.now()}`;
-      const webview = new WebviewWindow(label, {
-        url,
-        title: `Integraded Browser - ${compactUrl(url)}`,
-        width: 1280,
-        height: 820,
-        center: true,
-        resizable: true,
-        decorations: true,
-        focus: true,
-        incognito,
-      });
-      await webview.once("tauri://created", () => setNativeHint("Opened in native webview"));
-      await webview.once("tauri://error", () => setNativeHint("Native webview could not be opened"));
-    } catch {
-      window.open(url, "_blank", "noopener,noreferrer");
-      setNativeHint("Opened in your system browser");
-    }
-    setTimeout(() => setNativeHint(""), 2600);
   }
 
   function selectTab(tab: BrowserTab) {
@@ -279,15 +408,23 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     setMode(tab.kind === "project" ? "app" : "web");
     setSelection(null);
     setDraft(null);
-    setNativeHint("");
+    setBrowserHint("");
+    setEmbeddedBrowserError("");
     if (tab.url && !tab.external) {
+      void closeEmbeddedWebview();
       setCurrentUrl(tab.url);
       setLoading(true);
       setFrameTitle("");
     } else {
+      setTool("browse");
       setCurrentUrl("");
-      setLoading(false);
       setFrameTitle(tab.url ? compactUrl(tab.url) : "");
+      if (tab.url) {
+        void openEmbeddedWebview(tab.url, tab.id);
+      } else {
+        setLoading(false);
+        void closeEmbeddedWebview();
+      }
     }
   }
 
@@ -308,8 +445,8 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
 
   function openCurrentProject() {
     if (!currentProjectUrl) {
-      setNativeHint("No localhost project URL detected yet. Start a dev server first.");
-      setTimeout(() => setNativeHint(""), 2600);
+      setBrowserHint("No localhost project URL detected yet. Start a dev server first.");
+      setTimeout(() => setBrowserHint(""), 2600);
       return;
     }
     setActiveTabId("project");
@@ -485,7 +622,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
 
   const selectionBox = draft || selection;
   const hasUrl = Boolean(currentUrl);
-  const nativeWebUrl = mode === "web" && !currentUrl && address ? address : "";
+  const embeddedWebUrl = mode === "web" && !currentUrl && address ? address : "";
   const sandboxPolicy = mode === "app"
     ? "allow-same-origin allow-scripts allow-forms allow-modals allow-popups allow-downloads allow-pointer-lock allow-presentation"
     : undefined;
@@ -531,7 +668,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
           </button>
         </div>
 
-        <div className="browser-toolbar">
+        <div className={`browser-toolbar mode-${mode}`}>
           <div className="browser-nav" aria-label="Navigation">
             <button type="button" className="browser-icon-btn" disabled={historyIndex <= 0} onClick={() => go(-1)} title="Back">
               <i className="bx bx-chevron-left" />
@@ -539,7 +676,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
             <button type="button" className="browser-icon-btn" disabled={historyIndex >= history.length - 1} onClick={() => go(1)} title="Forward">
               <i className="bx bx-chevron-right" />
             </button>
-            <button type="button" className="browser-icon-btn" disabled={!currentUrl} onClick={reload} title="Reload">
+            <button type="button" className="browser-icon-btn" disabled={!currentUrl && !(mode === "web" && address)} onClick={reload} title="Reload">
               <i className={`bx bx-refresh ${loading ? "spin" : ""}`} />
             </button>
           </div>
@@ -566,22 +703,17 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
               <i className="bx bx-mouse" />
               <span>Browse</span>
             </button>
-            <button type="button" className={`browser-tool-btn ${tool === "point" ? "active" : ""}`} onClick={() => setTool("point")} title="Select element">
+            <button type="button" className={`browser-tool-btn ${tool === "point" ? "active" : ""}`} disabled={mode === "web"} onClick={() => setTool("point")} title={mode === "web" ? "Selection tools are available for the current project preview" : "Select element"}>
               <i className="bx bx-target-lock" />
               <span>Pick</span>
             </button>
-            <button type="button" className={`browser-tool-btn ${tool === "region" ? "active" : ""}`} onClick={() => setTool("region")} title="Select region">
+            <button type="button" className={`browser-tool-btn ${tool === "region" ? "active" : ""}`} disabled={mode === "web"} onClick={() => setTool("region")} title={mode === "web" ? "Selection tools are available for the current project preview" : "Select region"}>
               <i className="bx bx-crop" />
               <span>Area</span>
             </button>
           </div>
 
-          {mode === "web" ? (
-            <button type="button" className="browser-native-btn" disabled={!currentUrl && !address.trim()} onClick={() => openNativeWindow(currentUrl || address, false)} title="Open site in native webview">
-              <i className="bx bx-window-open" />
-              <span>Native</span>
-            </button>
-          ) : (
+          {mode === "app" && (
             <div className="browser-device-strip">
               {DEVICE_PRESETS.map(item => (
                 <button
@@ -598,7 +730,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
           )}
         </div>
 
-        {(cleanedSuggestions.length > 0 || sentHint || nativeHint) && (
+        {(cleanedSuggestions.length > 0 || sentHint || browserHint) && (
           <div className="browser-suggestion-row">
             {currentProjectUrl && (
               <button type="button" className="browser-current-suggestion" onClick={openCurrentProject}>
@@ -613,7 +745,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
               </button>
             ))}
             {sentHint && <span className="browser-sent-hint">{sentHint}</span>}
-            {nativeHint && <span className="browser-sent-hint">{nativeHint}</span>}
+            {browserHint && <span className="browser-sent-hint">{browserHint}</span>}
           </div>
         )}
 
@@ -644,23 +776,23 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                   }
                 }}
               />
-            ) : nativeWebUrl ? (
-              <div className="browser-native-page">
-                <i className="bx bx-window-open" />
-                <span className="browser-start-title">Opened as a real browser tab</span>
-                <span className="browser-start-sub">
-                  {compactUrl(nativeWebUrl)} blocks embedded preview in many browsers, so Integraded opens it in a native webview while keeping this tab tracked here.
-                </span>
-                <div className="browser-native-actions">
-                  <button type="button" onClick={() => openNativeWindow(nativeWebUrl, false)}>
-                    <i className="bx bx-window-open" />
-                    Open again
-                  </button>
-                  <button type="button" onClick={() => setTool("browse")}>
-                    <i className="bx bx-check" />
-                    Keep tracked
-                  </button>
-                </div>
+            ) : embeddedWebUrl ? (
+              <div className={`browser-webview-host ${embeddedBrowserReady ? "ready" : ""}`}>
+                {(loading || !embeddedBrowserReady) && !embeddedBrowserError && (
+                  <div className="browser-webview-status">
+                    <i className="bx bx-loader-alt spin" />
+                    <span>Opening {compactUrl(embeddedWebUrl)}</span>
+                  </div>
+                )}
+                {embeddedBrowserError && (
+                  <div className="browser-webview-status error">
+                    <i className="bx bx-error-circle" />
+                    <span>{embeddedBrowserError}</span>
+                    <button type="button" onClick={() => openEmbeddedWebview(embeddedWebUrl)}>
+                      Retry
+                    </button>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="browser-start-page">
@@ -669,7 +801,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                 <span className="browser-start-sub">
                   {mode === "app"
                     ? "Use Current project to open the detected localhost URL from your dev server, then choose a device viewport."
-                    : "Search or open a URL. Regular websites run in a native tab when they block iframe embedding."}
+                    : "Search or open a URL. Regular websites open inside this browser tab."}
                 </span>
                 <form className="browser-start-form" onSubmit={event => { event.preventDefault(); navigateTo(address); }}>
                   <input value={address} onChange={event => setAddress(event.target.value)} placeholder="google.com, search text, or localhost:3000" />
@@ -684,13 +816,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
               </div>
             )}
 
-            {false && mode === "web" && hasUrl && (
-              <button type="button" className="browser-native-fallback" onClick={() => openNativeWindow()}>
-                Site blocked here? Open Native
-              </button>
-            )}
-
-            {tool !== "browse" && (
+            {mode === "app" && tool !== "browse" && (
               <div
                 className="browser-select-layer"
                 onMouseDown={beginSelection}
