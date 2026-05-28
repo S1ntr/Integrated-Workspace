@@ -250,10 +250,14 @@ const RightPanel: React.FC<RightPanelProps> = ({
         request={browserRequest}
         suggestedUrls={suggestedUrls}
         workspaceName={directory.split(/[\\/]/).pop() || directory}
+        directory={directory}
         onClose={() => setBrowserOpen(false)}
         onSendToChat={(payload) => {
           setTab("chat");
           setExternalPrompt({ id: `browser-prompt-${Date.now()}`, ...payload });
+        }}
+        onAutoStartSession={(label, command) => {
+          onAddSession(label, command);
         }}
       />
     </div>

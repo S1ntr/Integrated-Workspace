@@ -2,11 +2,15 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./index.css";
 
-// Apply saved theme before first render to avoid flash
+// Apply saved theme before first render to avoid flash of wrong theme
 try {
   const saved = localStorage.getItem("__integraded_theme");
-  if (saved === "light") document.documentElement.setAttribute("data-theme", "light");
-  else if (saved === "dark") document.documentElement.setAttribute("data-theme", "dark");
+  if (saved && saved !== "auto") {
+    document.documentElement.setAttribute("data-theme", saved);
+  } else if (!saved) {
+    // Default to dark if nothing saved
+    document.documentElement.setAttribute("data-theme", "dark");
+  }
 } catch {}
 
 function eventInIntegratedBrowser(event: Event): boolean {

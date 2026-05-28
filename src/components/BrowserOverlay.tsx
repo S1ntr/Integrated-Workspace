@@ -5,6 +5,15 @@ import type { BrowserOpenRequest, ChatAttachment, ExternalChatPrompt } from "../
 
 type BrowserMode = "app" | "web";
 type BrowserTool = "browse" | "point" | "region";
+type DevServerStatus = "idle" | "detecting" | "starting" | "waiting" | "error";
+
+interface DevProjectInfo {
+  project_type: string;
+  label: string;
+  command: string;
+  port: number;
+  package_manager: string;
+}
 
 interface BrowserSelection {
   kind: "element" | "region";
@@ -28,8 +37,10 @@ interface BrowserOverlayProps {
   request?: BrowserOpenRequest | null;
   suggestedUrls?: string[];
   workspaceName?: string;
+  directory?: string;
   onClose: () => void;
   onSendToChat: (prompt: Omit<ExternalChatPrompt, "id">) => void;
+  onAutoStartSession?: (label: string, command: string) => void;
 }
 
 interface BrowserNewWindowEvent {
@@ -82,8 +93,10 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   request,
   suggestedUrls = [],
   workspaceName = "Workspace",
+  directory,
   onClose,
   onSendToChat,
+  onAutoStartSession,
 }) => {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -115,6 +128,12 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     { id: "project", label: "Current project", url: "", kind: "project" },
   ]);
   const [activeTabId, setActiveTabId] = useState("project");
+
+  // Dev server auto-start state
+  const [devStatus, setDevStatus] = useState<DevServerStatus>("idle");
+  const [devError, setDevError] = useState("");
+  const [devInfo, setDevInfo] = useState<DevProjectInfo | null>(null);
+  const devAbortRef = useRef(false);
 
   const preset = useMemo(
     () => DEVICE_PRESETS.find(item => item.key === device) || DEVICE_PRESETS[0],
@@ -274,6 +293,9 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   useEffect(() => {
     if (open) return;
     void closeEmbeddedWebview();
+    devAbortRef.current = true;
+    setDevStatus("idle");
+    setDevError("");
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -494,15 +516,102 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     if (activeTabId === tabId) selectTab(remaining[remaining.length - 1]);
   }
 
-  function openCurrentProject() {
-    if (!currentProjectUrl) {
-      setBrowserHint("No localhost project URL detected yet. Start a dev server first.");
+  // Poll 127.0.0.1:port until it responds or timeout expires.
+  // Returns true on success, throws on timeout or abort.
+  async function waitForPortOpen(port: number, timeoutMs: number): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (devAbortRef.current) throw new Error("cancelled");
+      const open = await invoke<boolean>("check_port_open", { port });
+      if (open) return;
+      await new Promise(resolve => setTimeout(resolve, 700));
+    }
+    if (devAbortRef.current) throw new Error("cancelled");
+    throw new Error(
+      `Dev server did not respond on port ${port} within ${Math.round(timeoutMs / 1000)}s.\n` +
+      `Check the terminal for error output.`,
+    );
+  }
+
+  async function openCurrentProject() {
+    // If a URL is already known (dev server already running), just navigate.
+    if (currentProjectUrl) {
+      setActiveTabId("project");
+      setMode("app");
+      navigateTo(currentProjectUrl, "push", "project", "project");
+      return;
+    }
+
+    if (!directory) {
+      setBrowserHint("No project directory available.");
       setTimeout(() => setBrowserHint(""), 2600);
       return;
     }
-    setActiveTabId("project");
-    setMode("app");
-    navigateTo(currentProjectUrl, "push", "project", "project");
+
+    // Abort any previous detection/polling
+    devAbortRef.current = true;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    devAbortRef.current = false;
+
+    setDevError("");
+    setDevInfo(null);
+    setDevStatus("detecting");
+
+    try {
+      // Step 1 — detect project type
+      const info = await invoke<DevProjectInfo>("detect_dev_project", { dir: directory });
+      if (devAbortRef.current) return;
+      setDevInfo(info);
+
+      // Step 2 — check if already running
+      const alreadyUp = await invoke<boolean>("check_port_open", { port: info.port });
+      if (devAbortRef.current) return;
+      if (alreadyUp) {
+        const url = `http://localhost:${info.port}`;
+        setDevStatus("idle");
+        setActiveTabId("project");
+        navigateTo(url, "push", "project", "project");
+        return;
+      }
+
+      // Step 3 — start the dev server in a terminal session
+      setDevStatus("starting");
+      onAutoStartSession?.(info.label, info.command);
+
+      // Step 4 — wait up to 60s for the port to open
+      setDevStatus("waiting");
+      await waitForPortOpen(info.port, 60_000);
+      if (devAbortRef.current) return;
+
+      // Step 5 — navigate
+      const url = `http://localhost:${info.port}`;
+      setDevStatus("idle");
+      setActiveTabId("project");
+      navigateTo(url, "push", "project", "project");
+    } catch (err) {
+      if (devAbortRef.current) return; // user navigated away — silently cancel
+      setDevStatus("error");
+      setDevError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function sendDevErrorToChat() {
+    const info = devInfo;
+    onSendToChat({
+      text: [
+        "The dev server failed to start. Please investigate and fix the issue.",
+        "",
+        `Project directory: ${directory || "unknown"}`,
+        info ? `Project type: ${info.project_type} (${info.package_manager})` : "",
+        info ? `Command attempted: ${info.command}` : "",
+        info ? `Expected port: ${info.port}` : "",
+        "",
+        `Error: ${devError}`,
+        "",
+        "Check the terminal session for the full error output. Common causes: missing dependencies (run install first), port already in use, or a syntax error in the project.",
+      ].filter(Boolean).join("\n"),
+    });
+    setDevStatus("idle");
   }
 
   function readElementInfo(x: number, y: number): string | undefined {
@@ -744,7 +853,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
             </button>
           </form>
 
-          <button type="button" className="browser-current-project-btn" onClick={openCurrentProject} title="Open detected localhost project">
+          <button type="button" className="browser-current-project-btn" onClick={() => void openCurrentProject()} title="Auto-start dev server and open project">
             <i className="bx bx-code-block" />
             <span>Current project</span>
           </button>
@@ -784,7 +893,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
         {(cleanedSuggestions.length > 0 || sentHint || browserHint) && (
           <div className="browser-suggestion-row">
             {currentProjectUrl && (
-              <button type="button" className="browser-current-suggestion" onClick={openCurrentProject}>
+              <button type="button" className="browser-current-suggestion" onClick={() => void openCurrentProject()}>
                 <i className="bx bx-code-block" />
                 Current project
               </button>
@@ -845,23 +954,91 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                   </div>
                 )}
               </div>
+            ) : devStatus !== "idle" ? (
+              // Dev server auto-start status panel
+              <div className={`browser-autostart-page${devStatus === "error" ? " error" : ""}`}>
+                {devStatus === "error" ? (
+                  <>
+                    <i className="bx bx-error-circle" />
+                    <span className="browser-autostart-title">Dev server failed to start</span>
+                    {devInfo && (
+                      <span className="browser-autostart-cmd">
+                        <i className="bx bx-terminal" /> {devInfo.command}
+                      </span>
+                    )}
+                    <div className="browser-autostart-error-msg">{devError}</div>
+                    <div className="browser-autostart-actions">
+                      <button
+                        type="button"
+                        className="browser-start-project"
+                        onClick={sendDevErrorToChat}
+                      >
+                        <i className="bx bx-send" />
+                        Send to chat
+                      </button>
+                      <button
+                        type="button"
+                        className="browser-start-project"
+                        onClick={() => { setDevStatus("idle"); void openCurrentProject(); }}
+                      >
+                        <i className="bx bx-refresh" />
+                        Retry
+                      </button>
+                      <button
+                        type="button"
+                        className="browser-start-project"
+                        onClick={() => setDevStatus("idle")}
+                      >
+                        <i className="bx bx-x" />
+                        Dismiss
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <i className="bx bx-loader-alt spin" />
+                    <span className="browser-autostart-title">
+                      {devStatus === "detecting" && "Detecting project type…"}
+                      {devStatus === "starting"  && `Starting ${devInfo?.label ?? "dev server"}…`}
+                      {devStatus === "waiting"   && `Waiting for localhost:${devInfo?.port ?? "…"}…`}
+                    </span>
+                    {devInfo && devStatus !== "detecting" && (
+                      <span className="browser-autostart-cmd">
+                        <i className="bx bx-terminal" /> {devInfo.command}
+                      </span>
+                    )}
+                    {devStatus === "waiting" && (
+                      <span>Check the terminal panel for startup output</span>
+                    )}
+                    <button
+                      type="button"
+                      className="browser-start-project"
+                      style={{ marginTop: 4 }}
+                      onClick={() => { devAbortRef.current = true; setDevStatus("idle"); }}
+                    >
+                      <i className="bx bx-x" />
+                      Cancel
+                    </button>
+                  </>
+                )}
+              </div>
             ) : (
               <div className="browser-start-page">
                 <i className={`bx ${mode === "app" ? "bx-shield-quarter" : "bx-globe"}`} />
                 <span className="browser-start-title">{mode === "app" ? "Open the current project" : "Open a browser tab"}</span>
                 <span className="browser-start-sub">
                   {mode === "app"
-                    ? "Use Current project to open the detected localhost URL from your dev server, then choose a device viewport."
+                    ? "Use Current project to auto-start your dev server, then choose a device viewport."
                     : "Search or open a URL. Regular websites open inside this browser tab."}
                 </span>
                 <form className="browser-start-form" onSubmit={event => { event.preventDefault(); navigateTo(address); }}>
                   <input value={address} onChange={event => setAddress(event.target.value)} placeholder="google.com, search text, or localhost:3000" />
                   <button type="submit"><i className="bx bx-right-arrow-alt" /></button>
                 </form>
-                {mode === "app" && currentProjectUrl && (
-                  <button type="button" className="browser-start-project" onClick={openCurrentProject}>
+                {mode === "app" && (
+                  <button type="button" className="browser-start-project" onClick={() => void openCurrentProject()}>
                     <i className="bx bx-code-block" />
-                    Current project
+                    {currentProjectUrl ? "Current project" : "Start dev server"}
                   </button>
                 )}
               </div>

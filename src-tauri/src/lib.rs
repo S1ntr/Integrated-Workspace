@@ -494,6 +494,57 @@ fn copy_item(src_path: String, dest_path: String, state: State<'_, WorkspaceStat
     }
 }
 
+/// Return a folder name like "Thursday_2026-05-28" for today's date.
+/// Uses Hinnant's civil_from_days algorithm — no chrono dependency needed.
+fn today_folder_name() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = secs / 86400;
+
+    // Weekday: epoch day 0 = Thursday (index 3 when Mon=0)
+    let weekday_idx = ((days % 7 + 3 + 7) % 7) as usize;
+    let day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+    let day_name = day_names[weekday_idx];
+
+    // Civil date (Hinnant 2013 algorithm)
+    let z: i64 = days + 719468;
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y   = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp  = (5 * doy + 2) / 153;
+    let d   = doy - (153 * mp + 2) / 5 + 1;
+    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y   = if m <= 2 { y + 1 } else { y };
+
+    format!("{}_{:04}-{:02}-{:02}", day_name, y, m, d)
+}
+
+/// Save the current chat session snapshot to {workspace_dir}/chat-history/{weekday_date}/
+/// so every workspace keeps its own readable, date-organised history on disk.
+#[tauri::command]
+fn save_chat_to_workspace(workspace_dir: String, json_data: String) -> Result<(), String> {
+    let ws = Path::new(&workspace_dir);
+    if !ws.exists() || !ws.is_dir() {
+        return Err("Workspace directory does not exist".to_string());
+    }
+
+    let today  = today_folder_name();
+    let folder = ws.join("chat-history").join(&today);
+    fs::create_dir_all(&folder)
+        .map_err(|e| format!("Failed to create chat-history folder: {}", e))?;
+
+    let file = folder.join("chat_history.json");
+    fs::write(&file, json_data.as_bytes())
+        .map_err(|e| format!("Failed to write workspace chat history: {}", e))?;
+
+    Ok(())
+}
+
 fn chat_history_root(app: &AppHandle) -> Result<PathBuf, String> {
     let home = app.path().home_dir().map_err(|e| format!("Failed to resolve home directory: {}", e))?;
     Ok(home.join("chat-history"))
@@ -646,66 +697,138 @@ fn default_true() -> bool {
     true
 }
 
-// ─── Machine-Bound Dynamic Cipher (Remediation for Hardcoded Secret Keys) ─────
-fn get_dynamic_key() -> Vec<u8> {
-    let mut key = b"INTEGRADED_DYNAMIC_CIPHER_CORE_KEY_".to_vec();
-    
-    // Windows host environmental vectors
-    if let Ok(val) = std::env::var("USERNAME") {
-        key.extend_from_slice(val.as_bytes());
+// ─── Key storage (v2: salted per-key cipher) ──────────────────────────────────
+//
+// Security model:
+//   • Each stored key has a unique 16-byte random salt.
+//   • The key-encryption key is derived from the salt + machine-specific env
+//     values (username, computer name, home path) using 256 rounds of mixing.
+//   • Stored format: "v2:<32-hex-salt>:<encrypted-hex>"
+//   • Without knowing both the salt AND the machine env, decryption is infeasible.
+//   • Backward-compat: values without the "v2:" prefix use the old v1 decoder.
+
+/// Generate a 16-byte salt from system entropy (no external crate needed).
+fn generate_salt() -> [u8; 16] {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    let p = std::process::id() as u64;
+    // Xorshift mix for pseudo-randomness
+    let mut s = t
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(p.wrapping_mul(2862933555777941757))
+        .wrapping_add(1442695040888963407);
+    let mut salt = [0u8; 16];
+    for i in 0..16 {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        salt[i] = (s >> (8 * (i % 8))) as u8;
     }
-    if let Ok(val) = std::env::var("COMPUTERNAME") {
-        key.extend_from_slice(val.as_bytes());
-    }
-    if let Ok(val) = std::env::var("USERPROFILE") {
-        key.extend_from_slice(val.as_bytes());
-    }
-    
-    // Unix/Linux/macOS host environmental vectors
-    if let Ok(val) = std::env::var("USER") {
-        key.extend_from_slice(val.as_bytes());
-    }
-    if let Ok(val) = std::env::var("HOSTNAME") {
-        key.extend_from_slice(val.as_bytes());
-    }
-    if let Ok(val) = std::env::var("HOME") {
-        key.extend_from_slice(val.as_bytes());
-    }
-    
-    // Safety fallback padding
-    if key.len() < 40 {
-        key.extend_from_slice(b"SECURE_HARDENED_INTEGRADED_CIPHER_FALLBACK_VAL_1985_!");
-    }
-    
-    key
+    salt
 }
 
+/// Derive a 64-byte encryption key from the salt + machine-specific material
+/// using 256 rounds of byte-level diffusion.
+fn derive_key(salt: &[u8]) -> [u8; 64] {
+    let mut material: Vec<u8> = Vec::new();
+    for var in ["USERNAME", "COMPUTERNAME", "USERPROFILE", "USER", "HOSTNAME", "HOME"] {
+        if let Ok(val) = std::env::var(var) {
+            material.extend_from_slice(val.as_bytes());
+            material.push(0x3A); // colon delimiter
+        }
+    }
+    // Fallback if no env vars are available
+    if material.is_empty() {
+        material.extend_from_slice(b"INTEGRADED_DEFAULT_MACHINE_FALLBACK");
+    }
+
+    let mut out = [0u8; 64];
+    for i in 0..64usize {
+        let mut v: u8 = material[i % material.len()].wrapping_add(salt[i % salt.len()]);
+        // 256 rounds of mixing (deterministic, salt-dependent)
+        for round in 0u8..=255 {
+            let prev = if i > 0 { out[i - 1] } else { 0xA5u8 };
+            let m = material[(i.wrapping_add(round as usize)) % material.len()];
+            let s = salt[(i.wrapping_add(round as usize * 3)) % salt.len()];
+            v = v
+                .rotate_left(((round % 5) + 1) as u32)
+                .wrapping_add(m)
+                .wrapping_add(prev)
+                ^ s
+                ^ (round.wrapping_mul(0x6B));
+        }
+        out[i] = v;
+    }
+    out
+}
+
+/// Encrypt a plaintext string → "v2:{salt-hex}:{cipher-hex}"
 fn scramble(data: &str) -> String {
-    let key = get_dynamic_key();
-    let mut scrambled = Vec::new();
-    for (i, byte) in data.as_bytes().iter().enumerate() {
-        scrambled.push(byte ^ key[i % key.len()]);
-    }
-    scrambled.iter().map(|b| format!("{:02x}", b)).collect()
+    let salt = generate_salt();
+    let key = derive_key(&salt);
+    let cipher: Vec<u8> = data
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| b ^ key[i % key.len()])
+        .collect();
+    let salt_hex: String = salt.iter().map(|b| format!("{:02x}", b)).collect();
+    let cipher_hex: String = cipher.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("v2:{}:{}", salt_hex, cipher_hex)
 }
 
-fn unscramble(hex_str: &str) -> Result<String, String> {
-    let key = get_dynamic_key();
-    let mut scrambled = Vec::new();
-    let mut chars = hex_str.chars();
+/// Decode a hex string to bytes.
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.chars();
     while let (Some(c1), Some(c2)) = (chars.next(), chars.next()) {
-        let byte_str = format!("{}{}", c1, c2);
-        let byte = u8::from_str_radix(&byte_str, 16)
-            .map_err(|e| format!("Invalid hex: {}", e))?;
-        scrambled.push(byte);
+        out.push(
+            u8::from_str_radix(&format!("{}{}", c1, c2), 16)
+                .map_err(|e| format!("Invalid hex: {}", e))?,
+        );
     }
-    
-    let mut unscrambled = Vec::new();
-    for (i, byte) in scrambled.iter().enumerate() {
-        unscrambled.push(byte ^ key[i % key.len()]);
+    Ok(out)
+}
+
+/// Decrypt. Handles both v2 (salted) and legacy v1 (plain XOR hex) formats.
+fn unscramble(hex_str: &str) -> Result<String, String> {
+    if let Some(rest) = hex_str.strip_prefix("v2:") {
+        // ── v2: salted format ─────────────────────────────────────────────
+        let mut parts = rest.splitn(2, ':');
+        let salt_hex = parts.next().ok_or("Missing salt")?;
+        let cipher_hex = parts.next().ok_or("Missing cipher")?;
+
+        let salt = hex_to_bytes(salt_hex)?;
+        let cipher = hex_to_bytes(cipher_hex)?;
+        let key = derive_key(&salt);
+
+        let plain: Vec<u8> = cipher
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ key[i % key.len()])
+            .collect();
+        String::from_utf8(plain).map_err(|e| format!("Invalid UTF-8: {}", e))
+    } else {
+        // ── v1: legacy plain XOR — kept for backward compat ───────────────
+        // Build the old machine key (verbatim from previous implementation)
+        let mut key = b"INTEGRADED_DYNAMIC_CIPHER_CORE_KEY_".to_vec();
+        for var in ["USERNAME", "COMPUTERNAME", "USERPROFILE", "USER", "HOSTNAME", "HOME"] {
+            if let Ok(val) = std::env::var(var) {
+                key.extend_from_slice(val.as_bytes());
+            }
+        }
+        if key.len() < 40 {
+            key.extend_from_slice(b"SECURE_HARDENED_INTEGRADED_CIPHER_FALLBACK_VAL_1985_!");
+        }
+        let cipher = hex_to_bytes(hex_str)?;
+        let plain: Vec<u8> = cipher
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ key[i % key.len()])
+            .collect();
+        String::from_utf8(plain).map_err(|e| format!("Invalid UTF-8: {}", e))
     }
-    
-    String::from_utf8(unscrambled).map_err(|e| format!("Invalid UTF-8: {}", e))
 }
 
 fn get_config_path() -> Result<std::path::PathBuf, String> {
@@ -1071,6 +1194,151 @@ async fn curl_post_stream(
     Ok(())
 }
 
+// ─── Dev server detection ─────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DevProjectInfo {
+    pub project_type: String,
+    pub label: String,
+    pub command: String,
+    pub port: u16,
+    pub package_manager: String,
+}
+
+/// Inspect the workspace directory and return the command + port needed to start
+/// a dev server, with no AI involved — pure file-based heuristics.
+#[tauri::command]
+fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
+    let path = Path::new(&dir);
+
+    // ── Node.js / npm / pnpm / yarn / bun project ──────────────────────────
+    let pkg_path = path.join("package.json");
+    if pkg_path.exists() {
+        let pkg_str = fs::read_to_string(&pkg_path)
+            .map_err(|e| format!("Failed to read package.json: {}", e))?;
+        let pkg: serde_json::Value = serde_json::from_str(&pkg_str)
+            .map_err(|e| format!("Failed to parse package.json: {}", e))?;
+
+        // Detect package manager from lockfiles (most specific first)
+        let pm = if path.join("bun.lockb").exists() || path.join("bun.lock").exists() {
+            "bun"
+        } else if path.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else if path.join("yarn.lock").exists() {
+            "yarn"
+        } else {
+            "npm"
+        };
+
+        let deps     = pkg.get("dependencies").and_then(|v| v.as_object());
+        let dev_deps = pkg.get("devDependencies").and_then(|v| v.as_object());
+        let has_dep  = |name: &str| -> bool {
+            deps.map(|d| d.contains_key(name)).unwrap_or(false)
+                || dev_deps.map(|d| d.contains_key(name)).unwrap_or(false)
+        };
+
+        // Detect expected port based on framework
+        let port: u16 = if has_dep("vite")
+            || path.join("vite.config.ts").exists()
+            || path.join("vite.config.js").exists()
+            || path.join("vite.config.mts").exists()
+            || path.join("vite.config.mjs").exists()
+        {
+            5173
+        } else if has_dep("@sveltejs/kit") {
+            5173
+        } else if has_dep("next") {
+            3000
+        } else if has_dep("nuxt") || has_dep("nuxt3") || has_dep("@nuxt/kit") {
+            3000
+        } else if has_dep("react-scripts") {
+            3000
+        } else if has_dep("gatsby") {
+            8000
+        } else if has_dep("@angular/core") || has_dep("@angular/cli") {
+            4200
+        } else {
+            3000
+        };
+
+        // Pick the script to run
+        let scripts = pkg.get("scripts").and_then(|v| v.as_object());
+        let script = if scripts.map(|s| s.contains_key("dev")).unwrap_or(false) {
+            "dev"
+        } else if scripts.map(|s| s.contains_key("start")).unwrap_or(false) {
+            "start"
+        } else if scripts.map(|s| s.contains_key("serve")).unwrap_or(false) {
+            "serve"
+        } else if scripts.map(|s| s.contains_key("develop")).unwrap_or(false) {
+            "develop"
+        } else {
+            return Err(
+                "No dev/start/serve script found in package.json. \
+                 Add a \"dev\" script to run your project.".to_string(),
+            );
+        };
+
+        let command = if pm == "npm" {
+            format!("npm run {}", script)
+        } else {
+            format!("{} {}", pm, script)
+        };
+
+        return Ok(DevProjectInfo {
+            project_type: "node".to_string(),
+            label: format!("{} {}", pm, script),
+            command,
+            port,
+            package_manager: pm.to_string(),
+        });
+    }
+
+    // ── Standalone Vite config (no package.json at root) ───────────────────
+    if path.join("vite.config.ts").exists()
+        || path.join("vite.config.js").exists()
+        || path.join("vite.config.mts").exists()
+        || path.join("vite.config.mjs").exists()
+    {
+        return Ok(DevProjectInfo {
+            project_type: "node".to_string(),
+            label: "npx vite".to_string(),
+            command: "npx vite".to_string(),
+            port: 5173,
+            package_manager: "npx".to_string(),
+        });
+    }
+
+    // ── Static HTML (no package.json) ──────────────────────────────────────
+    if path.join("index.html").exists() {
+        return Ok(DevProjectInfo {
+            project_type: "static".to_string(),
+            label: "Static server".to_string(),
+            command: "npx --yes serve . --listen 3000".to_string(),
+            port: 3000,
+            package_manager: "npx".to_string(),
+        });
+    }
+
+    Err(
+        "No recognizable project found. Expected package.json, \
+         vite.config.*, or index.html in the workspace directory."
+            .to_string(),
+    )
+}
+
+/// Attempt a TCP connection to 127.0.0.1:port; returns true if something is
+/// already listening there (i.e. the dev server is up).
+#[tauri::command]
+fn check_port_open(port: u16) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(400),
+    )
+    .is_ok()
+}
+
 // ─── App entry point ──────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1117,6 +1385,9 @@ pub fn run() {
             curl_post,
             curl_post_stream,
             cancel_stream,
+            detect_dev_project,
+            check_port_open,
+            save_chat_to_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

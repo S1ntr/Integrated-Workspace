@@ -1173,14 +1173,24 @@ export const ChatPanel: React.FC<{
     });
   };
 
+  // ── Persistence helpers ───────────────────────────────────────────────────────
+
+  // Save to both the global home-dir store AND the workspace's date-organised folder.
+  function persistPayload(payload: string) {
+    invoke("save_chat_history", { jsonData: payload, scope: chatScopeKey }).catch(() => {});
+    if (workspaceDir) {
+      invoke("save_chat_to_workspace", { workspaceDir, jsonData: payload }).catch(() => {});
+    }
+  }
+
   // Persistence synchronizations
   useEffect(() => {
     if (!historyHydrated) return;
     try {
       localStorage.setItem(storageKey("current_msgs"), JSON.stringify(normalizeMessages(msgs)));
     } catch {}
-    const payload = buildHistoryPayload(msgs, contextWindow, histories);
-    invoke("save_chat_history", { jsonData: payload, scope: chatScopeKey }).catch(() => {});
+    persistPayload(buildHistoryPayload(msgs, contextWindow, histories));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msgs, contextWindow, historyHydrated, chatScopeKey]);
 
   useEffect(() => {
@@ -1188,8 +1198,8 @@ export const ChatPanel: React.FC<{
     try {
       localStorage.setItem(storageKey("histories"), JSON.stringify(histories));
     } catch {}
-    const payload = buildHistoryPayload(msgs, contextWindow, histories);
-    invoke("save_chat_history", { jsonData: payload, scope: chatScopeKey }).catch(() => {});
+    persistPayload(buildHistoryPayload(msgs, contextWindow, histories));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [histories, contextWindow, msgs, currentChatMeta, historyHydrated, chatScopeKey]);
 
   useEffect(() => {
