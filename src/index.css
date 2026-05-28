@@ -785,8 +785,11 @@ input, textarea { font-family: var(--font-ui); }
   border-bottom: 1px solid var(--bg-4);
   background: var(--bg-base);
 }
+.browser-toolbar.mode-web {
+  grid-template-columns: auto minmax(180px, 1fr) auto auto;
+}
 .browser-nav, .browser-tool-group, .browser-device-strip, .browser-mode-switch { display: flex; align-items: center; gap: 3px; min-width: 0; }
-.browser-icon-btn, .browser-tool-btn, .browser-device-btn, .browser-mode-switch button, .browser-native-btn, .browser-current-project-btn {
+.browser-icon-btn, .browser-tool-btn, .browser-device-btn, .browser-mode-switch button, .browser-current-project-btn {
   height: 28px;
   border: 1px solid transparent;
   border-radius: var(--radius-xs);
@@ -800,7 +803,6 @@ input, textarea { font-family: var(--font-ui); }
 .browser-tool-btn:hover,
 .browser-device-btn:hover,
 .browser-mode-switch button:hover,
-.browser-native-btn:hover:not(:disabled),
 .browser-current-project-btn:hover { color: var(--text-1); background: var(--bg-3); border-color: var(--bg-5); }
 .browser-icon-btn:disabled { opacity: 0.35; cursor: default; }
 .browser-icon-btn .spin { animation: spin 0.8s linear infinite; }
@@ -853,6 +855,15 @@ input, textarea { font-family: var(--font-ui); }
 .browser-tool-btn i { font-size: 13px; }
 .browser-tool-btn.active,
 .browser-device-btn.active { color: var(--text-1); background: var(--accent-subtle); border-color: var(--accent-border); }
+.browser-tool-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+.browser-tool-btn:disabled:hover {
+  color: var(--text-3);
+  background: transparent;
+  border-color: transparent;
+}
 .browser-device-strip { overflow-x: auto; scrollbar-width: none; }
 .browser-device-strip::-webkit-scrollbar { display: none; }
 .browser-device-btn {
@@ -861,16 +872,6 @@ input, textarea { font-family: var(--font-ui); }
   white-space: nowrap;
   font-size: 10.5px;
 }
-.browser-native-btn {
-  gap: 5px;
-  padding: 0 10px;
-  color: var(--text-2);
-  background: var(--bg-1);
-  border-color: var(--bg-5);
-  font-size: 10.5px;
-  font-weight: 600;
-}
-.browser-native-btn:disabled { opacity: 0.4; cursor: default; }
 .browser-current-project-btn {
   gap: 6px;
   padding: 0 10px;
@@ -966,7 +967,7 @@ input, textarea { font-family: var(--font-ui); }
   background: var(--text-1); color: var(--bg-base);
 }
 .browser-start-project,
-.browser-native-actions button {
+.browser-webview-status button {
   height: 30px;
   display: inline-flex;
   align-items: center;
@@ -981,8 +982,20 @@ input, textarea { font-family: var(--font-ui); }
   font-weight: 700;
 }
 .browser-start-project:hover,
-.browser-native-actions button:hover { background: var(--bg-3); }
-.browser-native-page {
+.browser-webview-status button:hover { background: var(--bg-3); }
+.browser-webview-host {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  background: #fff;
+}
+.browser-webview-host.ready {
+  background: transparent;
+}
+.browser-webview-status {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
   width: 100%; height: 100%;
   display: flex;
   flex-direction: column;
@@ -996,8 +1009,13 @@ input, textarea { font-family: var(--font-ui); }
   color: var(--text-3);
   text-align: center;
 }
-.browser-native-page > i { font-size: 32px; color: var(--text-2); }
-.browser-native-actions { display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.browser-webview-status > i { font-size: 30px; color: var(--text-2); }
+.browser-webview-status.error {
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)),
+    var(--bg-base);
+}
+.browser-webview-status.error > i { color: var(--danger); }
 .browser-select-layer {
   position: absolute; inset: 0;
   z-index: 5;
@@ -1023,20 +1041,6 @@ input, textarea { font-family: var(--font-ui); }
   pointer-events: none;
 }
 .browser-selection-box.element { border-color: var(--accent-bright); background: rgba(212,212,212,0.18); }
-.browser-native-fallback {
-  position: absolute;
-  right: 12px;
-  top: 12px;
-  z-index: 4;
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid var(--bg-5);
-  border-radius: var(--radius-sm);
-  background: rgba(12,12,12,0.82);
-  color: #f3f3f3;
-  font-size: 10.5px;
-  box-shadow: var(--shadow-md);
-}
 .browser-selection-popover {
   position: absolute;
   z-index: 12;
@@ -1232,11 +1236,12 @@ input, textarea { font-family: var(--font-ui); }
     grid-template-columns: auto minmax(110px, 1fr) auto auto auto;
     gap: 6px;
   }
+  .browser-toolbar.mode-web {
+    grid-template-columns: auto minmax(110px, 1fr) auto auto;
+  }
   .browser-current-project-btn span,
-  .browser-tool-btn span,
-  .browser-native-btn span { display: none; }
-  .browser-current-project-btn,
-  .browser-native-btn { padding: 0 8px; }
+  .browser-tool-btn span { display: none; }
+  .browser-current-project-btn { padding: 0 8px; }
   .browser-device-strip {
     grid-column: 1 / -1;
     width: 100%;
