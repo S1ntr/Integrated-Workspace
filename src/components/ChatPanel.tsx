@@ -493,7 +493,7 @@ If your model has trouble with XML, a fenced JSON block named tool_call is also 
 9. Browser feedback may include a URL, viewport, selected element/region, and user note. Use that context to prompt agents with precise visual/UI fixes.
 10. When an agent finishes, convert its terminal output into a concise visible summary of changed files, integrations, tests, and remaining risks. Do not show a question card unless the terminal is clearly waiting for user input.
 11. After dispatching, briefly summarize what each agent is doing (visible to user)
-12. The user may mention files with @filename. Pass exact mentioned paths to agents and tell them to inspect those files before editing.
+12. The user may mention files with @filename, @path/file, or quoted @"path with spaces". Pass exact resolved paths to agents and tell them to inspect those files before editing. If a mention is unresolved, tell the agent to locate it with workspace search before touching files.
 13. If the task is naturally parallel and multiple agents are already open, split it across those agents. If there are not enough useful agents, use agent.request.
 
 ## Session Context Window
@@ -563,18 +563,63 @@ function formatToolLogBody(log: ToolCallLog): string {
   return `Tool call - ${log.action.type} -> ${target}\nStatus: ${log.status}${note ? `\n${compactText(note, 420)}` : ""}`;
 }
 
+function toolLogTarget(log: ToolCallLog): string {
+  if (log.action.type === "browser_open") return log.action.url || log.action.label;
+  if (log.action.type === "request") return `${log.action.count || 1} ${log.action.agentType || "agent"}`;
+  if (log.action.type === "mode") return `${log.action.label} -> ${log.action.agentType || log.action.mode || "mode"}`;
+  return log.action.label;
+}
+
+function toolLogNote(log: ToolCallLog): string {
+  const raw = log.note || log.action.prompt || log.action.reason || log.action.url || log.action.question || "";
+  if (/^sent to\b/i.test(raw.trim())) return "";
+  return compactText(raw, 360);
+}
+
+function cleanMentionToken(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^[@`"'\[]+|[`"',.!?\]]+$/g, "")
+    .replace(/^\.\//, "")
+    .trim();
+}
+
+function normalizeMentionPath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
+}
+
+function fileBaseName(name: string): string {
+  return name.replace(/\.[^.]+$/, "").toLowerCase();
+}
+
 function parseFileMentions(text: string, files: MentionFile[]): ChatAttachment[] {
-  if (!text.includes("@") || !files.length) return [];
-  const tokens = Array.from(text.matchAll(/@([^\s,;:)]+)/g)).map(m => m[1].replace(/^["']|["']$/g, "").replace(/[.!?]+$/g, ""));
+  if (!text.includes("@")) return [];
+  const mentionRegex = /(?:^|[\s([{])@(?:"([^"]+)"|'([^']+)'|`([^`]+)`|([^\s,;:)]+))/g;
+  const tokens = Array.from(text.matchAll(mentionRegex))
+    .map(m => cleanMentionToken(m[1] || m[2] || m[3] || m[4] || ""))
+    .filter(Boolean);
   const found: ChatAttachment[] = [];
   const used = new Set<string>();
   for (const token of tokens) {
     const lower = token.toLowerCase();
-    const match = files.find(file =>
-      file.name.toLowerCase() === lower ||
-      file.path.toLowerCase().endsWith(lower.replace(/\//g, "\\").replace(/^\\/, "")) ||
-      file.path.toLowerCase().endsWith(lower.replace(/\\/g, "/").replace(/^\//, ""))
-    );
+    const wantedPath = normalizeMentionPath(token);
+    const wantedBase = fileBaseName(lower.split(/[\\/]/).pop() || lower);
+    const match = files
+      .map(file => {
+        const path = normalizeMentionPath(file.path);
+        const name = file.name.toLowerCase();
+        const base = fileBaseName(file.name);
+        let score = 0;
+        if (path === wantedPath) score = 100;
+        else if (name === lower) score = 92;
+        else if (base === wantedBase) score = 84;
+        else if (path.endsWith(`/${wantedPath}`) || path.endsWith(wantedPath)) score = 76;
+        else if (path.includes(wantedPath) && wantedPath.length >= 4) score = 52;
+        else if (name.includes(lower) && lower.length >= 3) score = 42;
+        return { file, score };
+      })
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score)[0]?.file;
     if (match && !used.has(match.path)) {
       used.add(match.path);
       found.push({
@@ -583,6 +628,14 @@ function parseFileMentions(text: string, files: MentionFile[]): ChatAttachment[]
         name: match.name,
         path: match.path,
         detail: `Mentioned by @${token}`,
+      });
+    } else if (!match && !used.has(`unresolved:${token}`)) {
+      used.add(`unresolved:${token}`);
+      found.push({
+        id: `file-missing-${Date.now()}-${found.length}`,
+        type: "file",
+        name: token,
+        detail: `Unresolved @${token} mention. Agent should locate this file in the workspace before editing.`,
       });
     }
   }
@@ -671,6 +724,7 @@ export const ChatPanel: React.FC<{
 
   // ── Refs ─────────────────────────────────────────────────────────────────────
   const endRef = useRef<HTMLDivElement>(null);
+  const chatPanelRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<any>(null);
@@ -678,6 +732,7 @@ export const ChatPanel: React.FC<{
   const streamTextRef = useRef("");
   const streamThinkingRef = useRef("");
   const streamThinkingStartRef = useRef(0);
+  const streamThinkingElapsedRef = useRef<number | null>(null);
   const activeStreamIdRef = useRef<string | null>(null);
 
   const onSendPtyCommandRef = useRef(onSendPtyCommand);
@@ -717,7 +772,15 @@ export const ChatPanel: React.FC<{
 
   // ── Effects ──────────────────────────────────────────────────────────────────
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    requestAnimationFrame(() => {
+      const bodies = chatPanelRef.current?.querySelectorAll<HTMLElement>(".chat-thinking.open .chat-thinking-body");
+      bodies?.forEach(body => {
+        body.scrollTop = body.scrollHeight;
+      });
+    });
+  }, [msgs]);
 
   useEffect(() => {
     const last = msgs[msgs.length - 1];
@@ -1076,27 +1139,31 @@ export const ChatPanel: React.FC<{
     streamTextRef.current = "";
     streamThinkingRef.current = "";
     streamThinkingStartRef.current = Date.now();
+    streamThinkingElapsedRef.current = null;
 
     streamUnlistenRef.current = (await listen<string>(`stream-chunk-${sid}`, (e) => {
       if (activeStreamIdRef.current !== sid) return;
       const thinkingDelta = parseStreamThinking(e.payload, req.provider);
       if (thinkingPreviewEnabled && thinkingDelta) {
         streamThinkingRef.current += thinkingDelta;
-        const elapsedMs = Date.now() - streamThinkingStartRef.current;
+        const elapsedMs = streamThinkingElapsedRef.current ?? Date.now() - streamThinkingStartRef.current;
         setMsgs(p => p.map(m => m.id === msgId ? {
           ...m,
-          thinking: { text: streamThinkingRef.current, elapsedMs, open: true },
+          thinking: { text: streamThinkingRef.current, elapsedMs, open: m.thinking?.open ?? true, done: false },
         } : m));
       }
       const delta = parseStreamDelta(e.payload, req.provider);
       if (delta) {
         streamTextRef.current += delta;
-        const elapsedMs = Date.now() - streamThinkingStartRef.current;
+        if (streamThinkingElapsedRef.current === null) {
+          streamThinkingElapsedRef.current = Math.max(0, Date.now() - streamThinkingStartRef.current);
+        }
+        const elapsedMs = streamThinkingElapsedRef.current;
         setMsgs(p => p.map(m => m.id === msgId ? {
           ...m,
           body: visibleStreamText(streamTextRef.current),
           thinking: thinkingPreviewEnabled
-            ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: false, done: true }
+            ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: m.thinking?.open ?? false, done: true }
             : m.thinking,
         } : m));
       }
@@ -1108,13 +1175,14 @@ export const ChatPanel: React.FC<{
       activeStreamIdRef.current = null;
       streamUnlistenRef.current?.();
       streamUnlistenRef.current = null;
-      const elapsedMs = Math.max(0, Date.now() - streamThinkingStartRef.current);
+      const elapsedMs = streamThinkingElapsedRef.current ?? Math.max(0, Date.now() - streamThinkingStartRef.current);
+      streamThinkingElapsedRef.current = elapsedMs;
       setMsgs(p => p.map(m => m.id === msgId ? {
         ...m,
         streaming: false,
         body: visibleStreamText(streamTextRef.current),
         thinking: thinkingPreviewEnabled
-          ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: false, done: true }
+          ? { text: streamThinkingRef.current || "Working through the request and active agent context.", elapsedMs, open: m.thinking?.open ?? false, done: true }
           : m.thinking,
       } : m));
     }
@@ -1128,12 +1196,13 @@ export const ChatPanel: React.FC<{
     streamUnlistenRef.current?.();
     streamUnlistenRef.current = null;
     setIsProcessing(false);
-    const elapsedMs = Math.max(0, Date.now() - streamThinkingStartRef.current);
+    const elapsedMs = streamThinkingElapsedRef.current ?? Math.max(0, Date.now() - streamThinkingStartRef.current);
+    streamThinkingElapsedRef.current = elapsedMs;
     setMsgs(p => p.map(m => m.streaming ? {
       ...m,
       streaming: false,
       body: visibleStreamText(streamTextRef.current),
-      thinking: m.thinking ? { ...m.thinking, elapsedMs, open: false, done: true } : m.thinking,
+      thinking: m.thinking ? { ...m.thinking, elapsedMs, open: m.thinking.open, done: true } : m.thinking,
     } : m));
   };
 
@@ -1481,6 +1550,21 @@ export const ChatPanel: React.FC<{
     );
   };
 
+  const renderToolLog = (log: ToolCallLog) => {
+    const note = toolLogNote(log);
+    return (
+      <div className={`chat-tool-message status-${log.status}`}>
+        <div className="chat-tool-message-row">
+          <span className="chat-tool-status">{log.status}</span>
+          <span className="chat-tool-action">{log.action.type.replace("_", ".")}</span>
+          <span className="chat-tool-arrow">{"->"}</span>
+          <span className="chat-tool-target">{toolLogTarget(log)}</span>
+        </div>
+        {note && <div className="chat-tool-message-note">{note}</div>}
+      </div>
+    );
+  };
+
   const toggleThinking = (msgId: string) => {
     setMsgs(prev => prev.map(msg => msg.id === msgId && msg.thinking
       ? { ...msg, thinking: { ...msg.thinking, open: !msg.thinking.open } }
@@ -1489,12 +1573,15 @@ export const ChatPanel: React.FC<{
   };
 
   return (
-    <div className={`chat-panel ${embedded ? "embedded" : ""}`}>
+    <div ref={chatPanelRef} className={`chat-panel ${embedded ? "embedded" : ""}`}>
 
       {/* ── Header ── */}
       <div className="chat-panel-header">
         <div className="chat-header-left">
-          <span className={`chat-header-dot ${models.length > 0 ? "online" : "offline"}`} />
+          <span className="chat-header-logo-wrap">
+            <img src="/logo.svg" className="chat-header-logo" alt="" />
+            <span className={`chat-header-dot ${models.length > 0 ? "online" : "offline"}`} />
+          </span>
           <span className="chat-header-title">Integraded Chat</span>
         </div>
 
@@ -1689,7 +1776,13 @@ export const ChatPanel: React.FC<{
               <div key={m.id} className={`chat-msg ${m.agent || "ai"}`}>
                 <div className="chat-msg-ai-wrap">
                   <span className={`chat-avatar ${m.agent || "ai"}`}>
-                    <i className={`bx ${m.agent === "system" ? "bx-error-circle" : m.agent === "tool" ? "bx-list-check" : "bx-robot"}`} />
+                    {m.agent === "system" ? (
+                      <i className="bx bx-error-circle" />
+                    ) : m.agent === "tool" ? (
+                      <i className="bx bx-list-check" />
+                    ) : (
+                      <img src="/logo.svg" className="chat-avatar-logo" alt="" />
+                    )}
                   </span>
                   <div className="chat-msg-ai-content">
                     <div className="chat-msg-meta">
@@ -1707,33 +1800,10 @@ export const ChatPanel: React.FC<{
                         </div>
                       )}
                       <div className="chat-bubble-body">
-                        {m.body ? formatBody(m.body) : null}
+                        {m.agent === "tool" && m.toolLog ? renderToolLog(m.toolLog) : (m.body ? formatBody(m.body) : null)}
                         {renderAttachments(m.attachments)}
                         {m.streaming && <span className="chat-stream-cursor" />}
                       </div>
-                      {m.actions && m.actions.length > 0 && !m.streaming && (
-                        <div className="chat-dispatch">
-                          <div className="chat-dispatch-title"><i className="bx bx-chip" /> Dispatched</div>
-                          {m.actions.map((a, i) => (
-                            <div key={i} className={`chat-dispatch-card dispatch-${a.type}`}>
-                              <div className="chat-dispatch-header">
-                                <span className={`chat-dispatch-type dispatch-type-${a.type}`}>{a.type}</span>
-                                <span className="chat-dispatch-label">{a.label}</span>
-                                {a.agentType && <span className="chat-dispatch-agent">{a.agentType}</span>}
-                                <i className="bx bx-check-circle chat-dispatch-ok" />
-                              </div>
-                              {(a.prompt || a.question || a.reason || a.url) && (
-                                <div className="chat-dispatch-prompt">
-                                  {(() => {
-                                    const preview = a.prompt || a.question || a.reason || a.url || "";
-                                    return preview.length > 130 ? preview.slice(0, 130) + "..." : preview;
-                                  })()}
-                                </div>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
                     </div>
                   </div>
                 </div>
@@ -1745,7 +1815,7 @@ export const ChatPanel: React.FC<{
         {isProcessing && !msgs.some(m => m.streaming) && (
           <div className="chat-msg orchestrator">
             <div className="chat-msg-ai-wrap">
-              <span className="chat-avatar orchestrator"><i className="bx bx-robot" /></span>
+              <span className="chat-avatar orchestrator"><img src="/logo.svg" className="chat-avatar-logo" alt="" /></span>
               <div className="chat-msg-ai-content">
                 <div className="chat-msg-meta">
                   <span className="chat-sender">Integraded</span>
