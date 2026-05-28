@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Sidebar, FileEntry } from "./Sidebar";
-import { ChatPanel, type TerminalTranscriptEntry } from "./ChatPanel";
+import { ChatPanel, type MentionFile, type TerminalTranscriptEntry } from "./ChatPanel";
 import { BrowserOverlay } from "./BrowserOverlay";
 import { TerminalGrid, Session } from "./TerminalGrid";
 import { ChangesViewer, ChangedFile } from "./ChangesViewer";
@@ -131,6 +131,7 @@ interface RightPanelProps {
   onAddSession: (label: string, command: string) => Session;
   onCloseSession: (id: number) => void;
   onRestartSession?: (id: number) => string;
+  onChangeSessionAgent?: (id: number, label: string, command: string, restart?: boolean) => string | void;
 }
 
 const RightPanel: React.FC<RightPanelProps> = ({
@@ -146,6 +147,7 @@ const RightPanel: React.FC<RightPanelProps> = ({
   onAddSession,
   onCloseSession,
   onRestartSession,
+  onChangeSessionAgent,
 }) => {
   const [tab, setTab] = useState<"chat" | "file">("chat");
   const [browserOpen, setBrowserOpen] = useState(false);
@@ -161,6 +163,17 @@ const RightPanel: React.FC<RightPanelProps> = ({
     }
     return Array.from(urls).slice(0, 6);
   }, [terminalOutputs]);
+
+  const mentionFiles = React.useMemo<MentionFile[]>(() => {
+    const map = new Map<string, MentionFile>();
+    for (const path of Object.keys(baselineSnapshot)) {
+      map.set(path, { path, name: path.split(/[\\/]/).pop() || path });
+    }
+    for (const file of changedFiles) {
+      map.set(file.path, { path: file.path, name: file.name });
+    }
+    return Array.from(map.values());
+  }, [baselineSnapshot, changedFiles]);
 
   const openBrowser = (request?: Omit<BrowserOpenRequest, "id"> | BrowserOpenRequest) => {
     setBrowserRequest({
@@ -207,10 +220,12 @@ const RightPanel: React.FC<RightPanelProps> = ({
             terminalOutputs={terminalOutputs}
             terminalTranscripts={terminalTranscripts}
             externalPrompt={externalPrompt}
+            mentionFiles={mentionFiles}
             onSendPtyCommand={onSendPtyCommand}
             onAddSession={onAddSession}
             onCloseSession={onCloseSession}
             onRestartSession={onRestartSession}
+            onChangeSessionAgent={onChangeSessionAgent}
             onOpenBrowser={openBrowser}
           />
         ) : (
@@ -227,9 +242,9 @@ const RightPanel: React.FC<RightPanelProps> = ({
         suggestedUrls={suggestedUrls}
         workspaceName={directory.split(/[\\/]/).pop() || directory}
         onClose={() => setBrowserOpen(false)}
-        onSendToChat={(text) => {
+        onSendToChat={(payload) => {
           setTab("chat");
-          setExternalPrompt({ id: `browser-prompt-${Date.now()}`, text });
+          setExternalPrompt({ id: `browser-prompt-${Date.now()}`, ...payload });
         }}
       />
     </div>
@@ -460,11 +475,13 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     setSessions(prev => prev.filter(s => s.id !== termId));
   };
 
-  const changeSessionAgent = (termId: number, label: string, command: string, restart = true) => {
+  const changeSessionAgent = (termId: number, label: string, command: string, restart = true): string | void => {
     let finalCommand = command;
     if (command === "claude" && localStorage.getItem("__integraded_claude_skip_permissions") !== "0") {
       finalCommand = "claude --dangerously-skip-permissions";
     }
+    const newSessionId = restart ? `pty-${termId}-${Date.now()}` : undefined;
+    const currentSessionId = sessions.find(s => s.id === termId)?.sessionId;
     setSessions(prev => prev.map(s => {
       if (s.id === termId) {
         return {
@@ -473,11 +490,12 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
           command: finalCommand,
           // Only generate new sessionId (= PTY restart) when explicitly requested.
           // Keeping the same sessionId preserves agent context.
-          sessionId: restart ? `pty-${termId}-${Date.now()}` : s.sessionId,
+          sessionId: restart ? newSessionId! : s.sessionId,
         };
       }
       return s;
     }));
+    return newSessionId || currentSessionId;
   };
 
   const swapSessions = (idA: number, idB: number) => {
@@ -665,6 +683,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
               onAddSession={addSession}
               onCloseSession={closeSession}
               onRestartSession={restartSession}
+              onChangeSessionAgent={changeSessionAgent}
             />
           </>
         )}

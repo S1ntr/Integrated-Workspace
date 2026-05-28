@@ -529,7 +529,13 @@ pub struct AppConfig {
     pub cloud_provider: String,
     pub active_model: String,
     pub streaming: bool,
+    #[serde(default = "default_true")]
+    pub thinking_preview: bool,
     pub api_keys: HashMap<String, String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ─── Machine-Bound Dynamic Cipher (Remediation for Hardcoded Secret Keys) ─────
@@ -664,6 +670,7 @@ fn load_config() -> Result<AppConfig, String> {
             cloud_provider: "openai".to_string(),
             active_model: "".to_string(),
             streaming: true,
+            thinking_preview: true,
             api_keys: HashMap::new(),
         });
     }

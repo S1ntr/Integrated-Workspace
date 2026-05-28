@@ -12,6 +12,7 @@ interface AppConfig {
   cloud_provider: string;
   active_model: string;
   streaming: boolean;
+  thinking_preview: boolean;
   api_keys?: Record<string, string>;
 }
 
@@ -138,6 +139,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
     cloud_provider: "openai",
     active_model: "",
     streaming: true,
+    thinking_preview: true,
     api_keys: {},
   });
 
@@ -171,6 +173,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
           cloud_provider: loaded.cloud_provider || "openai",
           active_model: loaded.active_model || "",
           streaming: loaded.streaming ?? true,
+          thinking_preview: loaded.thinking_preview ?? true,
           api_keys: loaded.api_keys || {},
         });
         Object.entries(loaded.api_keys || {}).forEach(([k, v]) => {
@@ -463,11 +466,17 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                   <span>Response Behavior</span>
                 </div>
                 <div className="stng-section-body">
-                   <Toggle
+                  <Toggle
                     label="Streaming responses"
                     desc="Show AI responses word-by-word as they generate instead of waiting for the full response"
                     checked={config.streaming}
                     onChange={v => setConfig(prev => ({ ...prev, streaming: v }))}
+                  />
+                  <Toggle
+                    label="Thinking preview"
+                    desc="Show the model thinking phase as a collapsible live preview while streaming"
+                    checked={config.thinking_preview}
+                    onChange={v => setConfig(prev => ({ ...prev, thinking_preview: v }))}
                   />
                 </div>
               </div>
