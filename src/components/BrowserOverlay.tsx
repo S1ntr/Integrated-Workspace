@@ -529,7 +529,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     if (devAbortRef.current) throw new Error("cancelled");
     throw new Error(
       `Dev server did not respond on port ${port} within ${Math.round(timeoutMs / 1000)}s.\n` +
-      `Check the terminal for error output.`,
+      `The process may have failed to start or is taking longer than expected.`,
     );
   }
 
@@ -574,9 +574,10 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
         return;
       }
 
-      // Step 3 — start the dev server in a terminal session
+      // Step 3 — start the dev server silently in the background
       setDevStatus("starting");
-      onAutoStartSession?.(info.label, info.command);
+      await invoke("start_dev_server_background", { dir: directory, command: info.command });
+      if (devAbortRef.current) return;
 
       // Step 4 — wait up to 60s for the port to open
       setDevStatus("waiting");
@@ -608,7 +609,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
         "",
         `Error: ${devError}`,
         "",
-        "Check the terminal session for the full error output. Common causes: missing dependencies (run install first), port already in use, or a syntax error in the project.",
+        "Common causes: missing dependencies (run the install command first), port already in use, or a syntax error in the project.",
       ].filter(Boolean).join("\n"),
     });
     setDevStatus("idle");
@@ -1006,9 +1007,6 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                       <span className="browser-autostart-cmd">
                         <i className="bx bx-terminal" /> {devInfo.command}
                       </span>
-                    )}
-                    {devStatus === "waiting" && (
-                      <span>Check the terminal panel for startup output</span>
                     )}
                     <button
                       type="button"

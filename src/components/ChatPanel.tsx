@@ -656,15 +656,12 @@ function buildAgentsReadySummary(
   const urls = extractLocalUrls(outputs).map(url => `- ${url}`);
   const active = sessions.map(s => `- ${s.label} (${s.status || "unknown"})`).slice(0, 8);
   return [
-    "**Agents look done**",
-    "",
-    "No terminal has produced fresh activity for a moment and there are no open agent questions.",
+    "**Agents finished** — reviewing output…",
     "",
     `**Coordinated work**: ${labels}`,
     active.length ? `\n**Sessions**\n${active.join("\n")}` : "",
     files.length ? `\n**Changed files**\n${files.join("\n")}${changedFiles.length > files.length ? `\n- ...and ${changedFiles.length - files.length} more` : ""}` : "",
     urls.length ? `\n**Local preview**\n${urls.join("\n")}` : "",
-    "\nOpen `Changes` to review the diff before you run or commit it.",
   ].filter(Boolean).join("\n");
 }
 
@@ -994,6 +991,8 @@ export const ChatPanel: React.FC<{
   const chatAtBottomRef = useRef(true);
   const [workMonitor, setWorkMonitor] = useState<WorkMonitor | null>(null);
   const workMonitorRef = useRef<WorkMonitor | null>(null);
+  // Timestamp set when agents finish so the auto-resume useEffect can trigger.
+  const [pendingAutoResume, setPendingAutoResume] = useState<number | null>(null);
   const isProcessingRef = useRef(isProcessing);
 
   const onSendPtyCommandRef = useRef(onSendPtyCommand);
@@ -1424,9 +1423,102 @@ export const ChatPanel: React.FC<{
         ts: ts(),
       }]);
       setWorkMonitor(null);
+      // Trigger auto-resume: the LLM will read the terminal context and continue.
+      setPendingAutoResume(Date.now());
     }, 3000);
     return () => window.clearInterval(timer);
   }, [workMonitor]);
+
+  // ─── Auto-resume after agents finish ──────────────────────────────────────────
+  // When pendingAutoResume is set and we're not already processing, call the LLM
+  // with the terminal transcripts in context so it can continue the original task.
+  useEffect(() => {
+    if (pendingAutoResume === null || isProcessing) return;
+    setPendingAutoResume(null);
+
+    const continuationPrompt =
+      "The CLI agents have finished their work. Review the terminal output shown " +
+      "in your context and any files that were modified, then continue with the " +
+      "original task. If the agents completed it successfully, report what was done " +
+      "and suggest any follow-up steps. If there were errors or incomplete work, " +
+      "diagnose the problem and propose a fix (you may spawn another agent or ask me " +
+      "a clarifying question if needed).";
+
+    const runResume = async () => {
+      setIsProcessing(true);
+      try {
+        const sysPrompt = buildOrchestratorPrompt(
+          sessionsRef.current,
+          terminalOutputsRef.current,
+          terminalTranscriptsRef.current,
+          toolCallsRef.current,
+          agentQuestionsRef.current,
+          contextWindowRef.current,
+        );
+        // Build conversation history the same way send() does, so the LLM has
+        // full context of what was asked and what the agents did.
+        const history = msgs
+          .filter(m => (m.role === "user" || m.role === "ai") && !m.streaming)
+          .slice(-40)
+          .map(m => ({
+            role: m.role === "user" ? "user" as const : "assistant" as const,
+            content: messageForModel(m),
+          }));
+        const llmMsgs = [
+          { role: "system" as const, content: sysPrompt },
+          ...history,
+          { role: "user" as const, content: continuationPrompt },
+        ];
+        const aiMsgId = `a-resume-${Date.now()}`;
+
+        if (streamingEnabled) {
+          setMsgs(p => [...p, {
+            id: aiMsgId,
+            role: "ai",
+            agent: "orchestrator",
+            body: "",
+            streaming: true,
+            ts: ts(),
+          }]);
+          await streamLLM(aiMsgId, llmMsgs);
+          const finalText = streamTextRef.current;
+          const actions = parseAgentActions(finalText);
+          const visible = stripAgentTags(finalText);
+          setMsgs(p => p.map(m => m.id === aiMsgId
+            ? { ...m, streaming: false, body: visible, actions: actions.length ? actions : undefined }
+            : m,
+          ));
+          if (actions.length) autoDispatchActions(actions);
+        } else {
+          const resp = await callLLM(llmMsgs);
+          const actions = parseAgentActions(resp);
+          const visible = stripAgentTags(resp);
+          setMsgs(p => [...p, {
+            id: aiMsgId,
+            role: "ai",
+            agent: "orchestrator",
+            body: visible,
+            actions: actions.length ? actions : undefined,
+            ts: ts(),
+          }]);
+          if (actions.length) autoDispatchActions(actions);
+        }
+      } catch (err: any) {
+        setMsgs(p => [...p, {
+          id: `e-resume-${Date.now()}`,
+          role: "ai",
+          agent: "system",
+          body: `**Could not auto-review agent results:** ${err?.message || String(err)}`,
+          ts: ts(),
+        }]);
+      } finally {
+        setIsProcessing(false);
+      }
+    };
+
+    void runResume();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingAutoResume, isProcessing]);
 
   const { notifyError } = useNotify();
 

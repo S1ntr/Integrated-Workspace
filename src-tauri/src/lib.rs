@@ -1326,6 +1326,45 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
     )
 }
 
+/// Start the dev server as a detached background process (no visible terminal window).
+/// Stdout, stderr and stdin are all routed to /dev/null (Unix) or NUL (Windows).
+/// On Windows the CREATE_NO_WINDOW flag is set so no console flashes up.
+#[tauri::command]
+fn start_dev_server_background(dir: String, command: String) -> Result<(), String> {
+    let mut cmd = if cfg!(target_os = "windows") {
+        // Use cmd.exe /c so that .cmd / .bat shims (npm, pnpm, yarn, …) resolve correctly.
+        let mut c = std::process::Command::new("cmd.exe");
+        c.args(["/c", &command]);
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", &command]);
+        c
+    };
+
+    if !dir.is_empty() && Path::new(&dir).exists() {
+        cmd.current_dir(&dir);
+    }
+
+    // Suppress all I/O — we only care whether the port comes up, not the output.
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null());
+
+    // Windows: prevent a console window from briefly appearing.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd.spawn()
+        .map_err(|e| format!("Failed to start dev server in background: {}", e))?;
+
+    Ok(())
+}
+
 /// Attempt a TCP connection to 127.0.0.1:port; returns true if something is
 /// already listening there (i.e. the dev server is up).
 #[tauri::command]
@@ -1387,6 +1426,7 @@ pub fn run() {
             cancel_stream,
             detect_dev_project,
             check_port_open,
+            start_dev_server_background,
             save_chat_to_workspace,
         ])
         .run(tauri::generate_context!())
