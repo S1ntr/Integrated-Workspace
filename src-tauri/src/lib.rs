@@ -40,7 +40,7 @@ pub struct StreamState(Mutex<HashMap<String, u32>>);
 
 // ─── Workspace State for Sandboxing (Remediation for Path Traversal) ─────────
 #[derive(Default)]
-pub struct WorkspaceState(pub Mutex<Option<String>>);
+pub struct WorkspaceState(pub Mutex<Vec<String>>);
 
 #[derive(Serialize, Clone)]
 struct BrowserNewWindowPayload {
@@ -48,23 +48,45 @@ struct BrowserNewWindowPayload {
     url: String,
 }
 
-// Helper to validate that canonicalized targets are strictly within picked workspace parent boundaries
-fn validate_in_workspace(target_path_str: &str, workspace_opt: &Option<String>) -> Result<std::path::PathBuf, String> {
-    let ws_dir = workspace_opt.as_ref().ok_or_else(|| "Access denied: No active workspace directory selected in backend.".to_string())?;
-    
-    let ws_path = Path::new(ws_dir).canonicalize()
-        .map_err(|e| format!("Access denied: Workspace directory invalid or not found: {}", e))?;
-        
+fn register_workspace_root(path: &Path, state: &State<'_, WorkspaceState>) -> Result<String, String> {
+    if !path.exists() || !path.is_dir() {
+        return Err("Directory does not exist".to_string());
+    }
+    let canonical = path.canonicalize()
+        .map_err(|e| format!("Failed to canonicalize workspace: {}", e))?;
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let mut roots = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
+    if !roots.iter().any(|existing| existing == &canonical_str) {
+        roots.push(canonical_str.clone());
+    }
+    Ok(canonical_str)
+}
+
+fn workspace_roots(state: &State<'_, WorkspaceState>) -> Result<Vec<String>, String> {
+    state.0.lock()
+        .map(|roots| roots.clone())
+        .map_err(|e| format!("Mutex lock poisoned: {}", e))
+}
+
+// Helper to validate that canonicalized targets are strictly within registered workspace boundaries
+fn validate_in_workspace(target_path_str: &str, workspace_roots: &[String]) -> Result<std::path::PathBuf, String> {
+    if workspace_roots.is_empty() {
+        return Err("Access denied: No active workspace directory selected in backend.".to_string());
+    }
+
     let target_path = Path::new(target_path_str);
     let canonical_target = target_path.canonicalize()
         .map_err(|e| format!("Access denied: File/Folder not found or invalid path: {}", e))?;
-        
-    // Enforce scoping
-    if canonical_target.starts_with(&ws_path) {
-        Ok(canonical_target)
-    } else {
-        Err("Access denied: Target path lies outside the authorized workspace sandbox.".to_string())
+
+    for ws_dir in workspace_roots {
+        let ws_path = Path::new(ws_dir).canonicalize()
+            .map_err(|e| format!("Access denied: Workspace directory invalid or not found: {}", e))?;
+        if canonical_target.starts_with(&ws_path) {
+            return Ok(canonical_target);
+        }
     }
+
+    Err("Access denied: Target path lies outside the authorized workspace sandbox.".to_string())
 }
 
 // ─── PTY commands ─────────────────────────────────────────────────────────────
@@ -313,32 +335,20 @@ fn select_directory(state: State<'_, WorkspaceState>) -> Option<String> {
         .set_title("Select Integraded Workspace Directory")
         .pick_folder();
     if let Some(ref p) = dir {
-        let path_str = p.to_string_lossy().to_string();
-        if let Ok(mut ws) = state.0.lock() {
-            *ws = Some(path_str);
-        }
+        let _ = register_workspace_root(p, &state);
     }
     dir.map(|p| p.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 fn set_active_workspace(dir_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
-    let path = Path::new(&dir_path);
-    if !path.exists() || !path.is_dir() {
-        return Err("Directory does not exist".to_string());
-    }
-    let canonical = path.canonicalize()
-        .map_err(|e| format!("Failed to canonicalize workspace: {}", e))?;
-    if let Ok(mut ws) = state.0.lock() {
-        *ws = Some(canonical.to_string_lossy().to_string());
-    }
-    Ok(())
+    register_workspace_root(Path::new(&dir_path), &state).map(|_| ())
 }
 
 #[tauri::command]
 fn list_files(dir_path: &str, state: State<'_, WorkspaceState>) -> Result<Vec<FileInfo>, String> {
-    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
-    let canonical_dir = validate_in_workspace(dir_path, &ws_opt)?;
+    let roots = workspace_roots(&state)?;
+    let canonical_dir = validate_in_workspace(dir_path, &roots)?;
 
     if !canonical_dir.exists() {
         return Err("Directory does not exist".into());
@@ -400,52 +410,57 @@ fn list_files(dir_path: &str, state: State<'_, WorkspaceState>) -> Result<Vec<Fi
 
 #[tauri::command]
 fn read_file_content(file_path: &str, state: State<'_, WorkspaceState>) -> Result<String, String> {
-    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
-    let canonical_file = validate_in_workspace(file_path, &ws_opt)?;
+    let roots = workspace_roots(&state)?;
+    let canonical_file = validate_in_workspace(file_path, &roots)?;
     fs::read_to_string(canonical_file).map_err(|e| e.to_string())
 }
 
-fn validate_parent_in_workspace(target_path_str: &str, workspace_opt: &Option<String>) -> Result<std::path::PathBuf, String> {
-    let ws_dir = workspace_opt.as_ref().ok_or_else(|| "Access denied: No active workspace directory selected in backend.".to_string())?;
-    let ws_path = Path::new(ws_dir).canonicalize()
-        .map_err(|e| format!("Access denied: Workspace directory invalid or not found: {}", e))?;
+fn validate_parent_in_workspace(target_path_str: &str, workspace_roots: &[String]) -> Result<std::path::PathBuf, String> {
+    if workspace_roots.is_empty() {
+        return Err("Access denied: No active workspace directory selected in backend.".to_string());
+    }
     let target_path = Path::new(target_path_str);
     let parent = target_path.parent().ok_or_else(|| "Invalid target path: no parent directory".to_string())?;
     let canonical_parent = parent.canonicalize()
         .map_err(|e| format!("Access denied: Parent directory does not exist or invalid path: {}", e))?;
-    if canonical_parent.starts_with(&ws_path) {
-        Ok(target_path.to_path_buf())
-    } else {
-        Err("Access denied: Parent directory lies outside the authorized workspace sandbox.".to_string())
+
+    for ws_dir in workspace_roots {
+        let ws_path = Path::new(ws_dir).canonicalize()
+            .map_err(|e| format!("Access denied: Workspace directory invalid or not found: {}", e))?;
+        if canonical_parent.starts_with(&ws_path) {
+            return Ok(target_path.to_path_buf());
+        }
     }
+
+    Err("Access denied: Parent directory lies outside the authorized workspace sandbox.".to_string())
 }
 
 #[tauri::command]
 fn create_file(file_path: String, content: Option<String>, state: State<'_, WorkspaceState>) -> Result<(), String> {
-    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
-    let path = validate_parent_in_workspace(&file_path, &ws_opt)?;
+    let roots = workspace_roots(&state)?;
+    let path = validate_parent_in_workspace(&file_path, &roots)?;
     fs::write(path, content.unwrap_or_default().as_bytes()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn create_dir(dir_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
-    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
-    let path = validate_parent_in_workspace(&dir_path, &ws_opt)?;
+    let roots = workspace_roots(&state)?;
+    let path = validate_parent_in_workspace(&dir_path, &roots)?;
     fs::create_dir_all(path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn rename_item(old_path: String, new_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
-    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
-    let src = validate_in_workspace(&old_path, &ws_opt)?;
-    let dest = validate_parent_in_workspace(&new_path, &ws_opt)?;
+    let roots = workspace_roots(&state)?;
+    let src = validate_in_workspace(&old_path, &roots)?;
+    let dest = validate_parent_in_workspace(&new_path, &roots)?;
     fs::rename(src, dest).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn delete_item(path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
-    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
-    let target = validate_in_workspace(&path, &ws_opt)?;
+    let roots = workspace_roots(&state)?;
+    let target = validate_in_workspace(&path, &roots)?;
     if target.is_dir() {
         fs::remove_dir_all(target).map_err(|e| e.to_string())
     } else {
@@ -455,9 +470,9 @@ fn delete_item(path: String, state: State<'_, WorkspaceState>) -> Result<(), Str
 
 #[tauri::command]
 fn copy_item(src_path: String, dest_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
-    let ws_opt = state.0.lock().map_err(|e| format!("Mutex lock poisoned: {}", e))?;
-    let src = validate_in_workspace(&src_path, &ws_opt)?;
-    let dest = validate_parent_in_workspace(&dest_path, &ws_opt)?;
+    let roots = workspace_roots(&state)?;
+    let src = validate_in_workspace(&src_path, &roots)?;
+    let dest = validate_parent_in_workspace(&dest_path, &roots)?;
     if src.is_dir() {
         fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
             fs::create_dir_all(dst)?;

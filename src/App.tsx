@@ -20,6 +20,7 @@ function App() {
   const [busyWorkspaces, setBusyWorkspaces] = useState<Record<string, boolean>>({});
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  const [closingWorkspace, setClosingWorkspace] = useState<WorkspaceInstance | null>(null);
   const busyTimersRef = useRef<Record<string, number>>({});
 
   useEffect(() => () => {
@@ -61,6 +62,27 @@ function App() {
     }
     setRenamingId(null);
     setRenameDraft("");
+  };
+
+  const closeWorkspace = (id: string) => {
+    window.clearTimeout(busyTimersRef.current[id]);
+    delete busyTimersRef.current[id];
+    setBusyWorkspaces(prev => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setWorkspaces(prev => {
+      const next = prev.filter(workspace => workspace.id !== id);
+      if (activeId === id) {
+        const currentIndex = prev.findIndex(workspace => workspace.id === id);
+        const fallback = next[Math.max(0, Math.min(currentIndex, next.length - 1))];
+        setActiveId(fallback?.id || "");
+        setAddingWorkspace(next.length === 0);
+      }
+      return next;
+    });
+    setClosingWorkspace(null);
   };
 
   const activeWorkspace = workspaces.find(workspace => workspace.id === activeId);
@@ -128,6 +150,26 @@ function App() {
                         <i className="bx bx-edit-alt" />
                       </span>
                     )}
+                    {renamingId !== workspace.id && (
+                      <span
+                        className="workspace-tab-close"
+                        role="button"
+                        tabIndex={0}
+                        title="Close workspace"
+                        onClick={event => {
+                          event.stopPropagation();
+                          setClosingWorkspace(workspace);
+                        }}
+                        onKeyDown={event => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            setClosingWorkspace(workspace);
+                          }
+                        }}
+                      >
+                        <i className="bx bx-x" />
+                      </span>
+                    )}
                   </button>
                 );
               })}
@@ -165,6 +207,28 @@ function App() {
             onComplete={addWorkspace}
             onCancel={workspaces.length ? () => setAddingWorkspace(false) : undefined}
           />
+        )}
+
+        {closingWorkspace && (
+          <div className="workspace-close-overlay" role="dialog" aria-modal="true">
+            <div className="workspace-close-dialog">
+              <div className="workspace-close-icon">
+                <i className="bx bx-window-close" />
+              </div>
+              <h2>Want to close this workspace?</h2>
+              <p>
+                Closing <strong>{closingWorkspace.name}</strong> will stop its terminals and remove it from this window.
+              </p>
+              <div className="workspace-close-actions">
+                <button type="button" className="workspace-close-no" onClick={() => setClosingWorkspace(null)}>
+                  No
+                </button>
+                <button type="button" className="workspace-close-yes" onClick={() => closeWorkspace(closingWorkspace.id)}>
+                  Yes
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </div>
     </NotifyProvider>
