@@ -40,7 +40,6 @@ interface BrowserOverlayProps {
   directory?: string;
   onClose: () => void;
   onSendToChat: (prompt: Omit<ExternalChatPrompt, "id">) => void;
-  onAutoStartSession?: (label: string, command: string) => void;
 }
 
 interface BrowserNewWindowEvent {
@@ -96,7 +95,6 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   directory,
   onClose,
   onSendToChat,
-  onAutoStartSession,
 }) => {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
