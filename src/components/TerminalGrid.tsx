@@ -398,8 +398,12 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
           key={s.id}
           className={`tgrid-absolute-panel ${draggingSessionId === s.id ? "dragging" : ""} ${dragOverSessionId === s.id && draggingSessionId !== s.id ? "drag-over" : ""}`}
           data-terminal-panel-id={s.id}
-          onMouseDown={(e) => startSessionReorder(s, e)}
-          style={{
+          onMouseDown={(e) => fullscreenId !== s.id && startSessionReorder(s, e)}
+          style={fullscreenId === s.id ? {
+            position: "absolute",
+            left: 0, top: 0, width: "100%", height: "100%",
+            zIndex: 100,
+          } : {
             position: "absolute",
             left: `${left}%`,
             top: `${top}%`,

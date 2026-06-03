@@ -505,6 +505,64 @@ fn copy_item(src_path: String, dest_path: String, state: State<'_, WorkspaceStat
     }
 }
 
+#[tauri::command]
+fn move_item(src_path: String, dest_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
+    let roots = workspace_roots(&state)?;
+    let src = validate_in_workspace(&src_path, &roots)?;
+    let dest = validate_parent_in_workspace(&dest_path, &roots)?;
+    fs::rename(src, dest).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reveal_in_explorer(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .args(["/select,", &path.replace("/", "\\")])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", &path])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let parent = std::path::Path::new(&path).parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(path);
+        std::process::Command::new("xdg-open")
+            .arg(&parent)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+}
+
+#[tauri::command]
+fn get_clipboard_file_paths() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let ps = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command",
+                "[System.Windows.Forms.Clipboard]::GetFileDropList() | ForEach-Object { $_ }"])
+            .output();
+        if let Ok(out) = ps {
+            let text = String::from_utf8_lossy(&out.stdout);
+            return text.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+        }
+    }
+    vec![]
+}
+
 /// Return a folder name like "Thursday_2026-05-28" for today's date.
 /// Uses Hinnant's civil_from_days algorithm — no chrono dependency needed.
 #[allow(dead_code)]
@@ -2274,6 +2332,9 @@ pub fn run() {
             rename_item,
             delete_item,
             copy_item,
+            move_item,
+            reveal_in_explorer,
+            get_clipboard_file_paths,
             save_chat_history,
             load_chat_history,
             clear_chat_history,

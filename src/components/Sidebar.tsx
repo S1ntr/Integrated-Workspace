@@ -293,6 +293,18 @@ export const Sidebar: React.FC<SidebarProps> = ({ directory, activeFilePath, onF
       srcPath: contextMenu.targetPath,
       name: contextMenu.targetName,
       isDir: contextMenu.targetIsDir,
+      mode: "copy",
+    };
+    closeMenu();
+  };
+
+  const handleCut = () => {
+    if (!contextMenu.targetPath || !contextMenu.targetName) return;
+    (window as any).__integradedClipboard = {
+      srcPath: contextMenu.targetPath,
+      name: contextMenu.targetName,
+      isDir: contextMenu.targetIsDir,
+      mode: "cut",
     };
     closeMenu();
   };
@@ -303,7 +315,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ directory, activeFilePath, onF
     const destDir = getTargetDir(contextMenu.targetPath, contextMenu.targetIsDir);
     const destPath = `${destDir}/${clipboard.name}`;
     try {
-      await invoke("copy_item", { srcPath: clipboard.srcPath, destPath });
+      if (clipboard.mode === "cut") {
+        await invoke("move_item", { srcPath: clipboard.srcPath, destPath });
+        (window as any).__integradedClipboard = null;
+      } else {
+        await invoke("copy_item", { srcPath: clipboard.srcPath, destPath });
+      }
       refresh();
     } catch (e) {
       notifyError(`Paste failed: ${e}`);
@@ -311,7 +328,51 @@ export const Sidebar: React.FC<SidebarProps> = ({ directory, activeFilePath, onF
     closeMenu();
   };
 
+  const handleOSPaste = async () => {
+    const destDir = getTargetDir(contextMenu.targetPath, contextMenu.targetIsDir);
+    try {
+      const paths = await invoke<string[]>("get_clipboard_file_paths");
+      if (!paths.length) { notifyError("No files found in clipboard."); return; }
+      for (const srcPath of paths) {
+        const name = srcPath.replace(/\\/g, "/").split("/").pop() || "file";
+        const destPath = `${destDir}/${name}`;
+        await invoke("copy_item", { srcPath: srcPath.replace(/\\/g, "/"), destPath });
+      }
+      refresh();
+    } catch (e) {
+      notifyError(`Paste from OS clipboard failed: ${e}`);
+    }
+    closeMenu();
+  };
+
+  const handleDuplicate = async () => {
+    if (!contextMenu.targetPath || !contextMenu.targetName) return;
+    const parts = contextMenu.targetName.split(".");
+    const ext = parts.length > 1 ? `.${parts.pop()}` : "";
+    const base = parts.join(".");
+    const dir = getTargetDir(contextMenu.targetPath, false);
+    const destPath = `${dir}/${base} (copy)${ext}`;
+    try {
+      await invoke("copy_item", { srcPath: contextMenu.targetPath, destPath });
+      refresh();
+    } catch (e) {
+      notifyError(`Duplicate failed: ${e}`);
+    }
+    closeMenu();
+  };
+
+  const handleRevealInExplorer = async () => {
+    if (!contextMenu.targetPath) return;
+    try {
+      await invoke("reveal_in_explorer", { path: contextMenu.targetPath });
+    } catch (e) {
+      notifyError(`Could not open explorer: ${e}`);
+    }
+    closeMenu();
+  };
+
   const clipboardActive = !!(window as any).__integradedClipboard;
+  const clipboardIsCut = (window as any).__integradedClipboard?.mode === "cut";
 
   return (
     <div
@@ -356,34 +417,45 @@ export const Sidebar: React.FC<SidebarProps> = ({ directory, activeFilePath, onF
           onClick={e => e.stopPropagation()}
         >
           <button className="context-menu-item" onClick={() => startCreate("file")}>
-            <i className="bx bx-file" /> New File
+            <i className="bx bx-file-plus" /> New File
           </button>
           <button className="context-menu-item" onClick={() => startCreate("folder")}>
-            <i className="bx bx-folder" /> New Folder
+            <i className="bx bx-folder-plus" /> New Folder
           </button>
+
+          {/* Paste from OS clipboard always available */}
+          <div style={{ height: "1px", background: "var(--bg-4)", margin: "4px 0" }} />
+          <button className="context-menu-item" onClick={handleOSPaste}>
+            <i className="bx bx-import" /> Paste from OS Clipboard
+          </button>
+          {clipboardActive && (
+            <button className="context-menu-item" onClick={handlePaste}>
+              <i className="bx bx-paste" /> Paste {clipboardIsCut ? "(Move)" : "(Copy)"}
+            </button>
+          )}
+
           {contextMenu.targetPath && (
             <>
               <div style={{ height: "1px", background: "var(--bg-4)", margin: "4px 0" }} />
               <button className="context-menu-item" onClick={handleCopy}>
                 <i className="bx bx-copy" /> Copy
               </button>
-              <button className="context-menu-item" onClick={handlePaste} disabled={!clipboardActive}>
-                <i className="bx bx-paste" /> Paste
+              <button className="context-menu-item" onClick={handleCut}>
+                <i className="bx bx-cut" /> Cut
+              </button>
+              <button className="context-menu-item" onClick={handleDuplicate}>
+                <i className="bx bx-duplicate" /> Duplicate
               </button>
               <div style={{ height: "1px", background: "var(--bg-4)", margin: "4px 0" }} />
               <button className="context-menu-item" onClick={startRename}>
                 <i className="bx bx-edit" /> Rename
               </button>
+              <button className="context-menu-item" onClick={handleRevealInExplorer}>
+                <i className="bx bx-folder-open" /> Reveal in Explorer
+              </button>
+              <div style={{ height: "1px", background: "var(--bg-4)", margin: "4px 0" }} />
               <button className="context-menu-item danger" onClick={startDelete}>
                 <i className="bx bx-trash" /> Delete
-              </button>
-            </>
-          )}
-          {!contextMenu.targetPath && clipboardActive && (
-            <>
-              <div style={{ height: "1px", background: "var(--bg-4)", margin: "4px 0" }} />
-              <button className="context-menu-item" onClick={handlePaste}>
-                <i className="bx bx-paste" /> Paste
               </button>
             </>
           )}
