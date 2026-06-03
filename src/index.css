@@ -3049,7 +3049,7 @@ input, textarea { font-family: var(--font-ui); }
 .chat-mention-item:hover,
 .chat-mention-item.active { background: var(--accent-subtle); color: var(--text-1); }
 .chat-mention-icon { font-size: 13px; color: var(--accent); flex-shrink: 0; }
-.chat-mention-name { flex-shrink: 0; font-weight: 500; }
+.chat-mention-name { flex-shrink: 0; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
 .chat-mention-path {
   font-family: var(--font-mono);
   font-size: 10px;

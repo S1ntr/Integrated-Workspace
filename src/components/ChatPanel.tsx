@@ -3377,7 +3377,7 @@ export const ChatPanel: React.FC<{
               return (
                 <div
                   className="chat-mention-dropdown"
-                  style={{ position: "fixed", bottom: window.innerHeight - rect.top + 6, left: rect.left, width: Math.max(280, rect.width) }}
+                  style={{ position: "fixed", bottom: window.innerHeight - rect.top + 6, left: rect.left, width: Math.min(rect.width, window.innerWidth - rect.left - 6), minWidth: 180 }}
                 >
                   {mentionSuggestions.map((f, i) => (
                     <button
