@@ -391,7 +391,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   }
 
   return (
-    <div className={`tgrid-wrapper ${isResizing ? "resizing" : ""} ${draggingSessionId !== null ? "reordering" : ""}`} ref={wrapperRef} style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden" }}>
+    <div className={`tgrid-wrapper ${isResizing ? "resizing" : ""} ${draggingSessionId !== null ? "reordering" : ""}${fullscreenId !== null ? " has-fullscreen" : ""}`} ref={wrapperRef} style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden", isolation: "isolate" }}>
       {/* ── Render absolutely positioned panels ── */}
       {panels.map(({ s, left, top, width, height, pct }) => (
         <div
@@ -402,7 +402,15 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
           style={fullscreenId === s.id ? {
             position: "absolute",
             left: 0, top: 0, width: "100%", height: "100%",
-            zIndex: 100,
+            zIndex: 500,
+          } : fullscreenId !== null ? {
+            position: "absolute",
+            left: `${left}%`,
+            top: `${top}%`,
+            width: `${width}%`,
+            height: `${height}%`,
+            zIndex: 1,
+            isolation: "isolate" as const,
           } : {
             position: "absolute",
             left: `${left}%`,
