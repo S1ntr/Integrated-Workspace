@@ -2794,24 +2794,42 @@ export const ChatPanel: React.FC<{
     setTimeout(() => { ta?.focus(); const pos = replaced.length; ta?.setSelectionRange(pos, pos); }, 0);
   };
 
-  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+  const handleInputChange = async (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     setInput(val);
     const cursor = e.target.selectionStart ?? val.length;
     const beforeCursor = val.slice(0, cursor);
     const match = beforeCursor.match(/@([\w.\-]*)$/);
-    if (match) {
-      const q = match[1].toLowerCase();
-      setMentionQuery(q);
-      const sugg = mentionFilesRef.current
-        .filter(f => !q || f.name.toLowerCase().includes(q))
-        .slice(0, 8);
-      setMentionSuggestions(sugg);
-      setMentionIndex(0);
-    } else {
+    if (!match) {
       setMentionQuery(null);
       setMentionSuggestions([]);
+      return;
     }
+    const q = match[1].toLowerCase();
+    setMentionQuery(q);
+    setMentionIndex(0);
+
+    // Ensure file list is loaded — load on-demand if ref is empty
+    if (mentionFilesRef.current.length === 0 && workspaceDir) {
+      try {
+        interface FE { path: string; name: string; is_dir: boolean; children?: FE[] }
+        const entries = await invoke<FE[]>("list_files", { dirPath: workspaceDir });
+        const flat: MentionFile[] = [];
+        const recurse = (list: FE[]) => {
+          for (const e of list) {
+            if (e.is_dir) { if (e.children) recurse(e.children); }
+            else flat.push({ path: e.path, name: e.name });
+          }
+        };
+        recurse(entries);
+        mentionFilesRef.current = flat;
+      } catch {}
+    }
+
+    const sugg = mentionFilesRef.current
+      .filter(f => !q || f.name.toLowerCase().includes(q))
+      .slice(0, 10);
+    setMentionSuggestions(sugg);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -3340,9 +3358,27 @@ export const ChatPanel: React.FC<{
               </div>
             )}
 
-            <div className="chat-textarea-wrap" style={{ position: "relative" }}>
-              {mentionSuggestions.length > 0 && (
-                <div className="chat-mention-dropdown">
+            <div className="chat-textarea-wrap">
+              <textarea
+                ref={textareaRef}
+                className="chat-textarea"
+                value={input}
+                onChange={handleInputChange}
+                onKeyDown={handleKeyDown}
+                placeholder={isRecording ? "Listening…" : "Describe the task… (use @ to mention a file)"}
+                rows={1}
+                disabled={isRecording || isProcessing}
+              />
+            </div>
+            {/* Mention dropdown — rendered outside input-box to escape overflow:hidden */}
+            {mentionSuggestions.length > 0 && (() => {
+              const rect = textareaRef.current?.getBoundingClientRect();
+              if (!rect) return null;
+              return (
+                <div
+                  className="chat-mention-dropdown"
+                  style={{ position: "fixed", bottom: window.innerHeight - rect.top + 6, left: rect.left, width: Math.max(280, rect.width) }}
+                >
                   {mentionSuggestions.map((f, i) => (
                     <button
                       key={f.path}
@@ -3357,18 +3393,8 @@ export const ChatPanel: React.FC<{
                   ))}
                   <div className="chat-mention-hint"><kbd>↑↓</kbd> navigate · <kbd>Tab</kbd> insert · <kbd>Esc</kbd> close</div>
                 </div>
-              )}
-              <textarea
-                ref={textareaRef}
-                className="chat-textarea"
-                value={input}
-                onChange={handleInputChange}
-                onKeyDown={handleKeyDown}
-                placeholder={isRecording ? "Listening…" : "Describe the task… (use @ to mention a file)"}
-                rows={1}
-                disabled={isRecording || isProcessing}
-              />
-            </div>
+              );
+            })()}
 
             <div className="chat-toolbar">
               {/* ── Spec strip (left): model + mode ── */}

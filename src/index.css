@@ -3023,17 +3023,13 @@ input, textarea { font-family: var(--font-ui); }
 
 /* ── @mention autocomplete dropdown ── */
 .chat-mention-dropdown {
-  position: absolute;
-  bottom: calc(100% + 4px);
-  left: 0;
-  right: 0;
-  max-height: 220px;
+  max-height: 240px;
   overflow-y: auto;
   background: var(--bg-1);
   border: 1px solid var(--bg-5);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-xl);
-  z-index: 200;
+  z-index: 9999;
   display: flex;
   flex-direction: column;
 }
