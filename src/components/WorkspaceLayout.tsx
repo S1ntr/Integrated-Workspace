@@ -257,9 +257,6 @@ const RightPanel: React.FC<RightPanelProps> = ({
           setTab("chat");
           setExternalPrompt({ id: `browser-prompt-${Date.now()}`, ...payload });
         }}
-        onAutoStartSession={(label, command) => {
-          onAddSession(label, command);
-        }}
       />
     </div>
   );
