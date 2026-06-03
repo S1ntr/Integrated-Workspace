@@ -610,6 +610,28 @@ fn get_clipboard_file_paths() -> Vec<String> {
     vec![]
 }
 
+#[tauri::command]
+fn run_command_in_dir(cmd: String, dir: String) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| e.to_string())?;
+    #[cfg(not(target_os = "windows"))]
+    let output = std::process::Command::new("sh")
+        .args(["-c", &cmd])
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() && !stderr.is_empty() {
+        return Err(stderr.trim().to_string());
+    }
+    Ok(if !stdout.is_empty() { stdout } else { stderr })
+}
+
 fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) { &bytes[3..] } else { bytes }
 }
@@ -2385,6 +2407,7 @@ pub fn run() {
             copy_item,
             move_item,
             paste_external_file,
+            run_command_in_dir,
             reveal_in_explorer,
             get_clipboard_file_paths,
             save_chat_history,

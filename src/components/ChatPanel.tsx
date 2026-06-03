@@ -15,7 +15,7 @@ export interface Session {
 }
 
 interface AgentAction {
-  type: "spawn" | "send" | "broadcast" | "kill" | "request" | "ask_user" | "browser_open" | "mode" | "file_create";
+  type: "spawn" | "send" | "broadcast" | "kill" | "request" | "ask_user" | "browser_open" | "mode" | "file_create" | "read_file" | "exec_cmd";
   agentType?: string;
   label: string;
   prompt?: string;
@@ -25,6 +25,9 @@ interface AgentAction {
   url?: string;
   device?: string;
   mode?: string;
+  filePath?: string;
+  cmdString?: string;
+  result?: string;
 }
 
 interface ToolCallLog {
@@ -407,6 +410,16 @@ function normalizeToolAction(raw: any): AgentAction | null {
   if (tool === "ask_user" || tool === "ask" || tool === "question") {
     return { type: "ask_user", label: label || "User", question: question || prompt || reason || "Need more information.", reason };
   }
+  // File read tool
+  const filePath = typeof raw.path === "string" ? raw.path : typeof raw.file === "string" ? raw.file : typeof raw.filePath === "string" ? raw.filePath : prompt;
+  if (tool === "read_file" || tool === "read" || tool === "cat" || tool === "view_file") {
+    return { type: "read_file", label: filePath || "file", filePath };
+  }
+  // Command execution tool
+  const cmdString = typeof raw.cmd === "string" ? raw.cmd : typeof raw.command === "string" ? raw.command : typeof raw.run === "string" ? raw.run : prompt;
+  if (tool === "exec_cmd" || tool === "exec" || tool === "run" || tool === "bash" || tool === "shell_cmd") {
+    return { type: "exec_cmd", label: cmdString || "command", cmdString };
+  }
   return null;
 }
 
@@ -598,8 +611,13 @@ Tool calls execute automatically. Raw tool call syntax is hidden from the normal
 <tool_call>{"tool":"agent.kill","label":"Agent Label"}</tool_call>
 <tool_call>{"tool":"browser.open","url":"http://localhost:3000","device":"responsive","mode":"app","label":"Project Preview"}</tool_call>
 <tool_call>{"tool":"chat.ask_user","question":"Precise question for the user"}</tool_call>
+<tool_call>{"tool":"read_file","path":"src/App.tsx"}</tool_call>
+<tool_call>{"tool":"exec_cmd","command":"npm test"}</tool_call>
 
 If your model has trouble with XML, a fenced JSON block named tool_call is also accepted. Never show raw tool calls in visible prose. Visible prose should summarize what is happening and what you need from the user.
+
+## read_file / exec_cmd (direct tools — no agent needed)
+Use \`read_file\` to inspect any workspace file yourself before deciding on a plan. Use \`exec_cmd\` to run a quick command (test, lint, build check) and see the output in chat. These run instantly without spawning a terminal agent.
 
 ## Task Complexity → Agent Count (REQUIRED DECISION BEFORE ACTING)
 Classify the request first, then pick the right agent count:
@@ -613,10 +631,23 @@ Classify the request first, then pick the right agent count:
 | **Huge** | Full-stack feature, architectural refactor, new app scaffold | **Use all ${availableSlots} free slots** — maximize parallelism |
 
 **Coupling test (run this BEFORE choosing agent count):** Ask "could two different people write these pieces simultaneously without reading each other's output?" If NO → it is tightly coupled → use 1 agent.
-Examples of tightly coupled work (→ 1 agent regardless of file count): a single webpage's markup + styles + scripts; a component and its styles; a module and its unit tests; a config file and the code that reads it.
-Examples of truly parallel work (→ split): separate pages, separate API endpoints, separate features that don't share state.
 
-When in doubt, go ONE step LOWER on agent count — it is always cheaper to add more agents than to untangle conflicting ones.
+**TIGHTLY COUPLED = 1 agent only (no matter how many files):**
+- HTML + CSS + JS for the same page/component
+- React component + its .css/.scss file
+- A function + its unit tests
+- A config file + the code that reads it
+- Backend route + its frontend API call
+- Any feature where File A imports or depends on File B being done first
+
+**TRULY PARALLEL = can split agents:**
+- Separate pages (e.g. homepage vs. about page — different files, no shared logic)
+- Independent API endpoints with no shared state
+- Distinct features in completely separate modules
+- Backend + Frontend only when the API contract is already defined/stable
+
+**Decision rule:** If you're unsure → 1 agent. Adding agents later is cheap; untangling conflicting edits is expensive.
+When in doubt, go ONE step LOWER on agent count.
 
 ## Coordination Rules
 1. **AVOID UNNECESSARY SPAWNS**: DO NOT spawn or use multiple agents for simple, minor, or single-file tasks. If the user's request is straightforward (e.g., a simple bug fix, modifying a single file, writing a small script, or answering a question), use a single agent (like \`claude\` or \`opencode\`) to handle the entire request.
@@ -1029,6 +1060,9 @@ export const ChatPanel: React.FC<{
     }
   });
   const [input, setInput] = useState("");
+  const [mentionSuggestions, setMentionSuggestions] = useState<MentionFile[]>([]);
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
   const [contextWindow, setContextWindow] = useState<string>(() => {
     try { return localStorage.getItem(storageKey("context_window")) || ""; } catch { return ""; }
   });
@@ -1562,20 +1596,12 @@ export const ChatPanel: React.FC<{
     }
     if (!additions.length) return;
     setAgentQuestions(prev => [...additions, ...prev].slice(0, 20));
-    setMsgs(prev => [
-      ...prev,
-      ...additions.map(q => ({
-        id: q.id,
-        role: "ai" as const,
-        agent: "system" as const,
-        body: `**${q.label}:** ${q.question}`,
-        ts: q.ts,
-      })),
-    ]);
-    // Trigger auto-answer: give LLM 2.5 s to see context stabilize before answering
+    // Silently trigger auto-answer — no visible message until agent finishes.
+    // The orchestrator will answer the question directly in the terminal
+    // without cluttering the chat with intermediate status updates.
     setTimeout(() => {
       if (!isProcessingRef.current) setPendingAutoAnswer(Date.now());
-    }, 2500);
+    }, 1800);
   }, [sessionsProp, terminalOutputsProp]);
 
   // (Raw terminal summary effect removed — the LLM auto-resume generates proper summaries.)
@@ -2395,6 +2421,50 @@ export const ChatPanel: React.FC<{
           updateToolLog(logId, "failed", "No matching session found.");
         }
       }
+
+      if (action.type === "read_file" && action.filePath) {
+        updateToolLog(logId, "running", `Reading ${action.filePath}`);
+        invoke<string>("read_file_content", { filePath: action.filePath })
+          .then(content => {
+            const lines = content.split("\n").length;
+            const preview = content.slice(0, 3000);
+            updateToolLog(logId, "done", `${lines} lines`);
+            setMsgs(p => [...p, {
+              id: `rf-${Date.now()}`,
+              role: "ai" as const,
+              agent: "system" as const,
+              body: `**File:** \`${action.filePath}\`\n\`\`\`\n${preview}${content.length > 3000 ? "\n…[clipped]" : ""}\n\`\`\``,
+              ts: ts(),
+            }]);
+          })
+          .catch(err => updateToolLog(logId, "failed", String(err)));
+      }
+
+      if (action.type === "exec_cmd" && action.cmdString) {
+        updateToolLog(logId, "running", action.cmdString);
+        invoke<string>("run_command_in_dir", { cmd: action.cmdString, dir: workspaceDir || "." })
+          .then(output => {
+            const preview = output.trim().slice(0, 2000);
+            updateToolLog(logId, "done", preview.split("\n").slice(0, 2).join(" "));
+            setMsgs(p => [...p, {
+              id: `ec-${Date.now()}`,
+              role: "ai" as const,
+              agent: "system" as const,
+              body: `**$** \`${action.cmdString}\`\n\`\`\`\n${preview}${output.length > 2000 ? "\n…[clipped]" : ""}\n\`\`\``,
+              ts: ts(),
+            }]);
+          })
+          .catch(err => {
+            updateToolLog(logId, "failed", String(err));
+            setMsgs(p => [...p, {
+              id: `ec-err-${Date.now()}`,
+              role: "ai" as const,
+              agent: "system" as const,
+              body: `**$** \`${action.cmdString}\`\n\`\`\`\n${String(err)}\n\`\`\``,
+              ts: ts(),
+            }]);
+          });
+      }
     }
     if (monitorLabels.length) {
       setWorkMonitor({
@@ -2683,7 +2753,50 @@ export const ChatPanel: React.FC<{
     }
   };
 
+  const insertMention = (file: MentionFile) => {
+    const ta = textareaRef.current;
+    const cursor = ta?.selectionStart ?? input.length;
+    const before = input.slice(0, cursor);
+    const after = input.slice(cursor);
+    const replaced = before.replace(/@([\w.\-]*)$/, `@"${file.name}" `);
+    setInput(replaced + after);
+    setMentionSuggestions([]);
+    setMentionQuery(null);
+    setMentionIndex(0);
+    setTimeout(() => { ta?.focus(); const pos = replaced.length; ta?.setSelectionRange(pos, pos); }, 0);
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setInput(val);
+    const cursor = e.target.selectionStart ?? val.length;
+    const beforeCursor = val.slice(0, cursor);
+    const match = beforeCursor.match(/@([\w.\-]*)$/);
+    if (match) {
+      const q = match[1].toLowerCase();
+      setMentionQuery(q);
+      const sugg = mentionFilesRef.current
+        .filter(f => !q || f.name.toLowerCase().includes(q))
+        .slice(0, 8);
+      setMentionSuggestions(sugg);
+      setMentionIndex(0);
+    } else {
+      setMentionQuery(null);
+      setMentionSuggestions([]);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (mentionSuggestions.length > 0) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setMentionIndex(i => Math.min(i + 1, mentionSuggestions.length - 1)); return; }
+      if (e.key === "ArrowUp")   { e.preventDefault(); setMentionIndex(i => Math.max(i - 1, 0)); return; }
+      if (e.key === "Tab" || (e.key === "Enter" && mentionQuery !== null)) {
+        e.preventDefault();
+        insertMention(mentionSuggestions[mentionIndex]);
+        return;
+      }
+      if (e.key === "Escape") { setMentionSuggestions([]); setMentionQuery(null); return; }
+    }
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   };
 
@@ -3199,14 +3312,31 @@ export const ChatPanel: React.FC<{
               </div>
             )}
 
-            <div className="chat-textarea-wrap">
+            <div className="chat-textarea-wrap" style={{ position: "relative" }}>
+              {mentionSuggestions.length > 0 && (
+                <div className="chat-mention-dropdown">
+                  {mentionSuggestions.map((f, i) => (
+                    <button
+                      key={f.path}
+                      type="button"
+                      className={`chat-mention-item ${i === mentionIndex ? "active" : ""}`}
+                      onMouseDown={e => { e.preventDefault(); insertMention(f); }}
+                    >
+                      <i className="bx bx-file-blank chat-mention-icon" />
+                      <span className="chat-mention-name">{f.name}</span>
+                      <span className="chat-mention-path">{f.path.replace(/\\/g, "/").split("/").slice(-3, -1).join("/")}</span>
+                    </button>
+                  ))}
+                  <div className="chat-mention-hint"><kbd>↑↓</kbd> navigate · <kbd>Tab</kbd> insert · <kbd>Esc</kbd> close</div>
+                </div>
+              )}
               <textarea
                 ref={textareaRef}
                 className="chat-textarea"
                 value={input}
-                onChange={e => setInput(e.target.value)}
+                onChange={handleInputChange}
                 onKeyDown={handleKeyDown}
-                placeholder={isRecording ? "Listening…" : agentQuestions.some(q => !q.answered) ? "Type an answer for the waiting agent…" : "Describe the task…"}
+                placeholder={isRecording ? "Listening…" : "Describe the task… (use @ to mention a file)"}
                 rows={1}
                 disabled={isRecording || isProcessing}
               />

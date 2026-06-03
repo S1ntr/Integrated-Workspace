@@ -3021,6 +3021,64 @@ input, textarea { font-family: var(--font-ui); }
 .chat-input-box:focus-within .chat-textarea::placeholder { color: var(--text-2); }
 .chat-textarea:disabled { opacity: 0.4; }
 
+/* ── @mention autocomplete dropdown ── */
+.chat-mention-dropdown {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--bg-1);
+  border: 1px solid var(--bg-5);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-xl);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+}
+.chat-mention-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  background: transparent;
+  border: none;
+  color: var(--text-1);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.08s;
+}
+.chat-mention-item:hover,
+.chat-mention-item.active { background: var(--accent-subtle); color: var(--text-1); }
+.chat-mention-icon { font-size: 13px; color: var(--accent); flex-shrink: 0; }
+.chat-mention-name { flex-shrink: 0; font-weight: 500; }
+.chat-mention-path {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.chat-mention-hint {
+  padding: 5px 10px;
+  font-size: 10px;
+  color: var(--text-4);
+  border-top: 1px solid var(--bg-3);
+  font-family: var(--font-mono);
+}
+.chat-mention-hint kbd {
+  background: var(--bg-3);
+  border: 1px solid var(--bg-5);
+  border-radius: 2px;
+  padding: 0 3px;
+  font-size: 9px;
+  color: var(--text-2);
+}
+
 /* ── toolbar (the lower row of the input box) ── */
 .chat-toolbar {
   display: flex;
