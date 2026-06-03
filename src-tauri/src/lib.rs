@@ -505,6 +505,34 @@ fn copy_item(src_path: String, dest_path: String, state: State<'_, WorkspaceStat
     }
 }
 
+/// Copy a file/folder from OUTSIDE the workspace into the workspace.
+/// Source path is NOT sandboxed — only dest is validated.
+#[tauri::command]
+fn paste_external_file(src_path: String, dest_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
+    let roots = workspace_roots(&state)?;
+    let dest = validate_parent_in_workspace(&dest_path, &roots)?;
+    let src = std::path::Path::new(&src_path);
+    if !src.exists() {
+        return Err(format!("Source does not exist: {}", src_path));
+    }
+    fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let dest_child = dst.join(entry.file_name());
+            if ty.is_dir() { copy_dir_all(&entry.path(), &dest_child)?; }
+            else { fs::copy(entry.path(), &dest_child)?; }
+        }
+        Ok(())
+    }
+    if src.is_dir() {
+        copy_dir_all(src, &dest).map_err(|e| e.to_string())
+    } else {
+        fs::copy(src, &dest).map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
 #[tauri::command]
 fn move_item(src_path: String, dest_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
     let roots = workspace_roots(&state)?;
@@ -2349,6 +2377,7 @@ pub fn run() {
             delete_item,
             copy_item,
             move_item,
+            paste_external_file,
             reveal_in_explorer,
             get_clipboard_file_paths,
             save_chat_history,

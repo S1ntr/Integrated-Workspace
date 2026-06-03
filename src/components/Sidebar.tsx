@@ -336,7 +336,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ directory, activeFilePath, onF
       for (const srcPath of paths) {
         const name = srcPath.replace(/\\/g, "/").split("/").pop() || "file";
         const destPath = `${destDir}/${name}`;
-        await invoke("copy_item", { srcPath: srcPath.replace(/\\/g, "/"), destPath });
+        await invoke("paste_external_file", { srcPath: srcPath.replace(/\\/g, "/"), destPath });
       }
       refresh();
     } catch (e) {
