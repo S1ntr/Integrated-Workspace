@@ -12,8 +12,10 @@ export interface TerminalPanelProps {
   command: string;
   workspaceDir: string;
   widthPercent: number;
+  fullscreened?: boolean;
   onClose: (id: number) => void;
   onChangeAgent: (id: number, label: string, command: string) => void;
+  onToggleFullscreen?: (id: number) => void;
   onSwapSessions?: (idA: number, idB: number) => void;
   onStatusChange?: (id: number, status: "booting" | "running" | "exited") => void;
 }
@@ -24,8 +26,10 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   label,
   command,
   workspaceDir,
+  fullscreened = false,
   onClose,
   onChangeAgent,
+  onToggleFullscreen,
   onSwapSessions,
   onStatusChange,
 }) => {
@@ -44,6 +48,24 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     onStatusChange?.(id, newStatus);
   };
 
+  // Refit xterm when fullscreen state changes (CSS transition needs to settle first)
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      fitRef.current?.fit();
+      termRef.current?.focus();
+    }, 80);
+    return () => window.clearTimeout(t);
+  }, [fullscreened]);
+
+  // Escape key exits fullscreen
+  useEffect(() => {
+    if (!fullscreened) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onToggleFullscreen?.(id);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullscreened, id, onToggleFullscreen]);
 
   useEffect(() => {
     updateStatus("booting");
@@ -498,7 +520,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
 
   return (
     <div
-      className="term-pane"
+      className={`term-pane${fullscreened ? " term-pane-fullscreen" : ""}`}
       draggable={false}
       onDragStart={handleDragStart}
       onDragEnd={handleDragEnd}
@@ -551,6 +573,13 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
         <span className="term-badge">#{id + 1}</span>
         {status === "exited" && <span className="term-exited-label">exited</span>}
         <span className="term-path">{dirShort}</span>
+        <button
+          className="term-close-btn"
+          title={fullscreened ? "Exit fullscreen (Esc)" : "Fullscreen"}
+          onClick={() => onToggleFullscreen?.(id)}
+        >
+          <i className={`bx ${fullscreened ? "bx-exit-fullscreen" : "bx-fullscreen"}`} />
+        </button>
         <button
           className="term-close-btn"
           title="Close"

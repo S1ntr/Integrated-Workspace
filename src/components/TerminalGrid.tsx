@@ -67,6 +67,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
 }) => {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [isResizing, setIsResizing] = useState(false);
+  const [fullscreenId, setFullscreenId] = useState<number | null>(null);
   const [draggingSessionId, setDraggingSessionId] = useState<number | null>(null);
   const [dragOverSessionId, setDragOverSessionId] = useState<number | null>(null);
   const dragOverSessionIdRef = useRef<number | null>(null);
@@ -411,8 +412,10 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
             {...s}
             workspaceDir={workspaceDir}
             widthPercent={pct}
+            fullscreened={fullscreenId === s.id}
             onClose={onClose}
             onChangeAgent={onChangeAgent}
+            onToggleFullscreen={(id) => setFullscreenId(prev => prev === id ? null : id)}
             onSwapSessions={onSwapSessions}
             onStatusChange={onStatusChange}
           />

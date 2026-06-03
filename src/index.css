@@ -904,6 +904,24 @@ input, textarea { font-family: var(--font-ui); }
    promotion in WebView2. When opacity is removed after drag, WebView2 fails
    to repaint the canvas → black bars. A pseudo-element overlay leaves the
    canvas untouched and avoids all compositing side-effects. */
+/* ── Terminal fullscreen overlay ── */
+.term-pane-fullscreen {
+  position: fixed !important;
+  inset: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  z-index: 9000 !important;
+  border-radius: 0 !important;
+}
+.term-pane-fullscreen::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.72);
+  z-index: -1;
+  pointer-events: none;
+}
+
 .term-pane.dragging::after {
   content: '';
   position: absolute;
