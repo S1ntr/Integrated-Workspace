@@ -175,17 +175,72 @@ const Toggle: React.FC<ToggleProps> = ({ label, desc, checked, onChange }) => (
   </div>
 );
 
-type ThemeMode = "dark" | "light" | "auto" | "ocean" | "desert";
+type ThemeMode = "dark" | "light" | "auto" | "ocean" | "desert" | "void" | "forest" | "ember";
 
 function applyTheme(mode: ThemeMode) {
   const root = document.documentElement;
-  if (mode === "dark")        root.setAttribute("data-theme", "dark");
-  else if (mode === "light")  root.setAttribute("data-theme", "light");
-  else if (mode === "ocean")  root.setAttribute("data-theme", "ocean");
-  else if (mode === "desert") root.setAttribute("data-theme", "desert");
-  else                        root.removeAttribute("data-theme");
+  const KEYED = ["light","ocean","desert","void","forest","ember","dark"];
+  if (KEYED.includes(mode)) root.setAttribute("data-theme", mode);
+  else root.removeAttribute("data-theme");
   try { localStorage.setItem("__integraded_theme", mode); } catch {}
 }
+
+interface FontOption {
+  id: string;
+  label: string;
+  value: string;
+  url: string | null;
+  category: string;
+}
+
+const FONT_OPTIONS: FontOption[] = [
+  { id: "ibm-plex",      label: "IBM Plex Sans",     value: "'IBM Plex Sans', system-ui, sans-serif",     url: null,  category: "Default" },
+  { id: "inter",         label: "Inter",              value: "'Inter', system-ui, sans-serif",              url: "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "geist-sans",    label: "Geist",              value: "'Geist Sans', system-ui, sans-serif",         url: "https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "space-grotesk", label: "Space Grotesk",      value: "'Space Grotesk', system-ui, sans-serif",      url: "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "outfit",        label: "Outfit",             value: "'Outfit', system-ui, sans-serif",             url: "https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "plus-jakarta",  label: "Plus Jakarta Sans",  value: "'Plus Jakarta Sans', sans-serif",             url: "https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "dm-sans",       label: "DM Sans",            value: "'DM Sans', sans-serif",                       url: "https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "manrope",       label: "Manrope",            value: "'Manrope', sans-serif",                       url: "https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "nunito",        label: "Nunito",             value: "'Nunito', sans-serif",                        url: "https://fonts.googleapis.com/css2?family=Nunito:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "sora",          label: "Sora",               value: "'Sora', sans-serif",                          url: "https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "figtree",       label: "Figtree",            value: "'Figtree', sans-serif",                       url: "https://fonts.googleapis.com/css2?family=Figtree:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "onest",         label: "Onest",              value: "'Onest', sans-serif",                         url: "https://fonts.googleapis.com/css2?family=Onest:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "lexend",        label: "Lexend",             value: "'Lexend', sans-serif",                        url: "https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "rubik",         label: "Rubik",              value: "'Rubik', sans-serif",                         url: "https://fonts.googleapis.com/css2?family=Rubik:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "work-sans",     label: "Work Sans",          value: "'Work Sans', sans-serif",                     url: "https://fonts.googleapis.com/css2?family=Work+Sans:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "karla",         label: "Karla",              value: "'Karla', sans-serif",                         url: "https://fonts.googleapis.com/css2?family=Karla:wght@300;400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "cabin",         label: "Cabin",              value: "'Cabin', sans-serif",                         url: "https://fonts.googleapis.com/css2?family=Cabin:wght@400;500;600;700&display=swap", category: "Sans-serif" },
+  { id: "josefin",       label: "Josefin Sans",       value: "'Josefin Sans', sans-serif",                  url: "https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@300;400;600;700&display=swap", category: "Display" },
+  { id: "raleway",       label: "Raleway",            value: "'Raleway', sans-serif",                       url: "https://fonts.googleapis.com/css2?family=Raleway:wght@300;400;500;600;700&display=swap", category: "Display" },
+  { id: "montserrat",    label: "Montserrat",         value: "'Montserrat', sans-serif",                    url: "https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600;700&display=swap", category: "Display" },
+];
+
+const loadedFonts = new Set<string>();
+
+function loadFont(font: FontOption) {
+  if (!font.url || loadedFonts.has(font.id)) return;
+  loadedFonts.add(font.id);
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = font.url;
+  document.head.appendChild(link);
+}
+
+function applyFont(fontId: string) {
+  const font = FONT_OPTIONS.find(f => f.id === fontId) || FONT_OPTIONS[0];
+  loadFont(font);
+  document.documentElement.style.setProperty("--font-ui", font.value);
+  try { localStorage.setItem("__integraded_font", fontId); } catch {}
+}
+
+// Pre-load saved font on module init
+(function initFont() {
+  try {
+    const saved = localStorage.getItem("__integraded_font");
+    if (saved) applyFont(saved);
+  } catch {}
+})()
 
 const TABS = [
   { id: "keys",       label: "API Keys",   icon: "bx-key" },
@@ -214,6 +269,15 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
   const changeTheme = (mode: ThemeMode) => {
     setThemeMode(mode);
     applyTheme(mode);
+  };
+
+  const [fontId, setFontId] = useState<string>(() => {
+    try { return localStorage.getItem("__integraded_font") || "ibm-plex"; } catch { return "ibm-plex"; }
+  });
+
+  const changeFont = (id: string) => {
+    setFontId(id);
+    applyFont(id);
   };
 
   const [loading, setLoading] = useState(true);
@@ -737,6 +801,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
           {/* ─── TAB: Appearance ─── */}
           {activeTab === "appearance" && (
             <div className="stng-tab-content">
+              {/* Theme */}
               <div className="stng-section">
                 <div className="stng-section-header">
                   <i className="bx bx-palette" />
@@ -748,11 +813,14 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                   </p>
                   <div className="theme-picker">
                     {([
-                      { value: "dark"  as const, label: "Dark",  icon: "bx-moon",   swatchClass: "theme-swatch-dark"  },
-                      { value: "light" as const, label: "Light", icon: "bx-sun",    swatchClass: "theme-swatch-light" },
-                      { value: "auto"  as const, label: "Auto",  icon: "bx-adjust", swatchClass: "theme-swatch-auto"  },
-                      { value: "ocean"  as const, label: "Ocean",  icon: "bx-water",     swatchClass: "theme-swatch-ocean"  },
-                      { value: "desert" as const, label: "Desert", icon: "bx-landscape", swatchClass: "theme-swatch-desert" },
+                      { value: "dark"   as const, label: "Dark",    icon: "bx-moon",      swatchClass: "theme-swatch-dark"   },
+                      { value: "light"  as const, label: "Light",   icon: "bx-sun",       swatchClass: "theme-swatch-light"  },
+                      { value: "auto"   as const, label: "Auto",    icon: "bx-adjust",    swatchClass: "theme-swatch-auto"   },
+                      { value: "ocean"  as const, label: "Ocean",   icon: "bx-water",     swatchClass: "theme-swatch-ocean"  },
+                      { value: "desert" as const, label: "Desert",  icon: "bx-landscape", swatchClass: "theme-swatch-desert" },
+                      { value: "void"   as const, label: "Void",    icon: "bx-planet",    swatchClass: "theme-swatch-void"   },
+                      { value: "forest" as const, label: "Forest",  icon: "bx-leaf",      swatchClass: "theme-swatch-forest" },
+                      { value: "ember"  as const, label: "Ember",   icon: "bx-flame",     swatchClass: "theme-swatch-ember"  },
                     ]).map(t => (
                       <button
                         key={t.value}
@@ -765,6 +833,34 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                           <i className={`bx ${t.icon}`} />
                           {t.label}
                         </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Font */}
+              <div className="stng-section">
+                <div className="stng-section-header">
+                  <i className="bx bx-font" />
+                  <span>UI Font</span>
+                </div>
+                <div className="stng-section-body">
+                  <p className="stng-section-desc">
+                    Choose the font used throughout the app interface. Applies immediately.
+                  </p>
+                  <div className="font-picker">
+                    {FONT_OPTIONS.map(f => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        className={`font-option ${fontId === f.id ? "active" : ""}`}
+                        onClick={() => changeFont(f.id)}
+                        onMouseEnter={() => loadFont(f)}
+                        title={f.label}
+                      >
+                        <span className="font-option-name" style={{ fontFamily: f.value }}>{f.label}</span>
+                        <span className="font-option-meta">{f.category}</span>
                       </button>
                     ))}
                   </div>

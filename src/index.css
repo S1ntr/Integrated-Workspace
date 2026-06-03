@@ -173,6 +173,114 @@ html[data-theme="ocean"] {
   --shadow-xl: 0 20px 60px rgba(0,0,0,0.88), 0 0 0 1px rgba(56,189,248,0.09);
 }
 
+/* ── VOID MODE ───────────────────────────────────────────── */
+/* Deep space — near-pure-black with cold violet undertone, indigo accent */
+html[data-theme="void"] {
+  --bg-base: #030308;
+  --bg-1:    #07080f;
+  --bg-2:    #0d0f1c;
+  --bg-3:    #13152a;
+  --bg-4:    #1a1d36;
+  --bg-5:    #222644;
+  --bg-6:    #2c3058;
+
+  --text-1:  #e4e4ff;
+  --text-2:  #7878b0;
+  --text-3:  #3e3e72;
+  --text-4:  #252548;
+
+  --accent:        #7c6cff;
+  --accent-subtle: rgba(124,108,255,0.07);
+  --accent-border: rgba(124,108,255,0.20);
+  --accent-bright: #a89fff;
+
+  --ok:        #4ade80;
+  --ok-dim:    rgba(74,222,128,0.08);
+  --ok-border: rgba(74,222,128,0.18);
+  --warn:      #fbbf24;
+  --warn-dim:  rgba(251,191,36,0.08);
+  --err:       #f87171;
+  --err-dim:   rgba(248,113,113,0.08);
+  --err-border:rgba(248,113,113,0.20);
+
+  --shadow-sm: 0 1px 4px rgba(0,0,0,0.80);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.82);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.90), 0 0 0 1px rgba(124,108,255,0.06);
+  --shadow-xl: 0 20px 60px rgba(0,0,0,0.96), 0 0 0 1px rgba(124,108,255,0.10);
+}
+
+/* ── FOREST MODE ─────────────────────────────────────────── */
+/* Mossy dark — deep woodland greens, emerald accent */
+html[data-theme="forest"] {
+  --bg-base: #060e08;
+  --bg-1:    #0b1610;
+  --bg-2:    #101e15;
+  --bg-3:    #16281c;
+  --bg-4:    #1c3224;
+  --bg-5:    #243e2c;
+  --bg-6:    #2e4e37;
+
+  --text-1:  #d0ead6;
+  --text-2:  #6a9e76;
+  --text-3:  #3a5e42;
+  --text-4:  #223628;
+
+  --accent:        #34d399;
+  --accent-subtle: rgba(52,211,153,0.07);
+  --accent-border: rgba(52,211,153,0.20);
+  --accent-bright: #6ee7b7;
+
+  --ok:        #4ade80;
+  --ok-dim:    rgba(74,222,128,0.08);
+  --ok-border: rgba(74,222,128,0.18);
+  --warn:      #fbbf24;
+  --warn-dim:  rgba(251,191,36,0.08);
+  --err:       #f87171;
+  --err-dim:   rgba(248,113,113,0.08);
+  --err-border:rgba(248,113,113,0.20);
+
+  --shadow-sm: 0 1px 4px rgba(0,0,0,0.72);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.74);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.82), 0 0 0 1px rgba(52,211,153,0.06);
+  --shadow-xl: 0 20px 60px rgba(0,0,0,0.90), 0 0 0 1px rgba(52,211,153,0.09);
+}
+
+/* ── EMBER MODE ──────────────────────────────────────────── */
+/* Forge & ash — deep charcoal-crimson, fiery orange-red accent */
+html[data-theme="ember"] {
+  --bg-base: #0e0707;
+  --bg-1:    #160c0c;
+  --bg-2:    #1e1010;
+  --bg-3:    #281414;
+  --bg-4:    #341a1a;
+  --bg-5:    #402020;
+  --bg-6:    #502a2a;
+
+  --text-1:  #f0dfdf;
+  --text-2:  #a06060;
+  --text-3:  #5e3030;
+  --text-4:  #3c1e1e;
+
+  --accent:        #fb923c;
+  --accent-subtle: rgba(251,146,60,0.07);
+  --accent-border: rgba(251,146,60,0.20);
+  --accent-bright: #fdba74;
+
+  --ok:        #4ade80;
+  --ok-dim:    rgba(74,222,128,0.08);
+  --ok-border: rgba(74,222,128,0.18);
+  --warn:      #fbbf24;
+  --warn-dim:  rgba(251,191,36,0.08);
+  --err:       #f87171;
+  --err-dim:   rgba(248,113,113,0.08);
+  --err-border:rgba(248,113,113,0.20);
+
+  --shadow-sm: 0 1px 4px rgba(0,0,0,0.72);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.74);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.82), 0 0 0 1px rgba(251,146,60,0.06);
+  --shadow-xl: 0 20px 60px rgba(0,0,0,0.90), 0 0 0 1px rgba(251,146,60,0.09);
+}
+
 /* ── RESET ──────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html, body, #root { width: 100vw; height: 100vh; overflow: hidden; }
@@ -3685,6 +3793,70 @@ input, textarea { font-family: var(--font-ui); }
     linear-gradient(#2a211a 3px, #2a211a 13px, transparent 13px),
     linear-gradient(to right, #2a211a 0px, #2a211a 24px, #181410 24px);
 }
+
+/* Void swatch: near-black with violet accent stripe */
+.theme-swatch-void {
+  background:
+    linear-gradient(#7c6cff 0px, #7c6cff 3px, transparent 3px),
+    linear-gradient(#0d0f1c 3px, #0d0f1c 13px, transparent 13px),
+    linear-gradient(to right, #0d0f1c 0px, #0d0f1c 24px, #030308 24px);
+}
+
+/* Forest swatch: deep green with emerald accent stripe */
+.theme-swatch-forest {
+  background:
+    linear-gradient(#34d399 0px, #34d399 3px, transparent 3px),
+    linear-gradient(#101e15 3px, #101e15 13px, transparent 13px),
+    linear-gradient(to right, #101e15 0px, #101e15 24px, #060e08 24px);
+}
+
+/* Ember swatch: deep charcoal-crimson with orange accent stripe */
+.theme-swatch-ember {
+  background:
+    linear-gradient(#fb923c 0px, #fb923c 3px, transparent 3px),
+    linear-gradient(#1e1010 3px, #1e1010 13px, transparent 13px),
+    linear-gradient(to right, #1e1010 0px, #1e1010 24px, #0e0707 24px);
+}
+
+/* ── Font picker ─────────────────────────────────────────── */
+.font-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 6px;
+}
+.font-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+  text-align: left;
+}
+.font-option:hover { border-color: var(--bg-5); background: var(--bg-3); }
+.font-option.active { border-color: var(--accent-border); background: var(--accent-subtle); }
+.font-option-name {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text-1);
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.font-option-meta {
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+}
+.font-option.active .font-option-meta { color: var(--accent); }
 
 /* Label row inside each theme card */
 .theme-label {
