@@ -40,7 +40,11 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onC
   const [selected, setSelected] = useState("shell");
   const [count, setCount] = useState(1);
   const [skipPerms, setSkipPerms] = useState(localStorage.getItem("__integraded_claude_skip_permissions") !== "0");
+  const [customLabel, setCustomLabel] = useState("");
+  const [customCommand, setCustomCommand] = useState("");
   const pick = AGENT_OPTIONS.find(a => a.key === selected) ?? AGENT_OPTIONS[0];
+  const isCustom = selected === "custom";
+  const canLaunch = isCustom ? customCommand.trim().length > 0 : true;
 
   return (
     <div className="dialog-overlay" onClick={onCancel}>
@@ -64,6 +68,46 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onC
               {selected === a.key && <i className="bx bxs-check-circle dialog-check" />}
             </div>
           ))}
+
+          {/* Custom option */}
+          <div
+            className={`dialog-option ${isCustom ? "selected" : ""}`}
+            onClick={() => setSelected("custom")}
+          >
+            <i className="bx bx-code-curly" />
+            <div className="dialog-option-text">
+              <span className="dialog-option-name">Custom</span>
+              <span className="dialog-option-desc">Any CLI tool — enter your own launch command</span>
+            </div>
+            {isCustom && <i className="bx bxs-check-circle dialog-check" />}
+          </div>
+
+          {isCustom && (
+            <div className="dialog-custom-fields" onClick={e => e.stopPropagation()}>
+              <div className="dialog-custom-field">
+                <label className="dialog-custom-label">Label (optional)</label>
+                <input
+                  className="dialog-custom-input"
+                  type="text"
+                  placeholder="My Tool"
+                  value={customLabel}
+                  onChange={e => setCustomLabel(e.target.value)}
+                  autoFocus
+                />
+              </div>
+              <div className="dialog-custom-field">
+                <label className="dialog-custom-label">Launch command <span className="dialog-custom-required">*</span></label>
+                <input
+                  className="dialog-custom-input"
+                  type="text"
+                  placeholder="e.g.  aider  /  npx @openai/codex  /  gemini"
+                  value={customCommand}
+                  onChange={e => setCustomCommand(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter" && canLaunch) { onConfirm(customLabel.trim() || customCommand.trim(), customCommand.trim(), count); } }}
+                />
+              </div>
+            </div>
+          )}
 
           <div className="dialog-count-picker">
             <span className="dialog-count-label">Instances to open:</span>
@@ -107,9 +151,13 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onC
         </div>
         <div className="dialog-footer">
           <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
-          <button className="btn btn-primary" onClick={() => {
-            const cmd = selected === "claude" && skipPerms ? "claude --dangerously-skip-permissions" : pick.command;
-            onConfirm(pick.label, cmd, count);
+          <button className="btn btn-primary" disabled={!canLaunch} onClick={() => {
+            if (isCustom) {
+              onConfirm(customLabel.trim() || customCommand.trim(), customCommand.trim(), count);
+            } else {
+              const cmd = selected === "claude" && skipPerms ? "claude --dangerously-skip-permissions" : pick.command;
+              onConfirm(pick.label, cmd, count);
+            }
           }}>
             <i className="bx bx-play" />
             Launch

@@ -1063,6 +1063,9 @@ export const ChatPanel: React.FC<{
 
   // ── Terminal picker ──────────────────────────────────────────────────────────
   const [termPickerOpen, setTermPickerOpen] = useState(false);
+  const [termCustomOpen, setTermCustomOpen] = useState(false);
+  const [termCustomLabel, setTermCustomLabel] = useState("");
+  const [termCustomCommand, setTermCustomCommand] = useState("");
   const termPickerRef = useRef<HTMLDivElement>(null);
 
   // ── Model selection ──────────────────────────────────────────────────────────
@@ -2824,12 +2827,61 @@ export const ChatPanel: React.FC<{
                     onClick={() => {
                       onAddSessionRef.current?.(ag.label, ag.command);
                       setTermPickerOpen(false);
+                      setTermCustomOpen(false);
                     }}
                   >
                     <i className={`bx ${ag.icon}`} />
                     <span>{ag.label}</span>
                   </button>
                 ))}
+                {/* Custom option */}
+                <button
+                  type="button"
+                  className={`chat-dropdown-item ${termCustomOpen ? "active" : ""}`}
+                  onClick={() => { setTermCustomOpen(o => !o); setTermCustomLabel(""); setTermCustomCommand(""); }}
+                >
+                  <i className="bx bx-code-curly" />
+                  <span>Custom…</span>
+                </button>
+                {termCustomOpen && (
+                  <div className="chat-term-custom-fields" onClick={e => e.stopPropagation()}>
+                    <input
+                      className="chat-term-custom-input"
+                      type="text"
+                      placeholder="Label (optional)"
+                      value={termCustomLabel}
+                      onChange={e => setTermCustomLabel(e.target.value)}
+                    />
+                    <input
+                      className="chat-term-custom-input"
+                      type="text"
+                      placeholder="Launch command (e.g. aider)"
+                      value={termCustomCommand}
+                      autoFocus
+                      onChange={e => setTermCustomCommand(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === "Enter" && termCustomCommand.trim()) {
+                          onAddSessionRef.current?.(termCustomLabel.trim() || termCustomCommand.trim(), termCustomCommand.trim());
+                          setTermPickerOpen(false);
+                          setTermCustomOpen(false);
+                        }
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="chat-term-custom-launch"
+                      disabled={!termCustomCommand.trim()}
+                      onClick={() => {
+                        if (!termCustomCommand.trim()) return;
+                        onAddSessionRef.current?.(termCustomLabel.trim() || termCustomCommand.trim(), termCustomCommand.trim());
+                        setTermPickerOpen(false);
+                        setTermCustomOpen(false);
+                      }}
+                    >
+                      <i className="bx bx-play" /> Launch
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>

@@ -4169,6 +4169,85 @@ input, textarea { font-family: var(--font-ui); }
   margin-left: 4px;
 }
 
+/* ── Custom agent fields (dialog) ── */
+.dialog-custom-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius-sm);
+  margin-top: 4px;
+}
+.dialog-custom-field { display: flex; flex-direction: column; gap: 4px; }
+.dialog-custom-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+}
+.dialog-custom-required { color: var(--err); }
+.dialog-custom-input {
+  height: 30px;
+  padding: 0 9px;
+  background: var(--bg-base);
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius-xs);
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.12s;
+}
+.dialog-custom-input:focus { border-color: var(--accent-border); }
+.dialog-custom-input::placeholder { color: var(--text-3); }
+
+/* ── Custom agent fields (chat term picker) ── */
+.chat-term-custom-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--bg-3);
+  background: var(--bg-2);
+}
+.chat-term-custom-input {
+  height: 26px;
+  padding: 0 8px;
+  background: var(--bg-base);
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius-xs);
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  outline: none;
+  transition: border-color 0.12s;
+  width: 100%;
+}
+.chat-term-custom-input:focus { border-color: var(--accent-border); }
+.chat-term-custom-input::placeholder { color: var(--text-3); }
+.chat-term-custom-launch {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 10px;
+  background: var(--accent);
+  color: var(--bg-base);
+  border: none;
+  border-radius: var(--radius-xs);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  align-self: flex-end;
+  transition: opacity 0.12s;
+}
+.chat-term-custom-launch:disabled { opacity: 0.4; cursor: default; }
+.chat-term-custom-launch:not(:disabled):hover { opacity: 0.85; }
+
 /* ── Absolute Panels for independent resizes ── */
 .tgrid-absolute-panel {
   display: flex;
