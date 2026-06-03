@@ -2796,7 +2796,7 @@ export const ChatPanel: React.FC<{
       <div className="chat-panel-header">
         <div className="chat-header-left">
           <span className="chat-header-logo-wrap">
-            <img src="/logo.svg" className="chat-header-logo" alt="" />
+            <img src="/logo.png" className="chat-header-logo" alt="" />
             <span className={`chat-header-dot ${models.length > 0 ? "online" : "offline"}`} />
           </span>
           <span className="chat-header-title">Integraded Chat</span>
@@ -3065,7 +3065,7 @@ export const ChatPanel: React.FC<{
                     ) : m.agent === "diff" ? (
                       <i className="bx bx-git-compare" />
                     ) : (
-                      <img src="/logo.svg" className="chat-avatar-logo" alt="" />
+                      <img src="/logo.png" className="chat-avatar-logo" alt="" />
                     )}
                   </span>
                   <div className="chat-msg-ai-content">
@@ -3103,7 +3103,7 @@ export const ChatPanel: React.FC<{
         {isProcessing && !msgs.some(m => m.streaming) && (
           <div className="chat-msg orchestrator">
             <div className="chat-msg-ai-wrap">
-              <span className="chat-avatar orchestrator"><img src="/logo.svg" className="chat-avatar-logo" alt="" /></span>
+              <span className="chat-avatar orchestrator"><img src="/logo.png" className="chat-avatar-logo" alt="" /></span>
               <div className="chat-msg-ai-content">
                 <div className="chat-msg-meta">
                   <span className="chat-sender">Integraded</span>

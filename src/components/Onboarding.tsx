@@ -84,7 +84,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
       <div className="onboarding-card onboarding-single">
         {/* Brand */}
         <div className="onboarding-brand">
-          <img src="/logo.svg" alt="" className="onboarding-logo" />
+          <img src="/logo.png" alt="" className="onboarding-logo" />
           <div>
             <h1 className="onboarding-title">Integraded Workspace</h1>
             <p className="onboarding-subtitle">Configure your environment and launch</p>

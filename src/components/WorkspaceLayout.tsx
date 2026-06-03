@@ -657,7 +657,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
       {/* ── Header ── */}
       <header className="app-header">
         <div className="header-brand">
-          <img src="/logo.svg" className="header-logo" alt="" />
+          <img src="/logo.png" className="header-logo" alt="" />
           <span className="header-name">Integraded</span>
         </div>
         <div className="header-pills-row">
