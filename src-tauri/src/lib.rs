@@ -576,15 +576,17 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
 fn get_clipboard_file_paths() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
+        let utf8_prefix = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; ";
         // Try Get-Clipboard -Format FileDropList (PowerShell 5.1+)
+        let cmd1 = format!("{}try {{ $files = Get-Clipboard -Format FileDropList -ErrorAction Stop; if ($files) {{ $files | ForEach-Object {{ $_.FullName }} }} }} catch {{ }}", utf8_prefix);
         let ps = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command",
-                "try { $files = Get-Clipboard -Format FileDropList -ErrorAction Stop; if ($files) { $files | ForEach-Object { $_.FullName } } } catch { }"])
+            .args(["-NoProfile", "-NonInteractive", "-Command", &cmd1])
             .output();
         if let Ok(out) = ps {
-            let text = String::from_utf8_lossy(&out.stdout);
+            let raw = strip_utf8_bom(&out.stdout);
+            let text = String::from_utf8_lossy(raw);
             let paths: Vec<String> = text.lines()
-                .map(|l| l.trim().to_string())
+                .map(|l| l.trim().trim_end_matches('\r').to_string())
                 .filter(|l| !l.is_empty())
                 .collect();
             if !paths.is_empty() {
@@ -592,19 +594,24 @@ fn get_clipboard_file_paths() -> Vec<String> {
             }
         }
         // Fallback: Add-Type approach
+        let cmd2 = format!("{}Add-Type -AssemblyName System.Windows.Forms; $files = [System.Windows.Forms.Clipboard]::GetFileDropList(); $files | ForEach-Object {{ $_ }}", utf8_prefix);
         let ps2 = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; $files = [System.Windows.Forms.Clipboard]::GetFileDropList(); $files | ForEach-Object { $_ }"])
+            .args(["-NoProfile", "-NonInteractive", "-Command", &cmd2])
             .output();
         if let Ok(out) = ps2 {
-            let text = String::from_utf8_lossy(&out.stdout);
+            let raw = strip_utf8_bom(&out.stdout);
+            let text = String::from_utf8_lossy(raw);
             return text.lines()
-                .map(|l| l.trim().to_string())
+                .map(|l| l.trim().trim_end_matches('\r').to_string())
                 .filter(|l| !l.is_empty())
                 .collect();
         }
     }
     vec![]
+}
+
+fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) { &bytes[3..] } else { bytes }
 }
 
 /// Return a folder name like "Thursday_2026-05-28" for today's date.
