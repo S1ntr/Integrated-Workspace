@@ -1555,6 +1555,34 @@ export const ChatPanel: React.FC<{
     return () => window.removeEventListener("__integradedSkillsUpdated", load);
   }, []);
 
+  // ── Self-load workspace files for @mention — independent of parent prop ──────
+  // The parent's mentionFiles comes from baselineSnapshot which loads slowly.
+  // We keep our own flat file index so the dropdown is always populated.
+  useEffect(() => {
+    if (!workspaceDir) return;
+    const loadFiles = async () => {
+      try {
+        interface FileEntry { path: string; name: string; is_dir: boolean; children?: FileEntry[] }
+        const entries = await invoke<FileEntry[]>("list_files", { dirPath: workspaceDir });
+        const flat: MentionFile[] = [];
+        const recurse = (list: FileEntry[]) => {
+          for (const e of list) {
+            if (e.is_dir) { if (e.children) recurse(e.children); }
+            else flat.push({ path: e.path, name: e.name });
+          }
+        };
+        recurse(entries);
+        // Merge with parent prop (parent may have newer content for changed files)
+        const parentPaths = new Set(mentionFilesRef.current.map(f => f.path));
+        const combined = [...mentionFilesRef.current, ...flat.filter(f => !parentPaths.has(f.path))];
+        mentionFilesRef.current = combined;
+      } catch {}
+    };
+    loadFiles();
+    const id = window.setInterval(loadFiles, 8000);
+    return () => window.clearInterval(id);
+  }, [workspaceDir]);
+
   // Speech recognition
   useEffect(() => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
