@@ -32,6 +32,56 @@ function highlightToken(kind: string, index: number): string {
   return `___${kind}_${tokenIndex(index)}___`;
 }
 
+function applyCssHighlight(content: string): string {
+  let r = content;
+  const comments: string[] = [];
+  r = r.replace(/\/\*[\s\S]*?\*\//g, (m) => {
+    comments.push(`<span class="hl-comment">${m}</span>`);
+    return highlightToken("_CC", comments.length - 1);
+  });
+  const strings: string[] = [];
+  r = r.replace(/(".*?"|'.*?')/g, (m) => {
+    strings.push(`<span class="hl-string">${m}</span>`);
+    return highlightToken("_CS", strings.length - 1);
+  });
+  r = r
+    .replace(/([a-zA-Z0-9.#*@:\[\]=_-]+)\s*(\{)/g, '<span class="hl-keyword">$1</span> $2')
+    .replace(/([a-zA-Z0-9-]+)\s*:/g, '<span class="hl-attr">$1</span>:')
+    .replace(/(#[a-fA-F0-9]{3,8})/g, '<span class="hl-number">$&</span>')
+    .replace(/\b(\d+(?:px|em|rem|%|vh|vw|ms|s|deg)?)\b/g, '<span class="hl-number">$&</span>');
+  for (let i = 0; i < strings.length; i++) r = r.replace(highlightToken("_CS", i), strings[i]);
+  for (let i = 0; i < comments.length; i++) r = r.replace(highlightToken("_CC", i), comments[i]);
+  return r;
+}
+
+function applyJsHighlight(content: string): string {
+  let r = content;
+  const comments: string[] = [];
+  r = r
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => { comments.push(`<span class="hl-comment">${m}</span>`); return highlightToken("_JC", comments.length - 1); })
+    .replace(/\/\/.*$/gm, (m) => { comments.push(`<span class="hl-comment">${m}</span>`); return highlightToken("_JC", comments.length - 1); });
+  const strings: string[] = [];
+  r = r
+    .replace(/"(\\.|[^"\\])*"/g, (m) => { strings.push(`<span class="hl-string">${m}</span>`); return highlightToken("_JS", strings.length - 1); })
+    .replace(/'(\\.|[^'\\])*'/g, (m) => { strings.push(`<span class="hl-string">${m}</span>`); return highlightToken("_JS", strings.length - 1); })
+    .replace(/`([\s\S]*?)`/g, (m) => { strings.push(`<span class="hl-string">${m}</span>`); return highlightToken("_JS", strings.length - 1); });
+  r = r
+    .replace(/\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|default|class|interface|export|import|from|as|extends|new|this|typeof|instanceof|void|async|await)\b/g, '<span class="hl-keyword">$&</span>')
+    .replace(/\b(string|number|boolean|any|object|null|undefined|true|false|NaN|Infinity)\b/g, '<span class="hl-type">$&</span>')
+    .replace(/\b(0x[a-fA-F0-9]+|\d+(?:\.\d*)?)\b/g, '<span class="hl-number">$&</span>');
+  for (let i = 0; i < strings.length; i++) r = r.replace(highlightToken("_JS", i), strings[i]);
+  for (let i = 0; i < comments.length; i++) r = r.replace(highlightToken("_JC", i), comments[i]);
+  return r;
+}
+
+function highlightHtmlTagStr(tag: string): string {
+  return tag.replace(/(&lt;\/?[a-zA-Z0-9:-]+)([\s\S]*?)(&gt;)/g, (_m, p1, p2, p3) => {
+    const attrs = p2.replace(/([a-zA-Z0-9:-]+)\s*=\s*(".*?"|'.*?'|[^\s>]+)/g, (_ma: string, aName: string, aVal: string) =>
+      `<span class="hl-attr">${aName}</span>=<span class="hl-string">${aVal}</span>`);
+    return `<span class="hl-tag">${p1}</span>${attrs}<span class="hl-tag">${p3}</span>`;
+  });
+}
+
 export function highlightCode(
   code: string,
   fileName: string,
@@ -75,32 +125,49 @@ export function highlightCode(
       result = result.replace(highlightToken("STR", i), `<span class="${cls}">${strings[i]}</span>`);
     }
   } else if (ext === "html" || ext === "xml") {
-    // 1. Extract comments
+    // 1. Extract HTML comments
     const comments: string[] = [];
     result = result.replace(/&lt;!--[\s\S]*?--&gt;/g, (match) => {
       comments.push(`<span class="hl-comment">${match}</span>`);
       return highlightToken("COMMENT", comments.length - 1);
     });
 
-    // 2. Extract tags and highlight inside them
+    // 2. Extract <style> blocks — apply CSS highlighting to content
+    const styleBlocks: string[] = [];
+    result = result.replace(
+      /(&lt;style(?:(?!&gt;)[\s\S])*?&gt;)([\s\S]*?)(&lt;\/style&gt;)/gi,
+      (_m, open, inner, close) => {
+        styleBlocks.push(`${highlightHtmlTagStr(open)}${applyCssHighlight(inner)}${highlightHtmlTagStr(close)}`);
+        return highlightToken("STYLEBLK", styleBlocks.length - 1);
+      }
+    );
+
+    // 3. Extract <script> blocks — apply JS highlighting to content
+    const scriptBlocks: string[] = [];
+    result = result.replace(
+      /(&lt;script(?:(?!&gt;)[\s\S])*?&gt;)([\s\S]*?)(&lt;\/script&gt;)/gi,
+      (_m, open, inner, close) => {
+        scriptBlocks.push(`${highlightHtmlTagStr(open)}${applyJsHighlight(inner)}${highlightHtmlTagStr(close)}`);
+        return highlightToken("SCRIPTBLK", scriptBlocks.length - 1);
+      }
+    );
+
+    // 4. Highlight remaining HTML tags
     const tags: string[] = [];
     result = result.replace(/(&lt;\/?[a-zA-Z0-9:-]+)([\s\S]*?)(&gt;)/g, (_match, p1, p2, p3) => {
       let attrs = p2;
       attrs = attrs.replace(/([a-zA-Z0-9:-]+)\s*=\s*(".*?"|'.*?'|[^\s>]+)/g, (_m: string, aName: string, aVal: string) => {
         return `<span class="hl-attr">${aName}</span>=<span class="hl-string">${aVal}</span>`;
       });
-      const highlightedTag = `<span class="hl-tag">${p1}</span>${attrs}<span class="hl-tag">${p3}</span>`;
-      tags.push(highlightedTag);
+      tags.push(`<span class="hl-tag">${p1}</span>${attrs}<span class="hl-tag">${p3}</span>`);
       return highlightToken("TAG", tags.length - 1);
     });
 
-    // 3. Restore comments and tags
-    for (let i = 0; i < tags.length; i++) {
-      result = result.replace(highlightToken("TAG", i), tags[i]);
-    }
-    for (let i = 0; i < comments.length; i++) {
-      result = result.replace(highlightToken("COMMENT", i), comments[i]);
-    }
+    // 5. Restore all
+    for (let i = 0; i < tags.length; i++) result = result.replace(highlightToken("TAG", i), tags[i]);
+    for (let i = 0; i < comments.length; i++) result = result.replace(highlightToken("COMMENT", i), comments[i]);
+    for (let i = 0; i < styleBlocks.length; i++) result = result.replace(highlightToken("STYLEBLK", i), styleBlocks[i]);
+    for (let i = 0; i < scriptBlocks.length; i++) result = result.replace(highlightToken("SCRIPTBLK", i), scriptBlocks[i]);
   } else if (ext === "css") {
     // 1. Extract comments
     const comments: string[] = [];

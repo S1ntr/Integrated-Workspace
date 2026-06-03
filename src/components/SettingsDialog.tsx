@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { SkillsTab } from "./SkillsTab";
 
 interface SettingsDialogProps {
   onClose: () => void;
@@ -188,6 +189,7 @@ function applyTheme(mode: ThemeMode) {
 
 const TABS = [
   { id: "keys",       label: "API Keys",   icon: "bx-key" },
+  { id: "skills",     label: "Skills",     icon: "bx-extension" },
   { id: "behavior",   label: "Behavior",   icon: "bx-slider" },
   { id: "appearance", label: "Appearance", icon: "bx-palette" },
 ];
@@ -223,6 +225,20 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
   const [testingLocal, setTestingLocal] = useState<string | null>(null);
   const [localStatus, setLocalStatus] = useState<Record<string, "ok" | "err" | null>>({});
   const [confirmClear, setConfirmClear] = useState(false);
+  const [disabledProviders, setDisabledProviders] = useState<Set<string>>(new Set());
+
+  const toggleProvider = async (provider: string) => {
+    const isDisabled = disabledProviders.has(provider);
+    const next = new Set(disabledProviders);
+    if (isDisabled) next.delete(provider); else next.add(provider);
+    setDisabledProviders(next);
+    try {
+      await invoke("set_provider_enabled", { provider, enabled: isDisabled });
+      window.dispatchEvent(new CustomEvent("__integradedConfigUpdated"));
+    } catch (err: any) {
+      setError(`Failed to toggle provider: ${err}`);
+    }
+  };
 
   useEffect(() => {
     (async () => {
@@ -241,6 +257,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
         Object.entries(loaded.api_keys || {}).forEach(([k, v]) => {
           if (v && v.length > 5) setKeyStatus(prev => ({ ...prev, [k]: "ok" }));
         });
+        if (Array.isArray(loaded.disabled_providers)) {
+          setDisabledProviders(new Set(loaded.disabled_providers as string[]));
+        }
       } catch (err) {
         console.error("Failed to load config:", err);
       } finally {
@@ -257,6 +276,21 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
     setKeyStatus(prev => ({ ...prev, [provider]: null }));
   };
 
+  const deleteKey = async (provider: string) => {
+    const newConfig = {
+      ...config,
+      api_keys: { ...config.api_keys, [provider]: "" },
+    };
+    setConfig(newConfig);
+    setKeyStatus(prev => ({ ...prev, [provider]: null }));
+    try {
+      await invoke("save_config", { config: newConfig });
+      window.dispatchEvent(new CustomEvent("__integradedConfigUpdated"));
+    } catch (err: any) {
+      setError(`Failed to remove key: ${err}`);
+    }
+  };
+
   const openProviderDocs = async (url: string) => {
     try {
       await openUrl(url);
@@ -267,7 +301,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
   };
 
   const validateKey = async (cloudProv: string, key: string): Promise<boolean> => {
-    if (!key.trim()) { setError("Please enter an API key."); return false; }
+    if (!key.trim() || key === "••••••••••••••••") { setError("Please enter an API key."); return false; }
     setValidating(cloudProv);
     setError(null);
     try {
@@ -299,7 +333,21 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
       const res = await invoke<string>("curl_post", { url, body: requestBody, headers });
       const data = JSON.parse(res);
       if (data.error) throw new Error(data.error.message || "Invalid key");
+
+      // ── Auto-save verified key to OS keychain immediately ──────────────────
+      const newConfig = {
+        ...config,
+        api_keys: { ...config.api_keys, [cloudProv]: key },
+      };
+      await invoke("save_config", { config: newConfig });
+      // Update local state: key is now stored (show masked placeholder)
+      setConfig(prev => ({
+        ...prev,
+        api_keys: { ...prev.api_keys, [cloudProv]: "••••••••••••••••" },
+      }));
       setKeyStatus(prev => ({ ...prev, [cloudProv]: "ok" }));
+      // Notify ChatPanel so models from this provider appear immediately
+      window.dispatchEvent(new CustomEvent("__integradedConfigUpdated"));
       return true;
     } catch (err: any) {
       setKeyStatus(prev => ({ ...prev, [cloudProv]: "err" }));
@@ -414,14 +462,59 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                   </p>
                   {CLOUD_PROVIDERS.map(prov => {
                     const keyVal = (config.api_keys ?? {})[prov.id] || "";
+                    const isSaved = keyVal === "••••••••••••••••";
                     const status = keyStatus[prov.id];
+
+                    if (isSaved) {
+                      const isDisabled = disabledProviders.has(prov.id);
+                      // ── Saved state: key is in OS keychain ──────────────────
+                      return (
+                        <div key={prov.id} className={`stng-api-key-row stng-api-key-row-saved ${isDisabled ? "stng-api-key-row-disabled" : ""}`}>
+                          <div className="stng-api-key-header">
+                            <ProviderLogo provider={prov} />
+                            <span>{prov.name}</span>
+                            {isDisabled
+                              ? <span className="stng-key-badge none">Disabled</span>
+                              : <span className="stng-key-badge ok"><i className="bx bx-check" /> Active</span>
+                            }
+                          </div>
+                          <div className="stng-api-key-input-row">
+                            <div className="stng-key-saved-mask">
+                              <i className="bx bx-lock-alt" />
+                              <span>Stored in OS keychain</span>
+                            </div>
+                            {/* Enable / disable toggle */}
+                            <button
+                              type="button"
+                              className={`stng-toggle ${isDisabled ? "off" : "on"}`}
+                              role="switch"
+                              aria-checked={!isDisabled}
+                              onClick={() => toggleProvider(prov.id)}
+                              title={isDisabled ? "Enable provider" : "Disable provider"}
+                              style={{ flexShrink: 0 }}
+                            >
+                              <span className="stng-toggle-track"><span className="stng-toggle-thumb" /></span>
+                            </button>
+                            <button
+                              type="button"
+                              className="stng-btn stng-btn-danger stng-btn-sm"
+                              title="Remove API key"
+                              onClick={() => deleteKey(prov.id)}
+                            >
+                              <i className="bx bx-trash" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    // ── Unsaved state: show input + verify ──────────────────
                     return (
                       <div key={prov.id} className="stng-api-key-row">
                         <div className="stng-api-key-header">
                           <ProviderLogo provider={prov} />
                           <span>{prov.name}</span>
-                          {status === "ok" && <span className="stng-key-badge ok"><i className="bx bx-check" /></span>}
-                          {status === "err" && <span className="stng-key-badge err"><i className="bx bx-x" /></span>}
+                          {status === "err" && <span className="stng-key-badge err"><i className="bx bx-x" /> Invalid</span>}
                           {!keyVal && !status && <span className="stng-key-badge none">Not set</span>}
                         </div>
                         <div className="stng-api-key-input-row">
@@ -431,6 +524,12 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                             value={keyVal}
                             onChange={e => updateKey(prov.id, e.target.value)}
                             placeholder={prov.keyPlaceholder}
+                            onKeyDown={e => {
+                              if (e.key === "Enter") {
+                                const k = (config.api_keys ?? {})[prov.id] || "";
+                                if (k.trim() && validating !== prov.id) validateKey(prov.id, k);
+                              }
+                            }}
                           />
                           <button
                             type="button"
@@ -444,7 +543,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                             {validating === prov.id ? (
                               <i className="bx bx-loader-alt bx-spin" />
                             ) : (
-                              "Verify"
+                              "Verify & Save"
                             )}
                           </button>
                         </div>
@@ -533,6 +632,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
               </div>
             </div>
           )}
+
+          {/* ─── TAB: Skills ─── */}
+          {activeTab === "skills" && <SkillsTab />}
 
           {/* ─── TAB: Behavior ─── */}
           {activeTab === "behavior" && (

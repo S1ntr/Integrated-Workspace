@@ -242,6 +242,7 @@ const RightPanel: React.FC<RightPanelProps> = ({
             changedFiles={changedFiles}
             baselineSnapshot={baselineSnapshot}
             onFileSelect={onFileSelect}
+            workspaceDir={directory}
           />
         )}
       </div>
@@ -296,6 +297,13 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const [terminalOutputs, setTerminalOutputs] = useState<Record<string, string>>({});
   const [terminalTranscripts, setTerminalTranscripts] = useState<Record<string, TerminalTranscriptEntry[]>>({});
 
+  // Transcript batching — accumulate PTY output chunks per session, flush every 350ms.
+  // Prevents flooding transcript (and thus LLM context) with 100s of tiny entries per second.
+  const transcriptBatchRef = React.useRef<Record<string, string>>({});
+  const transcriptBatchTimerRef = React.useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // We need a stable reference to appendTerminalTranscript for the batch flush closure.
+  const appendTerminalTranscriptRef = React.useRef<((s: Pick<Session, "sessionId" | "label">, k: TerminalTranscriptEntry["kind"], t: string) => void) | null>(null);
+
   // Helper to recursively collect all file entries (leaves only)
   const collectAllFiles = (entries: FileEntry[]): FileEntry[] => {
     const result: FileEntry[] = [];
@@ -333,6 +341,8 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
       return { ...prev, [session.sessionId]: [...current, entry].slice(-120) };
     });
   };
+  // Keep ref in sync so batch-flush closures always call the latest version
+  appendTerminalTranscriptRef.current = appendTerminalTranscript;
 
   // ── Baseline Snapshotting ────────────────────────────────────────────────
   useEffect(() => {
@@ -418,12 +428,29 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
           .replace(/\x1b\[[0-9;]*[mGKHFJA-Za-z]/g, "")
           .replace(/\x1b\][^\x07]*\x07/g, "")
           .replace(/\r/g, "");
-        appendTerminalTranscript(session, "output", cleaned);
+
+        // Accumulate raw output immediately (used by LLM as rolling window)
         setTerminalOutputs(prev => {
           const current = prev[session.sessionId] || "";
           const updated = (current + cleaned).slice(-4000);
           return { ...prev, [session.sessionId]: updated };
         });
+
+        // Batch transcript entries: accumulate for 350ms then flush as one entry.
+        // Prevents flooding transcript (and React state) with 100s of micro-entries/second.
+        const sid = session.sessionId;
+        transcriptBatchRef.current[sid] = (transcriptBatchRef.current[sid] || "") + cleaned;
+        if (transcriptBatchTimerRef.current[sid]) {
+          clearTimeout(transcriptBatchTimerRef.current[sid]);
+        }
+        transcriptBatchTimerRef.current[sid] = setTimeout(() => {
+          const batched = transcriptBatchRef.current[sid] || "";
+          delete transcriptBatchRef.current[sid];
+          delete transcriptBatchTimerRef.current[sid];
+          if (batched.trim()) {
+            appendTerminalTranscriptRef.current?.(session, "output", batched);
+          }
+        }, 350);
       }).then(unlisten => unlisteners.push(unlisten));
     }
 
@@ -545,22 +572,28 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
 
   const handleStatusChange = (termId: number, status: "booting" | "running" | "exited") => {
     if (status === "booting" || status === "running") onWorkspaceActivity?.();
-    setSessions(prev => prev.map(s => s.id === termId ? { ...s, status } : s));
+    // Record status transition so LLM context shows terminal state changes
+    setSessions(prev => {
+      const session = prev.find(s => s.id === termId);
+      if (session) {
+        const label = status === "booting" ? "↺ Terminal restarting"
+          : status === "running" ? "✓ Terminal ready"
+          : "✗ Terminal process exited";
+        appendTerminalTranscriptRef.current?.(session, "system", label);
+      }
+      return prev.map(s => s.id === termId ? { ...s, status } : s);
+    });
   };
 
   const restartSession = (termId: number): string => {
     const newSessId = `pty-${termId}-${Date.now()}`;
-    console.log(`[restartSession] Restarting session ID: ${termId} with new session ID: ${newSessId}`);
-    setSessions(prev => prev.map(s => {
-      if (s.id === termId) {
-        return {
-          ...s,
-          status: "booting",
-          sessionId: newSessId,
-        };
+    setSessions(prev => {
+      const session = prev.find(s => s.id === termId);
+      if (session) {
+        appendTerminalTranscriptRef.current?.(session, "system", "↺ Session restarted (new PTY)");
       }
-      return s;
-    }));
+      return prev.map(s => s.id === termId ? { ...s, status: "booting", sessionId: newSessId } : s);
+    });
     return newSessId;
   };
 

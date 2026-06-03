@@ -49,14 +49,10 @@ interface BrowserNewWindowEvent {
 }
 
 const DEVICE_PRESETS = [
-  { key: "responsive", label: "Responsive", width: 0, height: 0 },
-  { key: "desktop", label: "Desktop", width: 1440, height: 900 },
-  { key: "macos", label: "macOS", width: 1280, height: 832 },
-  { key: "windows", label: "Windows", width: 1366, height: 768 },
-  { key: "linux", label: "Linux", width: 1366, height: 768 },
-  { key: "iphone", label: "iPhone", width: 390, height: 844 },
-  { key: "android", label: "Android", width: 412, height: 915 },
-  { key: "tablet", label: "Tablet", width: 820, height: 1180 },
+  { key: "responsive", label: "Responsive", width: 0, height: 0, device: "fluid" as const, model: "Free viewport" },
+  { key: "desktop",    label: "Desktop",    width: 1440, height: 900,  device: "desktop" as const, model: "1440 × 900 · 16:10" },
+  { key: "phone",      label: "Phone",      width: 390,  height: 844,  device: "phone" as const,   model: "iPhone 14 · 390 × 844" },
+  { key: "tablet",     label: "Tablet",     width: 820,  height: 1180, device: "tablet" as const,  model: "iPad Air · 820 × 1180" },
 ];
 
 function normalizeUrl(raw: string): string {
@@ -113,9 +109,18 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [loading, setLoading] = useState(false);
   const [frameKey, setFrameKey] = useState(0);
-  const [device, setDevice] = useState("responsive");
+  const [device, setDevice] = useState("desktop");
   const [tool, setTool] = useState<BrowserTool>("browse");
+
+  // Responsive resize state
+  const [responsiveSize, setResponsiveSize] = useState<{ w: number; h: number } | null>(null);
+  const [deviceScale, setDeviceScale] = useState(1);
+  const resizeDragRef = useRef<{ startX: number; startY: number; startW: number; startH: number; dir: "e" | "s" | "se" | "w" | "n" | "nw" | "ne" | "sw" } | null>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const panDragRef = useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
   const [selection, setSelection] = useState<BrowserSelection | null>(null);
+  const [hoverBox, setHoverBox] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
   const [draft, setDraft] = useState<BrowserSelection | null>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [note, setNote] = useState("");
@@ -133,6 +138,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   const [devStatus, setDevStatus] = useState<DevServerStatus>("idle");
   const [devError, setDevError] = useState("");
   const [devInfo, setDevInfo] = useState<DevProjectInfo | null>(null);
+  const [devRunning, setDevRunning] = useState(false);
   const devAbortRef = useRef(false);
 
   const preset = useMemo(
@@ -346,6 +352,101 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Reset custom size when switching away from responsive
+  useEffect(() => {
+    if (device !== "responsive") {
+      setResponsiveSize(null);
+      setPan({ x: 0, y: 0 });
+    }
+  }, [device]);
+
+  // Scale phone/tablet shells to fit within stage
+  useEffect(() => {
+    if (!open || device === "responsive" || device === "desktop") {
+      setDeviceScale(1);
+      return;
+    }
+    const updateScale = () => {
+      const stage = stageRef.current;
+      if (!stage) return;
+      const stageW = stage.clientWidth - 28;  // stage content width
+      const stageH = stage.clientHeight - 52 - 44; // content height minus stage padding minus device label
+      const p = DEVICE_PRESETS.find(item => item.key === device);
+      if (!p || !p.width || !p.height) return;
+      // shell-phone: padding: 12px all sides = 24px each axis
+      // shell-tablet: padding: 18px all sides = 36px each axis
+      const shellPad = device === "phone" ? 24 : 36;
+      const totalW = p.width + shellPad;
+      const totalH = p.height + shellPad;
+      const scale = Math.min(1, stageW / totalW, stageH / totalH);
+      setDeviceScale(Math.max(0.3, scale));
+    };
+    updateScale();
+    const observer = typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(updateScale)
+      : null;
+    if (stageRef.current) observer?.observe(stageRef.current);
+    return () => observer?.disconnect();
+  }, [open, device]);
+
+  function startResizeDrag(e: React.MouseEvent, dir: "e" | "s" | "se" | "w" | "n" | "nw" | "ne" | "sw") {
+    e.preventDefault();
+    e.stopPropagation();
+    const stageRect = stageRef.current?.getBoundingClientRect();
+    const stageEl = stageRef.current;
+    // Stage padding: 14px left+right = 28px total, 14px top + 38px bottom = 52px total
+    const currentW = responsiveSize?.w ?? (stageEl ? stageEl.clientWidth - 28 : 800);
+    const currentH = responsiveSize?.h ?? (stageEl ? stageEl.clientHeight - 52 : 600);
+    resizeDragRef.current = { startX: e.clientX, startY: e.clientY, startW: currentW, startH: currentH, dir };
+    if (!responsiveSize) setResponsiveSize({ w: currentW, h: currentH });
+
+    const onMove = (mv: MouseEvent) => {
+      const drag = resizeDragRef.current;
+      if (!drag) return;
+      const dx = mv.clientX - drag.startX;
+      const dy = mv.clientY - drag.startY;
+      const allowW = drag.dir.includes("e") || drag.dir.includes("w");
+      const allowH = drag.dir.includes("s") || drag.dir.includes("n");
+      const maxW = stageEl ? stageEl.clientWidth - 28 : 1920;
+      const maxH = stageEl ? stageEl.clientHeight - 52 : 1080;
+      setResponsiveSize({
+        w: allowW ? Math.max(240, Math.min(maxW, drag.startW + (drag.dir.includes("e") ? dx : -dx))) : drag.startW,
+        h: allowH ? Math.max(160, Math.min(maxH, drag.startH + (drag.dir.includes("s") ? dy : -dy))) : drag.startH,
+      });
+    };
+    const onUp = () => {
+      resizeDragRef.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function startPanDrag(e: React.MouseEvent) {
+    if (e.button !== 0) return;
+    panDragRef.current = { startX: e.clientX, startY: e.clientY, startPanX: pan.x, startPanY: pan.y };
+    const onMove = (mv: MouseEvent) => {
+      const drag = panDragRef.current;
+      if (!drag) return;
+      const stageRect = stageRef.current?.getBoundingClientRect();
+      if (!stageRect) return;
+      const maxX = Math.max(0, (responsiveSize?.w ?? stageRect.width) / 2);
+      const maxY = Math.max(0, (responsiveSize?.h ?? stageRect.height) / 2);
+      setPan({
+        x: Math.max(-maxX, Math.min(maxX, drag.startPanX + (mv.clientX - drag.startX))),
+        y: Math.max(-maxY, Math.min(maxY, drag.startPanY + (mv.clientY - drag.startY))),
+      });
+    };
+    const onUp = () => {
+      panDragRef.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
 
   if (!open) return null;
 
@@ -569,6 +670,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
       if (alreadyUp) {
         const url = `http://localhost:${info.port}`;
         setDevStatus("idle");
+        setDevRunning(true);
         setActiveTabId("project");
         navigateTo(url, "push", "project", "project");
         return;
@@ -587,12 +689,29 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
       // Step 5 — navigate
       const url = `http://localhost:${info.port}`;
       setDevStatus("idle");
+      setDevRunning(true);
       setActiveTabId("project");
       navigateTo(url, "push", "project", "project");
     } catch (err) {
       if (devAbortRef.current) return; // user navigated away — silently cancel
       setDevStatus("error");
       setDevError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function stopDevServer() {
+    devAbortRef.current = true;
+    setDevRunning(false);
+    setDevStatus("idle");
+    setDevError("");
+    // Navigate away from the local URL so the iframe doesn't keep the connection alive
+    setCurrentUrl("");
+    setAddress("");
+    const port = devInfo?.port ?? 3000;
+    try {
+      await invoke("stop_dev_server_background", { port });
+    } catch {
+      // Silently ignore — worst case the process dies on its own
     }
   }
 
@@ -615,11 +734,12 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     setDevStatus("idle");
   }
 
-  function readElementInfo(x: number, y: number): string | undefined {
+  function readElementBounds(x: number, y: number): { info: string | undefined; rect: { x: number; y: number; width: number; height: number } | null } {
     try {
       const doc = iframeRef.current?.contentDocument;
       const element = doc?.elementFromPoint(x, y) as HTMLElement | null;
-      if (!element) return undefined;
+      if (!element || element === doc?.documentElement || element === doc?.body) return { info: undefined, rect: null };
+      const domRect = element.getBoundingClientRect();
       const tag = element.tagName.toLowerCase();
       const id = element.id ? `#${element.id}` : "";
       const classes = typeof element.className === "string"
@@ -627,13 +747,19 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
         : "";
       const aria = element.getAttribute("aria-label");
       const text = (aria || element.innerText || element.textContent || "")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 180);
-      return `${tag}${id}${classes}${text ? ` | "${text}"` : ""}`;
+        .replace(/\s+/g, " ").trim().slice(0, 180);
+      const info = `${tag}${id}${classes}${text ? ` | "${text}"` : ""}`;
+      return {
+        info,
+        rect: { x: domRect.left, y: domRect.top, width: domRect.width, height: domRect.height },
+      };
     } catch {
-      return undefined;
+      return { info: undefined, rect: null };
     }
+  }
+
+  function readElementInfo(x: number, y: number): string | undefined {
+    return readElementBounds(x, y).info;
   }
 
   function pointFromEvent(event: React.MouseEvent<HTMLDivElement>) {
@@ -649,51 +775,56 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     if (tool === "browse") return;
     event.preventDefault();
     const point = pointFromEvent(event);
+
+    if (tool === "point") {
+      // Immediately select element under cursor — no drag needed
+      const { info, rect } = readElementBounds(point.x, point.y);
+      if (rect && rect.width > 0 && rect.height > 0) {
+        setSelection({ kind: "element", x: rect.x, y: rect.y, width: rect.width, height: rect.height, elementInfo: info });
+      } else {
+        setSelection({ kind: "element", x: Math.max(0, point.x - 7), y: Math.max(0, point.y - 7), width: 14, height: 14, elementInfo: info });
+      }
+      setHoverBox(null);
+      setNote("");
+      return;
+    }
+
+    // region tool — start drag
     setDragStart(point);
     setNote("");
-    const next: BrowserSelection = {
-      kind: tool === "point" ? "element" : "region",
-      x: point.x,
-      y: point.y,
-      width: tool === "point" ? 14 : 0,
-      height: tool === "point" ? 14 : 0,
-    };
-    setDraft(next);
+    setDraft({ kind: "region", x: point.x, y: point.y, width: 0, height: 0 });
   }
 
-  function updateSelection(event: React.MouseEvent<HTMLDivElement>) {
-    if (!dragStart || tool === "browse") return;
+  function handleSelectLayerMove(event: React.MouseEvent<HTMLDivElement>) {
+    if (tool === "point" && !selection) {
+      // Show hover highlight of element under cursor
+      const point = pointFromEvent(event);
+      const { rect } = readElementBounds(point.x, point.y);
+      setHoverBox(rect && rect.width > 0 ? rect : null);
+      return;
+    }
+    if (tool !== "region" || !dragStart) return;
+    // region drag
     const point = pointFromEvent(event);
     const x = Math.min(dragStart.x, point.x);
     const y = Math.min(dragStart.y, point.y);
     const width = Math.abs(point.x - dragStart.x);
     const height = Math.abs(point.y - dragStart.y);
-    setDraft({
-      kind: width > 6 || height > 6 ? "region" : "element",
-      x,
-      y,
-      width: Math.max(tool === "point" ? 14 : 1, width),
-      height: Math.max(tool === "point" ? 14 : 1, height),
-    });
+    setDraft({ kind: "region", x, y, width: Math.max(1, width), height: Math.max(1, height) });
   }
 
   function finishSelection(event: React.MouseEvent<HTMLDivElement>) {
-    if (!dragStart || tool === "browse") return;
+    if (tool !== "region" || !dragStart) return;
     const point = pointFromEvent(event);
     const width = Math.abs(point.x - dragStart.x);
     const height = Math.abs(point.y - dragStart.y);
-    const isRegion = tool === "region" || width > 8 || height > 8;
-    const x = isRegion ? Math.min(dragStart.x, point.x) : Math.max(0, point.x - 7);
-    const y = isRegion ? Math.min(dragStart.y, point.y) : Math.max(0, point.y - 7);
-    const next: BrowserSelection = {
-      kind: isRegion ? "region" : "element",
-      x,
-      y,
-      width: isRegion ? Math.max(1, width) : 14,
-      height: isRegion ? Math.max(1, height) : 14,
-      elementInfo: !isRegion ? readElementInfo(point.x, point.y) : undefined,
-    };
-    setSelection(next);
+    setSelection({
+      kind: "region",
+      x: Math.min(dragStart.x, point.x),
+      y: Math.min(dragStart.y, point.y),
+      width: Math.max(1, width),
+      height: Math.max(1, height),
+    });
     setDraft(null);
     setDragStart(null);
   }
@@ -862,7 +993,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
           <div className="browser-tool-group" aria-label="Browser tools">
             <button type="button" className={`browser-tool-btn ${tool === "browse" ? "active" : ""}`} onClick={() => setTool("browse")} title="Interact with page">
               <i className="bx bx-mouse" />
-              <span>Browse</span>
+              <span>Mouse</span>
             </button>
             <button type="button" className={`browser-tool-btn ${tool === "point" ? "active" : ""}`} disabled={mode === "web"} onClick={() => setTool("point")} title={mode === "web" ? "Selection tools are available for the current project preview" : "Select element"}>
               <i className="bx bx-target-lock" />
@@ -874,21 +1005,59 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
             </button>
           </div>
 
-          {mode === "app" && (
-            <div className="browser-device-strip">
-              {DEVICE_PRESETS.map(item => (
-                <button
-                  key={item.key}
-                  type="button"
-                  className={`browser-device-btn ${device === item.key ? "active" : ""}`}
-                  onClick={() => setDevice(item.key)}
-                  title={item.label}
-                >
-                  <span>{item.label}</span>
-                </button>
-              ))}
-            </div>
-          )}
+          <div className="browser-device-strip">
+            {DEVICE_PRESETS.map(item => (
+              <button
+                key={item.key}
+                type="button"
+                className={`browser-device-btn ${device === item.key ? "active" : ""}`}
+                onClick={() => setDevice(item.key)}
+                title={item.label}
+              >
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div>
+
+          {/* Live server toggle — always visible top-right */}
+          <div className="browser-live-server-wrap">
+            {devRunning ? (
+              <button
+                type="button"
+                className="browser-live-btn running"
+                onClick={() => void stopDevServer()}
+                title={`Dev server running on port ${devInfo?.port ?? "…"} — click to stop`}
+              >
+                <span className="browser-live-dot" />
+                <span>Live{devInfo?.port ? ` :${devInfo.port}` : ""}</span>
+                <i className="bx bx-stop-circle browser-live-stop-icon" />
+              </button>
+            ) : devStatus !== "idle" ? (
+              <button
+                type="button"
+                className="browser-live-btn starting"
+                onClick={() => { devAbortRef.current = true; setDevStatus("idle"); }}
+                title="Click to cancel"
+              >
+                <i className="bx bx-loader-alt spin" />
+                <span>
+                  {devStatus === "detecting" && "Detecting…"}
+                  {devStatus === "starting" && `Starting ${devInfo?.label ?? "server"}…`}
+                  {devStatus === "waiting" && `Waiting :${devInfo?.port ?? "…"}`}
+                </span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="browser-live-btn stopped"
+                onClick={() => void openCurrentProject()}
+                title="Start dev server"
+              >
+                <i className="bx bx-play-circle" />
+                <span>Start server</span>
+              </button>
+            )}
+          </div>
         </div>
 
         {(cleanedSuggestions.length > 0 || sentHint || browserHint) && (
@@ -910,198 +1079,282 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
           </div>
         )}
 
-        <div className={`browser-stage mode-${mode}`}>
-          <div
-            ref={viewportRef}
-            className={`browser-viewport ${mode === "app" && preset.width ? "device-fixed" : "device-fluid"} tool-${tool}`}
-            style={{
-              ["--browser-device-width" as string]: mode === "app" && preset.width ? `${preset.width}px` : "100%",
-              ["--browser-device-height" as string]: mode === "app" && preset.height ? `${preset.height}px` : "100%",
-            } as React.CSSProperties}
-          >
-            {hasUrl ? (
-              <iframe
-                key={`${currentUrl}-${frameKey}-${mode}`}
-                ref={iframeRef}
-                className="browser-frame"
-                src={currentUrl}
-                title="Integrated browser preview"
-                sandbox={sandboxPolicy}
-                allow="clipboard-read; clipboard-write; fullscreen; geolocation; camera; microphone"
-                onLoad={() => {
-                  setLoading(false);
-                  try {
-                    setFrameTitle(iframeRef.current?.contentDocument?.title || "");
-                  } catch {
-                    setFrameTitle(compactUrl(currentUrl));
-                  }
-                }}
-              />
-            ) : embeddedWebUrl ? (
-              <div className={`browser-webview-host ${embeddedBrowserReady ? "ready" : ""}`}>
-                {(loading || !embeddedBrowserReady) && !embeddedBrowserError && (
-                  <div className="browser-webview-status">
-                    <i className="bx bx-loader-alt spin" />
-                    <span>Opening {compactUrl(embeddedWebUrl)}</span>
-                  </div>
-                )}
-                {embeddedBrowserError && (
-                  <div className="browser-webview-status error">
-                    <i className="bx bx-error-circle" />
-                    <span>{embeddedBrowserError}</span>
-                    <button type="button" onClick={() => openEmbeddedWebview(embeddedWebUrl)}>
-                      Retry
-                    </button>
-                  </div>
-                )}
-              </div>
-            ) : devStatus !== "idle" ? (
-              // Dev server auto-start status panel
-              <div className={`browser-autostart-page${devStatus === "error" ? " error" : ""}`}>
-                {devStatus === "error" ? (
-                  <>
-                    <i className="bx bx-error-circle" />
-                    <span className="browser-autostart-title">Dev server failed to start</span>
-                    {devInfo && (
-                      <span className="browser-autostart-cmd">
-                        <i className="bx bx-terminal" /> {devInfo.command}
-                      </span>
-                    )}
-                    <div className="browser-autostart-error-msg">{devError}</div>
-                    <div className="browser-autostart-actions">
-                      <button
-                        type="button"
-                        className="browser-start-project"
-                        onClick={sendDevErrorToChat}
-                      >
-                        <i className="bx bx-send" />
-                        Send to chat
-                      </button>
-                      <button
-                        type="button"
-                        className="browser-start-project"
-                        onClick={() => { setDevStatus("idle"); void openCurrentProject(); }}
-                      >
-                        <i className="bx bx-refresh" />
-                        Retry
-                      </button>
-                      <button
-                        type="button"
-                        className="browser-start-project"
-                        onClick={() => setDevStatus("idle")}
-                      >
-                        <i className="bx bx-x" />
-                        Dismiss
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <i className="bx bx-loader-alt spin" />
-                    <span className="browser-autostart-title">
-                      {devStatus === "detecting" && "Detecting project type…"}
-                      {devStatus === "starting"  && `Starting ${devInfo?.label ?? "dev server"}…`}
-                      {devStatus === "waiting"   && `Waiting for localhost:${devInfo?.port ?? "…"}…`}
-                    </span>
-                    {devInfo && devStatus !== "detecting" && (
-                      <span className="browser-autostart-cmd">
-                        <i className="bx bx-terminal" /> {devInfo.command}
-                      </span>
-                    )}
-                    <button
-                      type="button"
-                      className="browser-start-project"
-                      style={{ marginTop: 4 }}
-                      onClick={() => { devAbortRef.current = true; setDevStatus("idle"); }}
-                    >
-                      <i className="bx bx-x" />
-                      Cancel
-                    </button>
-                  </>
-                )}
-              </div>
-            ) : (
-              <div className="browser-start-page">
-                <i className={`bx ${mode === "app" ? "bx-shield-quarter" : "bx-globe"}`} />
-                <span className="browser-start-title">{mode === "app" ? "Open the current project" : "Open a browser tab"}</span>
-                <span className="browser-start-sub">
-                  {mode === "app"
-                    ? "Use Current project to auto-start your dev server, then choose a device viewport."
-                    : "Search or open a URL. Regular websites open inside this browser tab."}
-                </span>
-                <form className="browser-start-form" onSubmit={event => { event.preventDefault(); navigateTo(address); }}>
-                  <input value={address} onChange={event => setAddress(event.target.value)} placeholder="google.com, search text, or localhost:3000" />
-                  <button type="submit"><i className="bx bx-right-arrow-alt" /></button>
-                </form>
-                {mode === "app" && (
-                  <button type="button" className="browser-start-project" onClick={() => void openCurrentProject()}>
-                    <i className="bx bx-code-block" />
-                    {currentProjectUrl ? "Current project" : "Start dev server"}
-                  </button>
-                )}
-              </div>
-            )}
-
-            {mode === "app" && tool !== "browse" && (
-              <div
-                className="browser-select-layer"
-                onMouseDown={beginSelection}
-                onMouseMove={updateSelection}
-                onMouseUp={finishSelection}
-                onMouseLeave={() => {
-                  if (dragStart) {
-                    setDraft(null);
-                    setDragStart(null);
-                  }
-                }}
-              >
-                {!selectionBox && (
-                  <div className="browser-select-hint">
-                    {tool === "point" ? "Click an element to describe a change" : "Drag over the area you want to change"}
-                  </div>
-                )}
-                {selectionBox && (
-                  <div
-                    className={`browser-selection-box ${selectionBox.kind}`}
-                    style={{
-                      left: selectionBox.x,
-                      top: selectionBox.y,
-                      width: selectionBox.width,
-                      height: selectionBox.height,
+        <div className={`browser-stage mode-${mode}`} ref={stageRef}>
+          {/* Responsive mode: wrapper holds custom size, handles live OUTSIDE the
+              overflow-hidden viewport so they aren't clipped. */}
+          {(() => {
+            const viewportContent = (
+              <>
+                {hasUrl ? (
+                  <iframe
+                    key={`${currentUrl}-${frameKey}-${mode}`}
+                    ref={iframeRef}
+                    className="browser-frame"
+                    src={currentUrl}
+                    title="Integrated browser preview"
+                    sandbox={sandboxPolicy}
+                    allow="clipboard-read; clipboard-write; fullscreen; geolocation; camera; microphone"
+                    onLoad={() => {
+                      setLoading(false);
+                      try { setFrameTitle(iframeRef.current?.contentDocument?.title || ""); }
+                      catch { setFrameTitle(compactUrl(currentUrl)); }
                     }}
                   />
+                ) : embeddedWebUrl ? (
+                  <div className={`browser-webview-host ${embeddedBrowserReady ? "ready" : ""}`}>
+                    {(loading || !embeddedBrowserReady) && !embeddedBrowserError && (
+                      <div className="browser-webview-status">
+                        <i className="bx bx-loader-alt spin" />
+                        <span>Opening {compactUrl(embeddedWebUrl)}</span>
+                      </div>
+                    )}
+                    {embeddedBrowserError && (
+                      <div className="browser-webview-status error">
+                        <i className="bx bx-error-circle" />
+                        <span>{embeddedBrowserError}</span>
+                        <button type="button" onClick={() => openEmbeddedWebview(embeddedWebUrl)}>Retry</button>
+                      </div>
+                    )}
+                  </div>
+                ) : devStatus !== "idle" ? (
+                  <div className={`browser-autostart-page${devStatus === "error" ? " error" : ""}`}>
+                    {devStatus === "error" ? (
+                      <>
+                        <i className="bx bx-error-circle" />
+                        <span className="browser-autostart-title">Dev server failed to start</span>
+                        {devInfo && <span className="browser-autostart-cmd"><i className="bx bx-terminal" /> {devInfo.command}</span>}
+                        <div className="browser-autostart-error-msg">{devError}</div>
+                        <div className="browser-autostart-actions">
+                          <button type="button" className="browser-start-project" onClick={sendDevErrorToChat}><i className="bx bx-send" />Send to chat</button>
+                          <button type="button" className="browser-start-project" onClick={() => { setDevStatus("idle"); void openCurrentProject(); }}><i className="bx bx-refresh" />Retry</button>
+                          <button type="button" className="browser-start-project" onClick={() => setDevStatus("idle")}><i className="bx bx-x" />Dismiss</button>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <i className="bx bx-loader-alt spin" />
+                        <span className="browser-autostart-title">
+                          {devStatus === "detecting" && "Detecting project type…"}
+                          {devStatus === "starting"  && `Starting ${devInfo?.label ?? "dev server"}…`}
+                          {devStatus === "waiting"   && `Waiting for localhost:${devInfo?.port ?? "…"}…`}
+                        </span>
+                        {devInfo && devStatus !== "detecting" && <span className="browser-autostart-cmd"><i className="bx bx-terminal" /> {devInfo.command}</span>}
+                        <button type="button" className="browser-start-project" style={{ marginTop: 4 }} onClick={() => { devAbortRef.current = true; setDevStatus("idle"); }}><i className="bx bx-x" />Cancel</button>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <div className="browser-start-page">
+                    <i className={`bx ${mode === "app" ? "bx-shield-quarter" : "bx-globe"}`} />
+                    <span className="browser-start-title">{mode === "app" ? "Open the current project" : "Open a browser tab"}</span>
+                    <span className="browser-start-sub">
+                      {mode === "app"
+                        ? "Use Current project to auto-start your dev server, then choose a device viewport."
+                        : "Search or open a URL. Regular websites open inside this browser tab."}
+                    </span>
+                    <form className="browser-start-form" onSubmit={event => { event.preventDefault(); navigateTo(address); }}>
+                      <input value={address} onChange={event => setAddress(event.target.value)} placeholder="google.com, search text, or localhost:3000" />
+                      <button type="submit"><i className="bx bx-right-arrow-alt" /></button>
+                    </form>
+                    {mode === "app" && (
+                      <button type="button" className="browser-start-project" onClick={() => void openCurrentProject()}>
+                        <i className="bx bx-code-block" />
+                        {currentProjectUrl ? "Current project" : "Start dev server"}
+                      </button>
+                    )}
+                  </div>
                 )}
-              </div>
-            )}
 
-            {selection && (
-              <div className="browser-selection-popover" style={popoverStyle()} onMouseDown={event => event.stopPropagation()}>
-                <div className="browser-popover-head">
-                  <span>{selection.kind === "element" ? "Element" : "Selection"}</span>
-                  <button type="button" onClick={() => setSelection(null)} title="Clear selection">
-                    <i className="bx bx-x" />
-                  </button>
+                {mode === "app" && tool !== "browse" && (
+                  <div
+                    className="browser-select-layer"
+                    onMouseDown={beginSelection}
+                    onMouseMove={handleSelectLayerMove}
+                    onMouseUp={finishSelection}
+                    onMouseLeave={() => {
+                      setHoverBox(null);
+                      if (dragStart) { setDraft(null); setDragStart(null); }
+                    }}
+                    onWheel={e => {
+                      try { iframeRef.current?.contentWindow?.scrollBy(e.deltaX, e.deltaY); } catch {}
+                    }}
+                  >
+                    {!selectionBox && !hoverBox && (
+                      <div className="browser-select-hint">
+                        {tool === "point" ? "Click any element to select it" : "Drag over the area you want to change"}
+                      </div>
+                    )}
+                    {hoverBox && !selection && (
+                      <div
+                        className="browser-hover-box"
+                        style={{ left: hoverBox.x, top: hoverBox.y, width: hoverBox.width, height: hoverBox.height }}
+                      />
+                    )}
+                    {selectionBox && (
+                      <div
+                        className={`browser-selection-box ${selectionBox.kind}`}
+                        style={{ left: selectionBox.x, top: selectionBox.y, width: selectionBox.width, height: selectionBox.height }}
+                      />
+                    )}
+                  </div>
+                )}
+
+                {selection && (
+                  <div className="browser-selection-popover" style={popoverStyle()} onMouseDown={event => event.stopPropagation()}>
+                    <div className="browser-popover-head">
+                      <span>{selection.kind === "element" ? "Element" : "Selection"}</span>
+                      <button type="button" onClick={() => setSelection(null)} title="Clear selection"><i className="bx bx-x" /></button>
+                    </div>
+                    <div className="browser-popover-meta">
+                      {Math.round(selection.width)}x{Math.round(selection.height)}
+                      {selection.elementInfo ? ` - ${selection.elementInfo}` : ""}
+                    </div>
+                    <textarea value={note} onChange={event => setNote(event.target.value)} placeholder="Describe what should change here..." autoFocus />
+                    <div className="browser-popover-actions">
+                      <button type="button" className="browser-popover-ghost" onClick={() => setSelection(null)}>Clear</button>
+                      <button type="button" className="browser-send-chat" onClick={sendToChat}><i className="bx bx-send" />Send</button>
+                    </div>
+                  </div>
+                )}
+              </>
+            );
+
+            if (device === "responsive") {
+              // Wrapper has the custom size (or fills the stage when no custom size yet).
+              // Handles are siblings to the viewport — NOT inside it — so overflow:hidden
+              // on the viewport doesn't clip them.
+              return (
+                <div className="browser-responsive-anchor">
+                  <div
+                    className={`browser-responsive-wrapper${responsiveSize ? " has-size" : ""}${tool !== "browse" ? " no-resize" : ""}`}
+                    style={responsiveSize ? {
+                      width: `${responsiveSize.w}px`,
+                      height: `${responsiveSize.h}px`,
+                      transform: `translate(${pan.x}px, ${pan.y}px)`,
+                    } : {}}
+                  >
+                    <div
+                      ref={viewportRef}
+                      className={`browser-viewport device-fluid tool-${tool} ${responsiveSize && tool === "browse" ? "is-pannable" : ""}`}
+                      onMouseDown={responsiveSize && tool === "browse" ? startPanDrag : undefined}
+                      style={responsiveSize && tool === "browse" ? { cursor: "grab" } : undefined}
+                    >
+                      {viewportContent}
+                    </div>
+
+                    {/* Always-visible resize handles (when sized) */}
+                    {responsiveSize && (
+                      <>
+                        <div className="browser-resize-rail browser-resize-rail-e"  onMouseDown={e => startResizeDrag(e, "e")}  title="Drag to resize width" />
+                        <div className="browser-resize-rail browser-resize-rail-s"  onMouseDown={e => startResizeDrag(e, "s")}  title="Drag to resize height" />
+                        <div className="browser-resize-rail browser-resize-rail-w"  onMouseDown={e => startResizeDrag(e, "w")}  title="Drag to resize width" />
+                        <div className="browser-resize-rail browser-resize-rail-n"  onMouseDown={e => startResizeDrag(e, "n")}  title="Drag to resize height" />
+
+                        <div className="browser-resize-handle se" onMouseDown={e => startResizeDrag(e, "se")} title="Drag to resize">
+                          <i className="bx bx-arrows-alt" />
+                        </div>
+                        <div className="browser-resize-handle nw" onMouseDown={e => startResizeDrag(e, "nw")} title="Drag to resize">
+                          <i className="bx bx-arrows-alt" />
+                        </div>
+                        <div className="browser-resize-handle ne" onMouseDown={e => startResizeDrag(e, "ne")} title="Drag to resize">
+                          <i className="bx bx-arrows-alt" />
+                        </div>
+                        <div className="browser-resize-handle sw" onMouseDown={e => startResizeDrag(e, "sw")} title="Drag to resize">
+                          <i className="bx bx-arrows-alt" />
+                        </div>
+
+                        <div className="browser-resize-readout">
+                          <span className="browser-resize-readout-label">VIEWPORT</span>
+                          <span className="browser-resize-readout-dim">
+                            {Math.round(responsiveSize.w)} × {Math.round(responsiveSize.h)}
+                          </span>
+                          <span className="browser-resize-readout-aspect">
+                            {(responsiveSize.w / responsiveSize.h).toFixed(2)}:1
+                          </span>
+                        </div>
+
+                        {(pan.x !== 0 || pan.y !== 0) && (
+                          <button
+                            type="button"
+                            className="browser-pan-reset"
+                            onClick={() => setPan({ x: 0, y: 0 })}
+                            title="Reset pan"
+                          >
+                            <i className="bx bx-crosshair" />
+                            <span>RECENTER</span>
+                          </button>
+                        )}
+                      </>
+                    )}
+
+                    {!responsiveSize && (
+                      <>
+                        <div className="browser-resize-rail browser-resize-rail-e"  onMouseDown={e => startResizeDrag(e, "e")}  title="Drag to resize width" />
+                        <div className="browser-resize-rail browser-resize-rail-s"  onMouseDown={e => startResizeDrag(e, "s")}  title="Drag to resize height" />
+                        <div className="browser-resize-rail browser-resize-rail-w"  onMouseDown={e => startResizeDrag(e, "w")}  title="Drag to resize width" />
+                        <div className="browser-resize-rail browser-resize-rail-n"  onMouseDown={e => startResizeDrag(e, "n")}  title="Drag to resize height" />
+                        <div className="browser-resize-handle se" onMouseDown={e => startResizeDrag(e, "se")} title="Drag to resize">
+                          <i className="bx bx-arrows-alt" />
+                        </div>
+                      </>
+                    )}
+                  </div>
                 </div>
-                <div className="browser-popover-meta">
-                  {Math.round(selection.width)}x{Math.round(selection.height)}
-                  {selection.elementInfo ? ` - ${selection.elementInfo}` : ""}
+              );
+            }
+
+            // Desktop — full-fill layout, no resize UI
+            if (preset.device === "desktop") {
+              return (
+                <div className="browser-responsive-anchor">
+                  <div className="browser-responsive-wrapper">
+                    <div ref={viewportRef} className={`browser-viewport device-fluid tool-${tool}`}>
+                      {viewportContent}
+                    </div>
+                  </div>
                 </div>
-                <textarea
-                  value={note}
-                  onChange={event => setNote(event.target.value)}
-                  placeholder="Describe what should change here..."
-                  autoFocus
-                />
-                <div className="browser-popover-actions">
-                  <button type="button" className="browser-popover-ghost" onClick={() => setSelection(null)}>Clear</button>
-                  <button type="button" className="browser-send-chat" onClick={sendToChat}>
-                    <i className="bx bx-send" />
-                    Send
-                  </button>
+              );
+            }
+
+            // Phone / Tablet — device shell scaled to fit stage
+            return (
+              <div
+                className={`browser-device-stage device-${preset.device}`}
+                style={deviceScale < 1 ? { zoom: deviceScale } as React.CSSProperties : undefined}
+              >
+                <div className={`browser-device-shell shell-${preset.device}`}>
+                  {preset.device === "phone" && (
+                    <>
+                      <div className="browser-device-notch">
+                        <span className="browser-device-notch-speaker" />
+                        <span className="browser-device-notch-camera" />
+                      </div>
+                    </>
+                  )}
+                  {preset.device === "tablet" && (
+                    <div className="browser-device-camera" />
+                  )}
+                  <div
+                    ref={viewportRef}
+                    className={`browser-viewport device-fixed tool-${tool}`}
+                    style={{
+                      ["--browser-device-width" as string]: `${preset.width}px`,
+                      ["--browser-device-height" as string]: `${preset.height}px`,
+                    } as React.CSSProperties}
+                  >
+                    {viewportContent}
+                  </div>
+                  {preset.device === "phone" && (
+                    <div className="browser-device-home-indicator" />
+                  )}
+                </div>
+                <div className="browser-device-label">
+                  <span className="browser-device-label-name">{preset.model}</span>
+                  <span className="browser-device-label-dim">{preset.width} × {preset.height}</span>
                 </div>
               </div>
-            )}
-          </div>
+            );
+          })()}
         </div>
       </div>
     </div>

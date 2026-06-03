@@ -357,6 +357,46 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     };
   }, [sessionId, command, workspaceDir]);
 
+  // ── Force full repaint after grid drag-resize ends ────────────────────────────
+  // TerminalGrid dispatches "termgrid-resize-end" when the user releases the
+  // resize handle. At that point the CSS layout has settled and we can do a
+  // definitive fit+refresh. We run three rounds to handle the ResizeObserver
+  // micro-task ordering in WebView2 (canvas resize → buffer resize → repaint).
+  useEffect(() => {
+    const onResizeEnd = () => {
+      const fit  = fitRef.current;
+      const term = termRef.current;
+      if (!fit || !term || destroyed.current) return;
+
+      // Round 1 — immediate: recalculate cols/rows from new CSS size
+      try { fit.fit(); } catch {}
+
+      // Round 2 — after next paint: canvas element has been resized by xterm
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (destroyed.current) return;
+          try {
+            fit.fit();
+            term.refresh(0, term.rows - 1);
+          } catch {}
+        });
+      });
+
+      // Round 3 — safety net at 220 ms: clears any residual stale pixels
+      // that WebView2's async canvas compositing can leave behind
+      setTimeout(() => {
+        if (destroyed.current) return;
+        try {
+          fit.fit();
+          term.refresh(0, term.rows - 1);
+        } catch {}
+      }, 220);
+    };
+
+    window.addEventListener("termgrid-resize-end", onResizeEnd);
+    return () => window.removeEventListener("termgrid-resize-end", onResizeEnd);
+  }, []);
+
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 

@@ -25,3 +25,5 @@ serde_json = "1"
 rfd = "0.15"
 portable-pty = "0.8"
 tokio = { version = "1", features = ["process", "time", "io-util"] }
+keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
+urlencoding = "2"

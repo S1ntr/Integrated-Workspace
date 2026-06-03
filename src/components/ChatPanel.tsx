@@ -88,17 +88,29 @@ export interface TerminalTranscriptEntry {
   ts: number;
 }
 
+interface SkillLog {
+  /** Skills that were matched and injected. */
+  skills: Array<{ name: string; slug: string }>;
+  /** Label of the terminal agent that received the injection, or "chat" for detection-only log. */
+  agentLabel: string;
+  /** detected = found in user msg; injected = sent inline in prompt; file_written = also written to workspace. */
+  status: "detected" | "injected" | "file_written" | "failed";
+  /** Workspace paths of files that were written (one per skill). */
+  filePaths?: string[];
+}
+
 interface Msg {
   id: string;
   role: "ai" | "user";
   body: string;
   ts: string;
   streaming?: boolean;
-  agent?: "orchestrator" | "system" | "tool" | "diff";
+  agent?: "orchestrator" | "system" | "tool" | "diff" | "skill";
   actions?: AgentAction[];
   attachments?: ChatAttachment[];
   toolLog?: ToolCallLog;
   diffLog?: DiffLog;
+  skillLog?: SkillLog;
   thinking?: {
     text: string;
     elapsedMs: number;
@@ -137,6 +149,95 @@ interface ModelEntry {
   type: "cloud" | "local";
 }
 
+interface InstalledSkill {
+  id: string;
+  slug: string;
+  name: string;
+  source: string;
+  installs: number;
+  description: string;
+  triggers: string[];
+  skill_md: string;
+  installed_at: number;
+}
+
+// ─── Skill helpers ────────────────────────────────────────────────────────────
+
+/** Return skills whose triggers/name match the user message. */
+function matchSkills(message: string, skills: InstalledSkill[]): InstalledSkill[] {
+  if (!skills.length || !message.trim()) return [];
+  const msg = message.toLowerCase();
+  return skills.filter(skill => {
+    if (skill.triggers.some(t => t.length >= 3 && msg.includes(t.toLowerCase()))) return true;
+    const nameWords = skill.name.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+    if (nameWords.some(w => msg.includes(w))) return true;
+    return false;
+  });
+}
+
+/** Build a skill block to prepend to system/user prompts. */
+function buildSkillBlock(skills: InstalledSkill[]): string {
+  if (!skills.length) return "";
+  return skills.map(s =>
+    `\n\n---\n[SKILL: ${s.name}]\n${s.skill_md}\n---`
+  ).join("");
+}
+
+/** Notification line to tell the agent which skills are attached. */
+function skillNotice(skills: InstalledSkill[]): string {
+  if (!skills.length) return "";
+  const names = skills.map(s => `"${s.name}"`).join(", ");
+  return `\n\n[Integraded: The following skills are attached and should be applied: ${names}]`;
+}
+
+/** Build file-reference lines pointing to workspace .integraded-skills/ files. */
+function buildSkillFileRef(skills: InstalledSkill[], filePaths: string[]): string {
+  if (!filePaths.length) return "";
+  const lines = skills
+    .map((s, i) => filePaths[i] ? `  - ${s.name}: .integraded-skills/${s.slug}.md` : "")
+    .filter(Boolean);
+  if (!lines.length) return "";
+  return `\n\n[SKILL FILES written to workspace — read these before starting:\n${lines.join("\n")}\nThese files contain detailed instructions for each skill. Follow them exactly.]`;
+}
+
+/** Render a SkillLog entry (similar to renderToolLog). Pure function, no hooks. */
+function renderSkillLog(log: SkillLog): React.ReactNode {
+  const statusIcon = log.status === "detected" ? "bx-search"
+    : log.status === "file_written" ? "bx-file"
+    : log.status === "failed" ? "bx-error-circle"
+    : "bx-extension";
+  const statusLabel = log.status === "detected" ? "detected"
+    : log.status === "file_written" ? "files written"
+    : log.status === "failed" ? "failed"
+    : "injected";
+  const note = log.filePaths?.length
+    ? log.filePaths.map(p => p.replace(/\\/g, "/").split("/").slice(-2).join("/")).join(", ")
+    : "";
+  return (
+    <div className={`chat-skill-log status-${log.status}`}>
+      <div className="chat-skill-log-row">
+        <i className={`bx ${statusIcon} chat-skill-icon`} />
+        <span className="chat-skill-status">{statusLabel}</span>
+        <span className="chat-skill-chips">
+          {log.skills.map(s => (
+            <span key={s.slug} className="chat-skill-chip">
+              <i className="bx bx-extension" />
+              {s.name}
+            </span>
+          ))}
+        </span>
+        {log.agentLabel && log.agentLabel !== "chat" && (
+          <>
+            <span className="chat-tool-arrow">{"→"}</span>
+            <span className="chat-skill-target">{log.agentLabel}</span>
+          </>
+        )}
+      </div>
+      {note && <div className="chat-skill-log-note">{note}</div>}
+    </div>
+  );
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const QUICK_AGENTS = [
@@ -147,49 +248,7 @@ const QUICK_AGENTS = [
   { label: "Antigravity", command: "antigravity",  icon: "bx-rocket" },
 ];
 
-const CLOUD_MODELS: Record<string, { value: string; label: string }[]> = {
-  openai: [
-    { value: "gpt-4o", label: "GPT-4o" },
-    { value: "gpt-4o-mini", label: "GPT-4o Mini" },
-    { value: "o1", label: "o1" },
-    { value: "o3-mini", label: "o3 Mini" },
-  ],
-  anthropic: [
-    { value: "claude-opus-4-7", label: "Claude Opus 4.7" },
-    { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-    { value: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
-    { value: "claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet" },
-  ],
-  deepseek: [
-    { value: "deepseek-chat", label: "DeepSeek V3" },
-    { value: "deepseek-reasoner", label: "DeepSeek R1" },
-  ],
-  mistral: [
-    { value: "mistral-large-2501", label: "Mistral Large" },
-    { value: "codestral-2501", label: "Codestral" },
-  ],
-  google: [
-    { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
-    { value: "gemini-1.5-pro", label: "Gemini 1.5 Pro" },
-  ],
-  grok: [
-    { value: "grok-3", label: "Grok 3" },
-    { value: "grok-3-mini", label: "Grok 3 Mini" },
-  ],
-  together: [
-    { value: "meta-llama/Llama-3.3-70B-Instruct-Turbo", label: "Llama 3.3 70B" },
-    { value: "deepseek-ai/DeepSeek-V3", label: "DeepSeek V3" },
-  ],
-  openrouter: [
-    { value: "openai/gpt-4o", label: "GPT-4o" },
-    { value: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-    { value: "google/gemini-2.0-flash", label: "Gemini 2.0 Flash" },
-  ],
-  ollama_cloud: [
-    { value: "gpt-oss:120b", label: "GPT OSS 120B" },
-    { value: "gpt-oss:20b", label: "GPT OSS 20B" },
-  ],
-};
+// Cloud models are fetched live from each provider's API — no hardcoded list.
 
 const PROVIDER_NAMES: Record<string, string> = {
   openai: "OpenAI", anthropic: "Anthropic", deepseek: "DeepSeek",
@@ -469,20 +528,35 @@ function buildOrchestratorPrompt(
   toolCalls: ToolCallLog[] = [],
   pendingQuestions: AgentQuestion[] = [],
   contextWindow = "",
+  installedSkills: InstalledSkill[] = [],
 ): string {
+  const MAX_TERMINALS = 16;
+  const availableSlots = Math.max(0, MAX_TERMINALS - sessions.length);
+
   const sessionList = sessions.length > 0
-    ? sessions.map(s => `- ${s.label} (${s.command})`).join("\n")
+    ? sessions.map(s => `- ${s.label} (${s.command}, ${s.status || "unknown"})`).join("\n")
     : "(none — use spawn actions to create terminals)";
 
+  const now = Date.now();
   const outputBlocks = sessions
     .filter(s => outputs[s.sessionId]?.trim() || transcripts[s.sessionId]?.length)
     .map(s => {
-      const structured = (transcripts[s.sessionId] || []).slice(-18).map(entry => {
-        const prefix = entry.kind === "input" ? "user->agent" : entry.kind;
+      const sessionTranscripts = transcripts[s.sessionId] || [];
+      // Compute freshness from last transcript entry timestamp
+      const lastTs = sessionTranscripts.length
+        ? Math.max(...sessionTranscripts.map(e => e.ts))
+        : 0;
+      const ageSec = lastTs ? Math.round((now - lastTs) / 1000) : null;
+      const freshness = ageSec !== null
+        ? ageSec < 5 ? " — active now" : ` — last activity ${ageSec}s ago`
+        : "";
+
+      const structured = sessionTranscripts.slice(-20).map(entry => {
+        const prefix = entry.kind === "input" ? "→ sent" : entry.kind === "system" ? "[system]" : "output";
         return `${prefix}: ${entry.text.replace(/\s+/g, " ").slice(-700)}`;
       }).join("\n");
-      const fallback = (outputs[s.sessionId] || "").slice(-1200).trim();
-      return `### ${s.label} (${s.command}, ${s.status || "unknown"})\n\`\`\`\n${structured || fallback}\n\`\`\``;
+      const fallback = (outputs[s.sessionId] || "").slice(-1400).trim();
+      return `### ${s.label} (${s.command}, ${s.status || "unknown"}${freshness})\n\`\`\`\n${structured || fallback}\n\`\`\``;
     })
     .join("\n\n");
 
@@ -494,12 +568,16 @@ function buildOrchestratorPrompt(
     `- ${q.label}: ${q.question}`
   ).join("\n");
 
+  const skillsList = installedSkills.length > 0
+    ? installedSkills.map(s => `- **${s.name}** (\`${s.slug}\`): ${s.description}\n  Triggers: ${s.triggers.join(", ")}`).join("\n")
+    : "(none installed — tell the user they can browse/install skills from the Skills tab)";
+
   return `You are the **Orchestrator** in "Integraded" — an integrated multi-agent development workspace.
 
 ## Role
 Break user requests into parallel sub-tasks. Dispatch each to dedicated CLI coding agents in real terminals, monitor their transcript, answer their follow-up questions when the user's intent is clear, and ask the user when it is not.
 
-## Active Sessions
+## Active Sessions (${sessions.length} running, ${availableSlots} slots free, max 16)
 ${sessionList}
 
 ## Available Agent Types
@@ -523,23 +601,43 @@ Tool calls execute automatically. Raw tool call syntax is hidden from the normal
 
 If your model has trouble with XML, a fenced JSON block named tool_call is also accepted. Never show raw tool calls in visible prose. Visible prose should summarize what is happening and what you need from the user.
 
+## Task Complexity → Agent Count (REQUIRED DECISION BEFORE ACTING)
+Classify the request first, then pick the right agent count:
+
+| Complexity | Signals | Agents to use |
+|------------|---------|---------------|
+| **Trivial** | Single question, doc lookup, ≤1 file change, simple script | **1 agent** — send to an existing session |
+| **Small** | Bug fix, 1-3 file edits, single feature area | **1 agent** — spawn one if none free |
+| **Medium** | 3-8 files, 2+ independent concerns (e.g. backend + frontend) | **2-3 agents** — split by concern |
+| **Large** | Full feature, new module, 8+ files, multiple layers (API/UI/tests/config) | **4-${Math.min(availableSlots + sessions.length, 8)} agents** — saturate available slots |
+| **Huge** | Full-stack feature, architectural refactor, new app scaffold | **Use all ${availableSlots} free slots** — maximize parallelism |
+
+**Coupling test (run this BEFORE choosing agent count):** Ask "could two different people write these pieces simultaneously without reading each other's output?" If NO → it is tightly coupled → use 1 agent.
+Examples of tightly coupled work (→ 1 agent regardless of file count): a single webpage's markup + styles + scripts; a component and its styles; a module and its unit tests; a config file and the code that reads it.
+Examples of truly parallel work (→ split): separate pages, separate API endpoints, separate features that don't share state.
+
+When in doubt, go ONE step LOWER on agent count — it is always cheaper to add more agents than to untangle conflicting ones.
+
 ## Coordination Rules
-1. **REUSE ACTIVE SESSIONS**: ALWAYS prefer sending tasks to already active sessions. If a running active session (e.g. "HTML Builder" or "CSS Stylist") listed under "Active Sessions" above can handle the task, use \`agent.send\` to send the prompt to it. Do not spawn a new session if a matching/compatible session already exists.
-2. Unique descriptive labels: "HTML Builder", "CSS Stylist", "JS Developer", etc.
-3. Each agent gets ONE focused task with FULL context: file names, shared types, conventions
-4. Never assign two agents to the same file
-5. If agent A defines a shared type, paste the full definition into agent B's prompt
-6. If more agents are needed but you should not create them yourself, use \`agent.request\`; the app will detect newly added matching agents and dispatch your queued prompt.
-7. If a CLI agent asks a question and the answer follows from the user's instruction, answer it with \`agent.send\`. If uncertain, use \`chat.ask_user\`.
-8. If the user asks to open, inspect, test, or preview a web/app UI, use \`browser.open\` with the best local URL from terminal output. If no URL is known, ask the user for it.
-9. Browser feedback may include a URL, viewport, selected element/region, and user note. Use that context to prompt agents with precise visual/UI fixes.
-10. When an agent finishes, convert its terminal output into a concise visible summary of changed files, integrations, tests, and remaining risks. Do not show a question card unless the terminal is clearly waiting for user input.
-11. After dispatching, briefly summarize what each agent is doing (visible to user)
-12. The user may mention files with @filename, @path/file, or quoted @"path with spaces". Pass exact resolved paths to agents and tell them to inspect those files before editing. If a mention is unresolved, tell the agent to locate it with workspace search before touching files.
-13. Default to parallel coordination for non-trivial build/fix requests. When 2+ compatible agents are active and the work can be separated by file, layer, test, or review responsibility, emit multiple tool calls in the same response: one focused \`agent.send\` or \`agent.spawn\` per useful agent. Do not stop after assigning the first agent.
-14. Use all helpful active agents when possible, with non-overlapping ownership. Good splits include UI/CSS, data/API, tests/build, bug diagnosis, docs, and review. Only use a single agent when the task is clearly tiny, single-file, or unsafe to parallelize.
-15. After dispatching, keep monitoring all terminal transcripts. If agents ask simple confirmation/follow-up questions that are answered by the user's instructions, answer them with \`agent.send\`. If not clear, use \`chat.ask_user\`.
-16. When all dispatched agents are quiet and no unanswered questions remain, provide one concise final project-ready summary with changed files, verification, risks, and run/preview hints. Avoid repeating noisy terminal UI output.
+1. **AVOID UNNECESSARY SPAWNS**: DO NOT spawn or use multiple agents for simple, minor, or single-file tasks. If the user's request is straightforward (e.g., a simple bug fix, modifying a single file, writing a small script, or answering a question), use a single agent (like \`claude\` or \`opencode\`) to handle the entire request.
+2. **SCALE UP FOR COMPLEX WORK**: For large projects with many independent concerns, spawn agents to fill the available terminal slots (up to the limit shown above). Parallel work on independent modules/layers saves significant time. Do NOT bottleneck a large project through a single terminal.
+3. **REUSE ACTIVE SESSIONS**: ALWAYS prefer sending tasks to already active sessions. If a running active session listed under "Active Sessions" above can handle the task, use \`agent.send\` to send the prompt to it. Do not spawn a new session if a matching/compatible session already exists.
+4. Unique descriptive labels: "HTML Builder", "CSS Stylist", "JS Developer", etc.
+5. Each agent gets ONE focused task with FULL context: file names, shared types, conventions
+6. Never assign two agents to the same file
+7. If agent A defines a shared type, paste the full definition into agent B's prompt
+8. If more agents are needed but you should not create them yourself, use \`agent.request\`; the app will detect newly added matching agents and dispatch your queued prompt.
+9. If a CLI agent asks a question and the answer follows from the user's instruction, answer it with \`agent.send\`. If uncertain, use \`chat.ask_user\`.
+10. If the user asks to open, inspect, test, or preview a web/app UI, use \`browser.open\` with the best local URL from terminal output. If no URL is known, ask the user for it.
+11. Browser feedback may include a URL, viewport, selected element/region, and user note. Use that context to prompt agents with precise visual/UI fixes.
+12. When an agent finishes, convert its terminal output into a concise visible summary of changed files, integrations, tests, and remaining risks. Do not show a question card unless the terminal is clearly waiting for user input.
+13. After dispatching, briefly summarize what each agent is doing (visible to user)
+14. The user may mention files with @filename, @path/file, or quoted @"path with spaces". Pass exact resolved paths to agents and tell them to inspect those files before editing. If a mention is unresolved, tell the agent to locate it with workspace search before touching files.
+15. When all dispatched agents are quiet and no unanswered questions remain, provide one concise final project-ready summary with changed files, verification, risks, and run/preview hints. Avoid repeating noisy terminal UI output.
+
+## Installed Skills
+These are custom agent capabilities installed in the workspace. If any of these are relevant to the user request, you should direct your CLI agents to apply/use them. For example, instruct the spawned CLI agent to follow the instructions in the attached skill block.
+${skillsList}
 
 ## Session Context Window
 ${contextWindow || "(no prior session context)"}
@@ -559,10 +657,15 @@ ${recentTools || "(none)"}`;
 function buildPlanPrompt(
   contextWindow = "",
   changedFiles: ChatDiffFile[] = [],
+  installedSkills: InstalledSkill[] = [],
 ): string {
   const changed = changedFiles.slice(0, 14)
     .map(file => `- ${file.status}: ${file.path}`)
     .join("\n");
+
+  const skillsList = installedSkills.length > 0
+    ? installedSkills.map(s => `- **${s.name}** (\`${s.slug}\`): ${s.description}\n  Triggers: ${s.triggers.join(", ")}`).join("\n")
+    : "(none installed — tell the user they can browse/install skills from the Skills tab)";
 
   return `You are the planning mode inside Integraded Chat.
 
@@ -570,7 +673,7 @@ Create a practical implementation plan for the user's request. This mode is hand
 - Do not call CLI agents.
 - Do not emit tool calls.
 - Do not ask another agent to do work.
-- Produce a concise but useful plan with concrete files, phases, risks, and verification steps.
+- Produce a concise but practical plan with concrete files, phases, risks, and verification steps.
 - If the user mentioned files with @filename, use the attached file contents/paths in your plan.
 - End by asking whether the user wants this plan saved as a Markdown implementation file.
 
@@ -580,6 +683,10 @@ Preferred structure:
 ## Files To Touch
 ## Verification
 ## Risks / Questions
+
+## Installed Skills
+The following custom capabilities are installed. You can reference them in your implementation plan if relevant:
+${skillsList}
 
 ## Current Chat Context
 ${contextWindow || "(no prior session context)"}
@@ -689,6 +796,11 @@ function messageForModel(msg: Msg): string {
   }
   if (msg.diffLog) {
     content += `\n\nDiff log:\n${formatDiffLogBody(msg.diffLog)}`;
+  }
+  if (msg.skillLog) {
+    const names = msg.skillLog.skills.map(s => s.name).join(", ");
+    const target = msg.skillLog.agentLabel !== "chat" ? ` → ${msg.skillLog.agentLabel}` : "";
+    content += `\n\nSkill log: ${msg.skillLog.status} [${names}]${target}`;
   }
   return content.trim();
 }
@@ -964,6 +1076,24 @@ export const ChatPanel: React.FC<{
   const [thinkingPreviewEnabled, setThinkingPreviewEnabled] = useState(true);
   const [chatMode, setChatMode] = useState<"build" | "plan">("build");
   const [pendingPlan, setPendingPlan] = useState<PendingPlan | null>(null);
+  // ── Installed skills ───────────────────────────────────────────────────────
+  const [installedSkills, setInstalledSkills] = useState<InstalledSkill[]>([]);
+  const installedSkillsRef = useRef<InstalledSkill[]>([]);
+
+  const [disabledProviders, setDisabledProviders] = useState<Set<string>>(new Set());
+  const disabledProvidersRef = useRef<Set<string>>(new Set());
+
+  /** Select a model and persist immediately to config.json */
+  const selectModel = (value: string, provider: string) => {
+    setSelectedModel(value);
+    setSelectedCloudProvider(provider);
+    invoke("save_active_model", { model: value, provider }).catch(() => {});
+  };
+
+  const [cloudModels, setCloudModels] = useState<ModelEntry[]>([]);
+  // Cache: provider → fetched entries. Cleared when config changes so newly
+  // added providers get fetched immediately without waiting for the next poll.
+  const cloudModelCacheRef = useRef<Partial<Record<string, ModelEntry[]>>>({});
   const [modelSearch, setModelSearch] = useState("");
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
@@ -993,6 +1123,8 @@ export const ChatPanel: React.FC<{
   const workMonitorRef = useRef<WorkMonitor | null>(null);
   // Timestamp set when agents finish so the auto-resume useEffect can trigger.
   const [pendingAutoResume, setPendingAutoResume] = useState<number | null>(null);
+  // Timestamp set when unanswered agent questions appear — triggers auto-answer.
+  const [pendingAutoAnswer, setPendingAutoAnswer] = useState<number | null>(null);
   const isProcessingRef = useRef(isProcessing);
 
   const onSendPtyCommandRef = useRef(onSendPtyCommand);
@@ -1010,6 +1142,11 @@ export const ChatPanel: React.FC<{
   const contextWindowRef = useRef(contextWindow);
   const mentionFilesRef = useRef(mentionFiles);
   const changedFilesRef = useRef(changedFiles);
+  /** Skills matched from the current user message — shared with terminal dispatch. */
+  const currentTaskSkillsRef = useRef<InstalledSkill[]>([]);
+  /** Workspace file paths written for current task's skills (empty if workspaceDir unset). */
+  const currentTaskSkillFilePathsRef = useRef<string[]>([]);
+
   const seenQuestionKeysRef = useRef<Set<string>>(new Set());
   const seenSummaryKeysRef = useRef<Set<string>>(new Set());
   const lastSummaryBySessionRef = useRef<Record<string, { sig: string; at: number }>>({});
@@ -1038,6 +1175,8 @@ export const ChatPanel: React.FC<{
   currentChatMetaRef.current = currentChatMeta;
   workMonitorRef.current = workMonitor;
   isProcessingRef.current = isProcessing;
+  installedSkillsRef.current = installedSkills;
+  disabledProvidersRef.current = disabledProviders;
 
   const updateChatAtBottom = () => {
     const el = messagesRef.current;
@@ -1108,6 +1247,10 @@ export const ChatPanel: React.FC<{
       setThinkingPreviewEnabled(loaded.thinking_preview ?? true);
       if (loaded.cloud_provider) setSelectedCloudProvider(loaded.cloud_provider);
       if (loaded.active_model) setSelectedModel(loaded.active_model);
+      // Persist disabled provider list
+      if (Array.isArray(loaded.disabled_providers)) {
+        setDisabledProviders(new Set(loaded.disabled_providers as string[]));
+      }
     } catch {}
   };
   useEffect(() => {
@@ -1117,16 +1260,42 @@ export const ChatPanel: React.FC<{
   }, [chatScopeKey]);
 
   useEffect(() => {
+    setHistoryHydrated(false);
     let active = true;
     (async () => {
       try {
-        const raw = await invoke<string | null>("load_chat_history", { scope: chatScopeKey });
+        // 1. Load the global histories list
+        const rawGlobal = await invoke<string | null>("load_chat_history", { scope: "default" });
         if (!active) return;
-        if (raw) {
-          const payload = JSON.parse(raw);
-          const diskHistories = Array.isArray(payload.histories)
+        
+        let loadedHistories: ChatHistory[] = [];
+        if (rawGlobal) {
+          const payload = JSON.parse(rawGlobal);
+          loadedHistories = Array.isArray(payload.histories)
             ? payload.histories.map(normalizeHistory).filter(Boolean) as ChatHistory[]
             : [];
+        } else {
+          // Fallback to global localStorage for histories
+          try {
+            const stored = localStorage.getItem("integraded_chat_default_histories");
+            if (stored) {
+              loadedHistories = (JSON.parse(stored) || []).map(normalizeHistory).filter(Boolean) as ChatHistory[];
+            }
+          } catch {}
+        }
+        setHistories(loadedHistories);
+
+        // 2. Load the workspace-scoped active session
+        const rawWorkspace = await invoke<string | null>("load_chat_history", { scope: chatScopeKey });
+        if (!active) return;
+        
+        // Reset active session questions/requests for the new scope
+        setAgentQuestions([]);
+        setPendingAgentRequests([]);
+        setWorkMonitor(null);
+        
+        if (rawWorkspace) {
+          const payload = JSON.parse(rawWorkspace);
           if (payload.current_session) {
             const current = normalizeHistory(payload.current_session);
             if (current) {
@@ -1142,11 +1311,36 @@ export const ChatPanel: React.FC<{
           } else if (Array.isArray(payload.current_msgs)) {
             setMsgs(normalizeMessages(payload.current_msgs));
             setContextWindow(typeof payload.current_context === "string" ? payload.current_context : "");
+            setCurrentChatMeta(createChatMeta());
+          } else {
+            setMsgs([]);
+            setContextWindow("");
+            setCurrentChatMeta(createChatMeta());
           }
-          if (diskHistories.length) setHistories(diskHistories);
+        } else {
+          // Fallback to scope-specific localStorage for current session
+          try {
+            const storedMsgs = localStorage.getItem(storageKey("current_msgs"));
+            const storedContext = localStorage.getItem(storageKey("context_window"));
+            const storedTools = localStorage.getItem(storageKey("tool_calls"));
+            
+            setMsgs(storedMsgs ? normalizeMessages(JSON.parse(storedMsgs)) : []);
+            setContextWindow(storedContext || "");
+            setToolCalls(storedTools ? JSON.parse(storedTools) : []);
+            setCurrentChatMeta(createChatMeta());
+          } catch {
+            setMsgs([]);
+            setContextWindow("");
+            setToolCalls([]);
+            setCurrentChatMeta(createChatMeta());
+          }
         }
       } catch {
-        // LocalStorage initializers already provide an offline fallback.
+        // Fallback offline resets
+        setMsgs([]);
+        setContextWindow("");
+        setToolCalls([]);
+        setCurrentChatMeta(createChatMeta());
       } finally {
         if (active) setHistoryHydrated(true);
       }
@@ -1154,36 +1348,9 @@ export const ChatPanel: React.FC<{
     return () => {
       active = false;
     };
-  }, []);
-
-  const buildHistoryPayload = (nextMsgs = msgs, nextContext = contextWindow, nextHistories = histories) => {
-    const cleanMsgs = normalizeMessages(nextMsgs);
-    const currentName = cleanMsgs.find(m => m.role === "user")?.body.slice(0, 60) || "Current chat";
-    return JSON.stringify({
-      current_msgs: cleanMsgs,
-      current_context: nextContext,
-      current_session: {
-        ...currentChatMetaRef.current,
-        name: currentName,
-        msgs: cleanMsgs,
-        contextWindow: nextContext,
-      },
-      histories: nextHistories.map(h => ({ ...h, msgs: normalizeMessages(h.msgs) })),
-    });
-  };
+  }, [chatScopeKey]);
 
   // ── Persistence helpers ───────────────────────────────────────────────────────
-
-  // Save to both the global home-dir store AND the workspace's date-organised folder.
-  function persistPayload(payload: string) {
-    invoke("save_chat_history", { jsonData: payload, scope: chatScopeKey }).catch(() => {});
-    // disabled save_chat_to_workspace to avoid polluting the workspace
-    /*
-    if (workspaceDir) {
-      invoke("save_chat_to_workspace", { workspaceDir, jsonData: payload }).catch(() => {});
-    }
-    */
-  }
 
   // Persistence synchronizations
   useEffect(() => {
@@ -1191,18 +1358,37 @@ export const ChatPanel: React.FC<{
     try {
       localStorage.setItem(storageKey("current_msgs"), JSON.stringify(normalizeMessages(msgs)));
     } catch {}
-    persistPayload(buildHistoryPayload(msgs, contextWindow, histories));
+    
+    // Save only current active session to the workspace-scoped file
+    const cleanMsgs = normalizeMessages(msgs);
+    const currentName = cleanMsgs.find(m => m.role === "user")?.body.slice(0, 60) || "Current chat";
+    const payload = JSON.stringify({
+      current_msgs: cleanMsgs,
+      current_context: contextWindow,
+      current_session: {
+        ...currentChatMetaRef.current,
+        name: currentName,
+        msgs: cleanMsgs,
+        contextWindow: contextWindow,
+      },
+    });
+    invoke("save_chat_history", { jsonData: payload, scope: chatScopeKey }).catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msgs, contextWindow, historyHydrated, chatScopeKey]);
 
   useEffect(() => {
     if (!historyHydrated) return;
     try {
-      localStorage.setItem(storageKey("histories"), JSON.stringify(histories));
+      localStorage.setItem("integraded_chat_default_histories", JSON.stringify(histories));
     } catch {}
-    persistPayload(buildHistoryPayload(msgs, contextWindow, histories));
+    
+    // Save only histories list to the global store
+    const payload = JSON.stringify({
+      histories: histories.map(h => ({ ...h, msgs: normalizeMessages(h.msgs) })),
+    });
+    invoke("save_chat_history", { jsonData: payload, scope: "default" }).catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [histories, contextWindow, msgs, currentChatMeta, historyHydrated, chatScopeKey]);
+  }, [histories, historyHydrated]);
 
   useEffect(() => {
     try { localStorage.setItem(storageKey("context_window"), contextWindow); } catch {}
@@ -1233,38 +1419,104 @@ export const ChatPanel: React.FC<{
     return () => window.removeEventListener("__integradedChatHistoryCleared", handleClear);
   }, []);
 
-  // Poll models
+  // ── Cloud model fetching ───────────────────────────────────────────────────
+  // Runs once per config change (e.g. new key saved). Each provider is fetched
+  // concurrently and results are cached so re-renders don't trigger extra calls.
   useEffect(() => {
     if (!config) return;
-    const check = async () => {
-      const result: ModelEntry[] = [];
-      const keys = config.api_keys || {};
-      for (const [prov, mods] of Object.entries(CLOUD_MODELS)) {
-        if (keys[prov] && (keys[prov] as string).length > 5) {
-          for (const m of mods) result.push({ value: m.value, label: m.label, provider: prov, providerName: PROVIDER_NAMES[prov], type: "cloud" });
-        }
-      }
+    // Reset cache when config changes so newly added providers get fetched fresh
+    cloudModelCacheRef.current = {};
+
+    const CLOUD_PROVIDERS_IDS = Object.keys(PROVIDER_NAMES);
+    const keys = config.api_keys || {};
+
+    const fetchCloud = async () => {
+      const results = await Promise.allSettled(
+        CLOUD_PROVIDERS_IDS
+          .filter(prov => keys[prov] && (keys[prov] as string).length > 5)
+          .map(async (prov) => {
+            if (cloudModelCacheRef.current[prov]) return; // already fetched
+            try {
+              const fetched = await invoke<{ id: string; name: string }[]>(
+                "fetch_provider_models", { provider: prov }
+              );
+              const entries: ModelEntry[] = fetched.map(m => ({
+                value: m.id,
+                label: m.name || m.id,
+                provider: prov,
+                providerName: PROVIDER_NAMES[prov] || prov,
+                type: "cloud" as const,
+              }));
+              cloudModelCacheRef.current[prov] = entries;
+            } catch {
+              // Provider unreachable or key invalid — silently skip
+              cloudModelCacheRef.current[prov] = [];
+            }
+          })
+      );
+      void results; // we care only about the cache side-effects
+
+      const all = CLOUD_PROVIDERS_IDS.flatMap(p => cloudModelCacheRef.current[p] || []);
+      setCloudModels(all);
+    };
+
+    fetchCloud();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config]);
+
+  // ── Local provider polling (LM Studio + Ollama) ────────────────────────────
+  // Poll every 8 s so newly downloaded models appear without a restart.
+  useEffect(() => {
+    if (!config) return;
+    const pollLocal = async () => {
+      const local: ModelEntry[] = [];
       try {
         const lmUrl = (config.lmstudio_url || "http://localhost:1234").replace(/\/+$/, "");
         const d = JSON.parse(await invoke<string>("curl_get", { url: `${lmUrl}/v1/models` }));
-        for (const m of d.data) result.push({ value: m.id, provider: "lmstudio", providerName: "LM Studio", type: "local" });
+        for (const m of d.data) local.push({ value: m.id, provider: "lmstudio", providerName: "LM Studio", type: "local" });
       } catch {}
       try {
         const olUrl = (config.ollama_url || "http://localhost:11434").replace(/\/+$/, "");
         const d = JSON.parse(await invoke<string>("curl_get", { url: `${olUrl}/api/tags` }));
-        for (const m of d.models) result.push({ value: m.name, provider: "ollama", providerName: "Ollama", type: "local" });
+        for (const m of d.models) local.push({ value: m.name, provider: "ollama", providerName: "Ollama", type: "local" });
       } catch {}
-      setModels(result);
-      // Use ref to avoid stale closure — selectedModelRef.current always has the latest value
-      if (!result.some(m => m.value === selectedModelRef.current) && result.length > 0) {
-        setSelectedModel(result[0].value);
-        setSelectedCloudProvider(result[0].provider);
-      }
+      setModels(prev => {
+        const cloud = prev.filter(m => m.type === "cloud");
+        return [...cloud, ...local];
+      });
     };
-    check();
-    const t = setInterval(check, 8000);
+    pollLocal();
+    const t = setInterval(pollLocal, 8000);
     return () => clearInterval(t);
   }, [config]);
+
+  // ── Merge cloud + local into the combined models list ─────────────────────
+  useEffect(() => {
+    setModels(prev => {
+      const local = prev.filter(m => m.type === "local");
+      const visibleCloud = cloudModels.filter(m => !disabledProvidersRef.current.has(m.provider));
+      const merged = [...visibleCloud, ...local];
+      // Auto-select first model if current selection is not in the visible list
+      if (!merged.some(m => m.value === selectedModelRef.current) && merged.length > 0) {
+        selectModel(merged[0].value, merged[0].provider);
+      }
+      return merged;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cloudModels, disabledProviders]);
+
+  // ── Load installed skills (and refresh when user installs/uninstalls) ────────
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const skills = await invoke<InstalledSkill[]>("skills_list_installed");
+        setInstalledSkills(skills);
+      } catch {}
+    };
+    load();
+    window.addEventListener("__integradedSkillsUpdated", load);
+    return () => window.removeEventListener("__integradedSkillsUpdated", load);
+  }, []);
 
   // Speech recognition
   useEffect(() => {
@@ -1313,40 +1565,17 @@ export const ChatPanel: React.FC<{
         id: q.id,
         role: "ai" as const,
         agent: "system" as const,
-        body: `**${q.label} asks:** ${q.question}\n\nMůžeš odpovědět přímo tady v chatu, nebo použít tlačítko u otázky pro poslání rozepsané odpovědi do terminálu.`,
+        body: `**${q.label}:** ${q.question}`,
         ts: q.ts,
       })),
     ]);
+    // Trigger auto-answer: give LLM 2.5 s to see context stabilize before answering
+    setTimeout(() => {
+      if (!isProcessingRef.current) setPendingAutoAnswer(Date.now());
+    }, 2500);
   }, [sessionsProp, terminalOutputsProp]);
 
-  // Surface agent completion notes as summaries instead of misclassifying them as questions.
-  useEffect(() => {
-    const additions: Msg[] = [];
-    for (const session of sessionsProp) {
-      const transcript = terminalTranscriptsProp[session.sessionId] || [];
-      const wasPrompted = transcript.some(entry => entry.kind === "input") || usedPromptSessionIdsRef.current.has(session.sessionId);
-      if (!wasPrompted) continue;
-      const summary = detectAgentCompletionSummary(terminalOutputsProp[session.sessionId] || "");
-      if (!summary) continue;
-      const sig = summarySignature(summary);
-      const last = lastSummaryBySessionRef.current[session.sessionId];
-      if (last && (last.sig === sig || last.sig.includes(sig) || sig.includes(last.sig) || Date.now() - last.at < 15000)) {
-        continue;
-      }
-      const key = `${session.sessionId}:${sig}`;
-      if (seenSummaryKeysRef.current.has(key)) continue;
-      seenSummaryKeysRef.current.add(key);
-      lastSummaryBySessionRef.current[session.sessionId] = { sig, at: Date.now() };
-      additions.push({
-        id: `sum-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        role: "ai",
-        agent: "orchestrator",
-        body: `**${session.label} summary**\n${summary}`,
-        ts: ts(),
-      });
-    }
-    if (additions.length) setMsgs(prev => [...prev, ...additions]);
-  }, [sessionsProp, terminalOutputsProp, terminalTranscriptsProp]);
+  // (Raw terminal summary effect removed — the LLM auto-resume generates proper summaries.)
 
   // Keep only the latest diff signature here. The full diff belongs in Changes,
   // not in the chat transcript.
@@ -1412,21 +1641,8 @@ export const ChatPanel: React.FC<{
       const signature = `${workMonitor.id}:${lastActivity}:${changedFilesRef.current.length}`;
       if (lastReadySummaryRef.current === signature) return;
       lastReadySummaryRef.current = signature;
-      const body = buildAgentsReadySummary(
-        workMonitor,
-        sessionsRef.current,
-        terminalOutputsRef.current,
-        changedFilesRef.current,
-      );
-      setMsgs(prev => [...prev, {
-        id: `ready-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        role: "ai",
-        agent: "orchestrator",
-        body,
-        ts: ts(),
-      }]);
       setWorkMonitor(null);
-      // Trigger auto-resume: the LLM will read the terminal context and continue.
+      // Trigger auto-resume: the LLM will generate a summary directly.
       setPendingAutoResume(Date.now());
     }, 3000);
     return () => window.clearInterval(timer);
@@ -1434,21 +1650,50 @@ export const ChatPanel: React.FC<{
 
   // ─── Auto-resume after agents finish ──────────────────────────────────────────
   // When pendingAutoResume is set and we're not already processing, call the LLM
-  // with the terminal transcripts in context so it can continue the original task.
+  // with the terminal transcripts in context so it can summarize and continue.
   useEffect(() => {
     if (pendingAutoResume === null || isProcessing) return;
+    // Skip if no model is configured — avoids curl errors being surfaced in chat.
+    if (!selectedModel || models.length === 0) {
+      setPendingAutoResume(null);
+      return;
+    }
     setPendingAutoResume(null);
 
-    const continuationPrompt =
-      "The CLI agents have finished their work. Review the terminal output shown " +
-      "in your context and any files that were modified, then continue with the " +
-      "original task. If the agents completed it successfully, report what was done " +
-      "and suggest any follow-up steps. If there were errors or incomplete work, " +
-      "diagnose the problem and propose a fix (you may spawn another agent or ask me " +
-      "a clarifying question if needed).";
+    // Build an adaptive continuation prompt based on actual work state
+    const currentSessions = sessionsRef.current;
+    const currentOutputs = terminalOutputsRef.current;
+    const exitedAgents = currentSessions.filter(s => s.status === "exited");
+    const activeAgents = currentSessions.filter(s => s.status === "running");
+    const fileCount = changedFilesRef.current.length;
+    const allOutput = Object.values(currentOutputs).join("\n");
+    const hasErrors = /\b(error|exception|failed|fatal|traceback|cannot find|unable to|ENOENT|EACCES|SyntaxError|TypeError|ImportError|ModuleNotFoundError)\b/i.test(allOutput.slice(-2000));
+
+    let continuationPrompt = "Agents are idle. Review the terminal context and assess the state of work.\n\n";
+
+    if (exitedAgents.length > 0) {
+      continuationPrompt += `⚠ Exited agents: ${exitedAgents.map(s => s.label).join(", ")}. Check if they completed their task or crashed.\n`;
+    }
+    if (hasErrors) {
+      continuationPrompt += `⚠ Errors detected in terminal output. Diagnose the root cause and decide if the task can continue.\n`;
+    }
+    if (fileCount > 0) {
+      continuationPrompt += `📁 ${fileCount} file${fileCount > 1 ? "s" : ""} changed in workspace.\n`;
+    }
+    if (activeAgents.length > 0) {
+      continuationPrompt += `🟢 Active: ${activeAgents.map(s => s.label).join(", ")}.\n`;
+    }
+
+    continuationPrompt += `\nNow:\n`;
+    continuationPrompt += `1. Summarize what was completed (files created/modified, features working)\n`;
+    continuationPrompt += `2. Identify errors, incomplete work, or blockers\n`;
+    continuationPrompt += `3. If work is incomplete or errored, dispatch follow-up tasks immediately via tool calls\n`;
+    continuationPrompt += `4. If all complete, give a clean summary with verification/preview steps\n`;
+    continuationPrompt += `\nBe decisive — if an agent left a task half-done, send it the next step now.`;
 
     const runResume = async () => {
       setIsProcessing(true);
+      const aiMsgId = `a-resume-${Date.now()}`;
       try {
         const sysPrompt = buildOrchestratorPrompt(
           sessionsRef.current,
@@ -1457,9 +1702,8 @@ export const ChatPanel: React.FC<{
           toolCallsRef.current,
           agentQuestionsRef.current,
           contextWindowRef.current,
+          installedSkillsRef.current,
         );
-        // Build conversation history the same way send() does, so the LLM has
-        // full context of what was asked and what the agents did.
         const history = msgs
           .filter(m => (m.role === "user" || m.role === "ai") && !m.streaming)
           .slice(-40)
@@ -1472,7 +1716,6 @@ export const ChatPanel: React.FC<{
           ...history,
           { role: "user" as const, content: continuationPrompt },
         ];
-        const aiMsgId = `a-resume-${Date.now()}`;
 
         if (streamingEnabled) {
           setMsgs(p => [...p, {
@@ -1507,13 +1750,10 @@ export const ChatPanel: React.FC<{
           if (actions.length) autoDispatchActions(actions);
         }
       } catch (err: any) {
-        setMsgs(p => [...p, {
-          id: `e-resume-${Date.now()}`,
-          role: "ai",
-          agent: "system",
-          body: `**Could not auto-review agent results:** ${err?.message || String(err)}`,
-          ts: ts(),
-        }]);
+        // Remove the streaming placeholder if present, then silently drop the error.
+        // We don't surface low-level curl/network errors into the conversation.
+        setMsgs(p => p.filter(m => m.id !== aiMsgId));
+        console.warn("[auto-resume] failed:", err?.message || String(err));
       } finally {
         setIsProcessing(false);
       }
@@ -1522,6 +1762,89 @@ export const ChatPanel: React.FC<{
     void runResume();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingAutoResume, isProcessing]);
+
+  // ─── Auto-answer: LLM answers pending agent questions automatically ────────────
+  useEffect(() => {
+    if (pendingAutoAnswer === null || isProcessing) return;
+    const unanswered = agentQuestionsRef.current.filter(q => !q.answered);
+    if (!unanswered.length) { setPendingAutoAnswer(null); return; }
+    if (!selectedModel || models.length === 0) { setPendingAutoAnswer(null); return; }
+    setPendingAutoAnswer(null);
+
+    const questionContext = unanswered
+      .map(q => `- ${q.label}: "${q.question}"`)
+      .join("\n");
+
+    const autoAnswerPrompt =
+      `The following CLI agent(s) are paused and waiting for a response:\n${questionContext}\n\n` +
+      `Review the terminal output and the original user task in your context window. ` +
+      `If the answer is clear from context (e.g. "yes, proceed", "overwrite", "use default"), ` +
+      `send it directly with agent.send. Be decisive — agents prefer a clear answer over silence. ` +
+      `Only use chat.ask_user if the answer genuinely cannot be inferred from context.`;
+
+    const runAutoAnswer = async () => {
+      setIsProcessing(true);
+      const aiMsgId = `a-autoanswer-${Date.now()}`;
+      try {
+        const sysPrompt = buildOrchestratorPrompt(
+          sessionsRef.current,
+          terminalOutputsRef.current,
+          terminalTranscriptsRef.current,
+          toolCallsRef.current,
+          agentQuestionsRef.current,
+          contextWindowRef.current,
+          installedSkillsRef.current,
+        );
+        const history = msgs
+          .filter(m => (m.role === "user" || m.role === "ai") && !m.streaming)
+          .slice(-30)
+          .map(m => ({ role: m.role === "user" ? "user" as const : "assistant" as const, content: messageForModel(m) }));
+        const llmMsgs = [
+          { role: "system" as const, content: sysPrompt },
+          ...history,
+          { role: "user" as const, content: autoAnswerPrompt },
+        ];
+
+        if (streamingEnabled) {
+          setMsgs(p => [...p, { id: aiMsgId, role: "ai", agent: "orchestrator" as const, body: "", streaming: true, ts: ts() }]);
+          await streamLLM(aiMsgId, llmMsgs);
+          const finalText = streamTextRef.current;
+          const actions = parseAgentActions(finalText);
+          const visible = stripAgentTags(finalText);
+          setMsgs(p => p.map(m => m.id === aiMsgId
+            ? { ...m, streaming: false, body: visible, actions: actions.length ? actions : undefined }
+            : m));
+          if (actions.length) {
+            autoDispatchActions(actions);
+            // Mark questions as answered for agents that received a send/broadcast
+            const sentLabels = actions
+              .filter(a => a.type === "send" || a.type === "broadcast")
+              .map(a => a.label.toLowerCase());
+            if (sentLabels.length > 0) {
+              setAgentQuestions(prev => prev.map(q =>
+                sentLabels.some(l => q.label.toLowerCase().includes(l) || l.includes(q.label.toLowerCase()) || l === "all" || l === "*")
+                  ? { ...q, answered: true } : q
+              ));
+            }
+          }
+        } else {
+          const resp = await callLLM(llmMsgs);
+          const actions = parseAgentActions(resp);
+          const visible = stripAgentTags(resp);
+          setMsgs(p => [...p, { id: aiMsgId, role: "ai", agent: "orchestrator" as const, body: visible, actions: actions.length ? actions : undefined, ts: ts() }]);
+          if (actions.length) autoDispatchActions(actions);
+        }
+      } catch (err: any) {
+        setMsgs(p => p.filter(m => m.id !== aiMsgId));
+        console.warn("[auto-answer] failed:", err?.message || String(err));
+      } finally {
+        setIsProcessing(false);
+      }
+    };
+
+    void runAutoAnswer();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingAutoAnswer, isProcessing]);
 
   const { notifyError } = useNotify();
 
@@ -1621,8 +1944,11 @@ export const ChatPanel: React.FC<{
   };
 
   // ── Build API request ─────────────────────────────────────────────────────────
+  // buildRequest is async because cloud providers retrieve their key from the OS
+  // keychain via the backend (invoke "get_api_key"). The key is never stored in
+  // React state — it is fetched only at call time and used once.
 
-  const buildRequest = (messages: { role: string; content: string }[], streaming: boolean) => {
+  const buildRequest = async (messages: { role: string; content: string }[], streaming: boolean) => {
     if (!config) throw new Error("No configuration loaded.");
     const model = selectedModel || "gpt-4o";
     const entry = models.find(m => m.value === model);
@@ -1639,8 +1965,12 @@ export const ChatPanel: React.FC<{
     }
 
     const prov = selectedCloudProvider || config.cloud_provider || "openai";
-    const key = config.api_keys?.[prov] || "";
-    if (!key) throw new Error(`No API key for ${prov}.`);
+    // Check that a key is configured (masked marker "••••••••••••••••" means it's in the keychain)
+    const hasKey = !!(config.api_keys?.[prov]);
+    if (!hasKey) throw new Error(`No API key configured for ${prov}. Add it in Settings.`);
+
+    // Retrieve the real key from the OS keychain — never stored in JS state
+    const key = await invoke<string>("get_api_key", { provider: prov });
 
     if (prov === "anthropic") {
       const aMessages = messages.filter(m => m.role !== "system").map(m => ({ role: m.role as "user"|"assistant", content: m.content }));
@@ -1672,13 +2002,29 @@ export const ChatPanel: React.FC<{
     if (prov === "google") {
       return { provider: prov, url: `${url}?key=${key}`, body: JSON.stringify({ model, messages, max_tokens: 4096, stream: streaming }), headers: [["Content-Type","application/json"]] as string[][] };
     }
+    if (prov === "openrouter") {
+      return { provider: prov, url, body: JSON.stringify({ model, messages, max_tokens: 4096, stream: streaming, include_reasoning: true }), headers: [["Authorization",`Bearer ${key}`],["Content-Type","application/json"]] as string[][] };
+    }
     return { provider: prov, url, body: JSON.stringify({ model, messages, max_tokens: 4096, stream: streaming }), headers: [["Authorization",`Bearer ${key}`],["Content-Type","application/json"]] as string[][] };
   };
 
   // ── Streaming ─────────────────────────────────────────────────────────────────
 
+  function extractThinkingFromContent(text: string): { thinking: string; content: string; isThinking: boolean } {
+    const thinkStart = text.indexOf("<think>");
+    if (thinkStart === -1) {
+      return { thinking: "", content: text, isThinking: false };
+    }
+    const thinkEnd = text.indexOf("</think>");
+    if (thinkEnd === -1) {
+      return { thinking: text.slice(thinkStart + 7), content: text.slice(0, thinkStart), isThinking: true };
+    } else {
+      return { thinking: text.slice(thinkStart + 7, thinkEnd), content: text.slice(0, thinkStart) + text.slice(thinkEnd + 8), isThinking: false };
+    }
+  }
+
   const streamLLM = async (msgId: string, messages: { role: string; content: string }[]) => {
-    const req = buildRequest(messages, true);
+    const req = await buildRequest(messages, true);
     const sid = `chat-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
     activeStreamIdRef.current = sid;
     streamTextRef.current = "";
@@ -1688,34 +2034,46 @@ export const ChatPanel: React.FC<{
 
     streamUnlistenRef.current = (await listen<string>(`stream-chunk-${sid}`, (e) => {
       if (activeStreamIdRef.current !== sid) return;
+      
       const thinkingDelta = parseStreamThinking(e.payload, req.provider);
-      if (thinkingPreviewEnabled && thinkingDelta) {
+      if (thinkingDelta) {
         if (streamThinkingStartRef.current === null) streamThinkingStartRef.current = Date.now();
         streamThinkingRef.current += thinkingDelta;
-        const thinkingStart = streamThinkingStartRef.current ?? Date.now();
-        const elapsedMs = Date.now() - thinkingStart;
-        setMsgs(p => p.map(m => m.id === msgId ? {
-          ...m,
-          thinking: { text: streamThinkingRef.current, elapsedMs, open: m.thinking?.open ?? true, done: false },
-        } : m));
       }
+      
       const delta = parseStreamDelta(e.payload, req.provider);
       if (delta) {
         streamTextRef.current += delta;
-        const hadThinking = streamThinkingStartRef.current !== null || streamThinkingRef.current.length > 0;
-        const justFinishedThinking = hadThinking && streamThinkingElapsedRef.current === null;
-        if (justFinishedThinking) {
-          streamThinkingElapsedRef.current = Math.max(0, Date.now() - (streamThinkingStartRef.current ?? Date.now()));
-        }
-        const elapsedMs = streamThinkingElapsedRef.current ?? 0;
-        setMsgs(p => p.map(m => m.id === msgId ? {
-          ...m,
-          body: visibleStreamText(streamTextRef.current),
-          thinking: thinkingPreviewEnabled && hadThinking
-            ? { text: streamThinkingRef.current, elapsedMs, open: justFinishedThinking ? false : (m.thinking?.open ?? false), done: true }
-            : m.thinking,
-        } : m));
       }
+      
+      const extracted = extractThinkingFromContent(streamTextRef.current);
+      const combinedThinkingText = (streamThinkingRef.current + extracted.thinking).trim();
+      const hasThinkingText = combinedThinkingText.length > 0;
+      
+      const isCurrentlyThinking = (hasThinkingText && !delta) || extracted.isThinking;
+      
+      if (hasThinkingText && streamThinkingStartRef.current === null) {
+        streamThinkingStartRef.current = Date.now();
+      }
+      
+      if (hasThinkingText && !isCurrentlyThinking && streamThinkingElapsedRef.current === null) {
+        streamThinkingElapsedRef.current = Math.max(0, Date.now() - (streamThinkingStartRef.current ?? Date.now()));
+      }
+      
+      const elapsedMs = streamThinkingElapsedRef.current ?? (streamThinkingStartRef.current !== null ? Date.now() - streamThinkingStartRef.current : 0);
+      
+      setMsgs(p => p.map(m => m.id === msgId ? {
+        ...m,
+        body: visibleStreamText(extracted.content),
+        thinking: thinkingPreviewEnabled && hasThinkingText
+          ? {
+              text: combinedThinkingText,
+              elapsedMs,
+              open: m.thinking?.open ?? (isCurrentlyThinking ? true : false),
+              done: !isCurrentlyThinking,
+            }
+          : m.thinking,
+      } : m));
     })) as unknown as () => void;
 
     try {
@@ -1724,15 +2082,20 @@ export const ChatPanel: React.FC<{
       activeStreamIdRef.current = null;
       streamUnlistenRef.current?.();
       streamUnlistenRef.current = null;
-      const hadThinking = streamThinkingStartRef.current !== null || streamThinkingRef.current.length > 0;
-      const elapsedMs = streamThinkingElapsedRef.current ?? (hadThinking ? Math.max(0, Date.now() - (streamThinkingStartRef.current ?? Date.now())) : 0);
+      
+      const extracted = extractThinkingFromContent(streamTextRef.current);
+      const combinedThinkingText = (streamThinkingRef.current + extracted.thinking).trim();
+      const hasThinkingText = combinedThinkingText.length > 0;
+      
+      const elapsedMs = streamThinkingElapsedRef.current ?? (streamThinkingStartRef.current !== null ? Math.max(0, Date.now() - streamThinkingStartRef.current) : 0);
       streamThinkingElapsedRef.current = elapsedMs;
+      
       setMsgs(p => p.map(m => m.id === msgId ? {
         ...m,
         streaming: false,
-        body: visibleStreamText(streamTextRef.current),
-        thinking: thinkingPreviewEnabled && hadThinking
-          ? { text: streamThinkingRef.current, elapsedMs, open: m.thinking?.open ?? false, done: true }
+        body: visibleStreamText(extracted.content),
+        thinking: thinkingPreviewEnabled && hasThinkingText
+          ? { text: combinedThinkingText, elapsedMs, open: m.thinking?.open ?? false, done: true }
           : m.thinking,
       } : m));
     }
@@ -1746,19 +2109,24 @@ export const ChatPanel: React.FC<{
     streamUnlistenRef.current?.();
     streamUnlistenRef.current = null;
     setIsProcessing(false);
-    const hadThinking = streamThinkingStartRef.current !== null || streamThinkingRef.current.length > 0;
-    const elapsedMs = streamThinkingElapsedRef.current ?? (hadThinking ? Math.max(0, Date.now() - (streamThinkingStartRef.current ?? Date.now())) : 0);
+    
+    const extracted = extractThinkingFromContent(streamTextRef.current);
+    const combinedThinkingText = (streamThinkingRef.current + extracted.thinking).trim();
+    const hasThinkingText = combinedThinkingText.length > 0;
+    
+    const elapsedMs = streamThinkingElapsedRef.current ?? (streamThinkingStartRef.current !== null ? Math.max(0, Date.now() - streamThinkingStartRef.current) : 0);
     streamThinkingElapsedRef.current = elapsedMs;
+    
     setMsgs(p => p.map(m => m.streaming ? {
       ...m,
       streaming: false,
-      body: visibleStreamText(streamTextRef.current),
-      thinking: hadThinking && m.thinking ? { ...m.thinking, elapsedMs, open: m.thinking.open, done: true } : m.thinking,
+      body: visibleStreamText(extracted.content),
+      thinking: hasThinkingText && m.thinking ? { ...m.thinking, text: combinedThinkingText, elapsedMs, done: true } : m.thinking,
     } : m));
   };
 
   const callLLM = async (messages: { role: string; content: string }[]): Promise<string> => {
-    const req = buildRequest(messages, false);
+    const req = await buildRequest(messages, false);
     const res = await invoke<string>("curl_post", { url: req.url, body: req.body, headers: req.headers });
     const d = JSON.parse(res);
     if (req.provider === "ollama" || req.provider === "ollama_cloud") return d.message?.content || "_(no response)_";
@@ -1797,30 +2165,91 @@ export const ChatPanel: React.FC<{
     return command.toLowerCase().split(/\s+/)[0] === agentType.toLowerCase();
   };
 
+  /**
+   * Augment a prompt going to a terminal with any matching installed skills.
+   *
+   * Combines two sources:
+   *   1. Skills matched from the original user message (currentTaskSkillsRef) — avoids
+   *      missing skills when the LLM rephrases the task in ways that drop trigger keywords.
+   *   2. Skills re-matched from the agent-specific prompt — catches any additional context.
+   *
+   * If skill files were already written to the workspace (currentTaskSkillFilePathsRef),
+   * includes file references so CLI agents can read the full skill content from disk.
+   */
+  const injectSkillsIntoPrompt = (promptText: string): string => {
+    const allSkills = installedSkillsRef.current;
+    if (!allSkills.length) return promptText;
+
+    // Union: task-level skills (from original user msg) + prompt-matched skills
+    const taskSkills = currentTaskSkillsRef.current;
+    const promptMatched = matchSkills(promptText, allSkills);
+    const combined = Array.from(
+      new Map([...taskSkills, ...promptMatched].map(s => [s.id, s])).values()
+    );
+    if (!combined.length) return promptText;
+
+    const notice = skillNotice(combined);
+    const block = buildSkillBlock(combined);
+    const fileRef = buildSkillFileRef(combined, currentTaskSkillFilePathsRef.current);
+    return promptText + notice + block + fileRef;
+  };
+
   const sendToSession = (session: Session, promptText: string, logId: string) => {
     usedPromptSessionIdsRef.current.add(session.sessionId);
+    // Inject relevant skills into every prompt sent to a terminal agent
+    const enrichedPrompt = injectSkillsIntoPrompt(promptText);
+
+    // Skills are injected inline into the prompt — logged once at detection time in send().
+
     if (session.status === "exited") {
       const newSessId = onRestartSessionRef.current?.(session.id);
       if (!newSessId) {
         updateToolLog(logId, "failed", "Could not restart exited session.");
         return;
       }
-      updateToolLog(logId, "queued", `Restarting ${session.label}.`);
-      setTimeout(() => {
-        onSendPtyCommandRef.current?.(newSessId, promptText);
-        updateToolLog(logId, "done", `Sent to restarted ${session.label}.`);
-      }, 4000);
+      updateToolLog(logId, "queued", `Restarting ${session.label}…`);
+      // Poll for "running" status, retry up to 3 × 4s = 12s
+      const waitAndSend = (attempt: number, targetSessId: string) => {
+        setTimeout(() => {
+          const current = sessionsRef.current.find(s => s.id === session.id);
+          if (!current) { updateToolLog(logId, "failed", `${session.label} session gone.`); return; }
+          if (current.status === "running") {
+            onSendPtyCommandRef.current?.(current.sessionId, enrichedPrompt);
+            updateToolLog(logId, "done", `Sent to restarted ${session.label}.`);
+          } else if (current.status === "booting" && attempt < 3) {
+            updateToolLog(logId, "queued", `Still waiting for ${session.label} (${attempt + 1}/3)…`);
+            waitAndSend(attempt + 1, current.sessionId);
+          } else {
+            // Boot took too long — send anyway
+            onSendPtyCommandRef.current?.(current.sessionId, enrichedPrompt);
+            updateToolLog(logId, "done", `Sent to ${session.label} (forced after boot timeout).`);
+          }
+        }, 4000);
+      };
+      waitAndSend(0, newSessId);
       return;
     }
     if (session.status === "booting") {
-      updateToolLog(logId, "queued", `Waiting for ${session.label} to boot.`);
-      setTimeout(() => {
-        onSendPtyCommandRef.current?.(session.sessionId, promptText);
-        updateToolLog(logId, "done", `Sent to ${session.label}.`);
-      }, 4000);
+      updateToolLog(logId, "queued", `Waiting for ${session.label} to boot…`);
+      const waitAndSend = (attempt: number) => {
+        setTimeout(() => {
+          const current = sessionsRef.current.find(s => s.id === session.id);
+          if (!current) { updateToolLog(logId, "failed", `${session.label} session gone.`); return; }
+          if (current.status === "running") {
+            onSendPtyCommandRef.current?.(current.sessionId, enrichedPrompt);
+            updateToolLog(logId, "done", `Sent to ${session.label}.`);
+          } else if (current.status === "booting" && attempt < 3) {
+            waitAndSend(attempt + 1);
+          } else {
+            onSendPtyCommandRef.current?.(current.sessionId, enrichedPrompt);
+            updateToolLog(logId, "done", `Sent to ${session.label} (forced after boot timeout).`);
+          }
+        }, 4000);
+      };
+      waitAndSend(0);
       return;
     }
-    onSendPtyCommandRef.current?.(session.sessionId, promptText);
+    onSendPtyCommandRef.current?.(session.sessionId, enrichedPrompt);
     updateToolLog(logId, "done", `Sent to ${session.label}.`);
   };
 
@@ -1886,7 +2315,7 @@ export const ChatPanel: React.FC<{
         updateToolLog(logId, "done", `Switched ${target.label} to ${nextCommand}.`);
         if (action.prompt && newSessionId) {
           monitorLabels.push(target.label);
-          setTimeout(() => onSendPtyCommandRef.current?.(newSessionId, action.prompt || ""), 4000);
+          setTimeout(() => onSendPtyCommandRef.current?.(newSessionId, injectSkillsIntoPrompt(action.prompt || "")), 4000);
         }
         continue;
       }
@@ -2061,7 +2490,7 @@ export const ChatPanel: React.FC<{
       content: messageForModel(m),
     }));
     const llmMsgs = [
-      { role: "system", content: buildPlanPrompt(contextWindowRef.current, changedFilesRef.current) },
+      { role: "system", content: buildPlanPrompt(contextWindowRef.current, changedFilesRef.current, installedSkillsRef.current) },
       ...history,
       { role: "user", content: messageForModel(userMsg) },
     ];
@@ -2133,6 +2562,58 @@ export const ChatPanel: React.FC<{
         return;
       }
 
+      // ── Skill detection, file writing & injection ─────────────────────────
+      const matchedSkills = matchSkills(text, installedSkillsRef.current);
+      const skillBlock = buildSkillBlock(matchedSkills);
+
+      // Store matched skills in refs so sendToSession can access them without
+      // re-matching from LLM-rephrased prompts that may not contain trigger keywords.
+      currentTaskSkillsRef.current = matchedSkills;
+      currentTaskSkillFilePathsRef.current = [];
+
+      // Show skill detection log, then update it to file_written after async write
+      if (matchedSkills.length > 0) {
+        const detectMsgId = `skill-detect-${Date.now()}`;
+        const detectionLog: SkillLog = {
+          skills: matchedSkills.map(s => ({ name: s.name, slug: s.slug })),
+          agentLabel: "chat",
+          status: "detected",
+        };
+        setMsgs(p => [...p, {
+          id: detectMsgId,
+          role: "ai",
+          agent: "skill",
+          body: "",
+          skillLog: detectionLog,
+          ts: ts(),
+        }]);
+
+        // Write skill files to workspace (best-effort async — updates log when done)
+        if (workspaceDir) {
+          (async () => {
+            const written: string[] = [];
+            for (const skill of matchedSkills) {
+              try {
+                const path = await invoke<string>("write_skill_to_workspace", {
+                  workspaceDir,
+                  slug: skill.slug,
+                  content: `# Skill: ${skill.name}\n\n${skill.skill_md}`,
+                });
+                written.push(path);
+              } catch {}
+            }
+            if (written.length > 0) {
+              currentTaskSkillFilePathsRef.current = written;
+              // Update the detection log to show file_written status
+              setMsgs(p => p.map(msg => msg.id === detectMsgId ? {
+                ...msg,
+                skillLog: { ...detectionLog, status: "file_written" as const, filePaths: written },
+              } : msg));
+            }
+          })();
+        }
+      }
+
       const sysPrompt = buildOrchestratorPrompt(
         sessionsRef.current,
         terminalOutputsRef.current,
@@ -2140,7 +2621,8 @@ export const ChatPanel: React.FC<{
         toolCallsRef.current,
         agentQuestionsRef.current,
         contextWindowRef.current,
-      );
+        installedSkillsRef.current,
+      ) + skillBlock; // skills appended to system prompt
       const history = msgs.filter(m => (m.role === "user" || m.role === "ai") && !m.streaming).slice(-40).map(m => {
         let content = messageForModel(m);
         if (m.role === "ai" && m.actions?.length) {
@@ -2264,20 +2746,30 @@ export const ChatPanel: React.FC<{
     </div>
   );
 
-  const renderToolLog = (log: ToolCallLog) => {
+  const renderToolStrip = (log: ToolCallLog, ts_val?: string) => {
+    const ACTION_ICONS: Record<string, string> = {
+      spawn: "bx-plus-circle", send: "bx-send", broadcast: "bx-rss",
+      kill: "bx-x-circle", request: "bx-user-plus", mode: "bx-transfer",
+      ask_user: "bx-comment-dots", browser_open: "bx-world", file_create: "bx-file-plus",
+    };
+    const icon = ACTION_ICONS[log.action.type] || "bx-cog";
+    const target = toolLogTarget(log);
     const note = toolLogNote(log);
     return (
-      <div className={`chat-tool-message status-${log.status}`}>
-        <div className="chat-tool-message-row">
-          <span className="chat-tool-status">{log.status}</span>
-          <span className="chat-tool-action">{log.action.type.replace("_", ".")}</span>
-          <span className="chat-tool-arrow">{"->"}</span>
-          <span className="chat-tool-target">{toolLogTarget(log)}</span>
-        </div>
-        {note && <div className="chat-tool-message-note">{note}</div>}
+      <div className={`tool-strip tool-strip-${log.status}`}>
+        <i className={`bx ${icon} tool-strip-icon`} />
+        <span className="tool-strip-action">{log.action.type.replace("_", ".")}</span>
+        <span className="tool-strip-sep">→</span>
+        <span className="tool-strip-target">{target}</span>
+        {note && <span className="tool-strip-note">{note}</span>}
+        <span className={`tool-strip-dot dot-${log.status}`} title={log.status} />
+        {ts_val && <span className="tool-strip-ts">{ts_val}</span>}
       </div>
     );
   };
+
+  // Keep old renderToolLog for inline use (diff, etc.) but now unused in msgs
+  const renderToolLog = renderToolStrip;
 
   const toggleThinking = (msgId: string) => {
     setMsgs(prev => prev.map(msg => msg.id === msgId && msg.thinking
@@ -2351,7 +2843,7 @@ export const ChatPanel: React.FC<{
               onClick={() => { setHistoryOpen(o => !o); setTermPickerOpen(false); }}
             >
               <i className="bx bx-history" />
-              {histories.length > 0 && <span className="chat-hdr-badge">{histories.length}</span>}
+              {(histories.length > 0 || msgs.length > 0) && <span className="chat-hdr-badge">{histories.length + (msgs.length > 0 ? 1 : 0)}</span>}
             </button>
             {historyOpen && (
               <div className="chat-dropdown chat-history-panel">
@@ -2361,10 +2853,27 @@ export const ChatPanel: React.FC<{
                     <i className="bx bx-plus" /> New chat
                   </button>
                 </div>
-                {histories.length === 0 ? (
+                {msgs.length === 0 && histories.length === 0 ? (
                   <div className="chat-history-empty">No saved chats</div>
                 ) : (
                   <div className="chat-history-list">
+                    {/* Current active session — always shown at top if it has messages */}
+                    {msgs.length > 0 && (() => {
+                      const cleanMsgs = normalizeMessages(msgs);
+                      const name = cleanMsgs.find(m => m.role === "user")?.body.slice(0, 60) || "Active chat";
+                      return (
+                        <div key="__current__" className="chat-history-item chat-history-item-active">
+                          <div className="chat-history-item-name">
+                            <span className="chat-history-active-dot" />
+                            {name}
+                          </div>
+                          <div className="chat-history-item-meta">
+                            <span>{relativeTime(currentChatMeta.createdAt)}</span>
+                            <span className="chat-history-item-count">{cleanMsgs.length} msgs</span>
+                          </div>
+                        </div>
+                      );
+                    })()}
                     {histories.map(h => (
                       <div key={h.id} className="chat-history-item" onClick={() => loadHistory(h)}>
                         <div className="chat-history-item-name">{h.name}</div>
@@ -2498,12 +3007,59 @@ export const ChatPanel: React.FC<{
                 </div>
               );
             }
+            // ── Tool call messages: compact strip, no avatar/bubble ──────────
+            if (m.agent === "tool" && m.toolLog) {
+              return (
+                <div key={m.id} className="chat-msg-tool-strip">
+                  {renderToolStrip(m.toolLog, m.ts)}
+                </div>
+              );
+            }
+
+            // ── Skill messages: compact strip, no avatar/bubble ───────────────
+            if (m.agent === "skill") {
+              return (
+                <div key={m.id} className="chat-msg-skill-strip">
+                  {m.skillLog ? (
+                    <div className={`skill-strip skill-strip-${m.skillLog.status}`}>
+                      <i className="bx bx-extension skill-strip-icon" />
+                      <span className="skill-strip-chips">
+                        {m.skillLog.skills.map(s => (
+                          <span key={s.slug} className="skill-strip-chip">{s.name}</span>
+                        ))}
+                      </span>
+                      {m.skillLog.agentLabel && m.skillLog.agentLabel !== "chat" && (
+                        <><span className="skill-strip-sep">→</span><span className="skill-strip-target">{m.skillLog.agentLabel}</span></>
+                      )}
+                      <span className="skill-strip-badge">{
+                        m.skillLog.status === "file_written" ? "files written" :
+                        m.skillLog.status === "detected" ? "detected" :
+                        m.skillLog.status === "failed" ? "failed" : "injected"
+                      }</span>
+                      <span className="skill-strip-ts">{m.ts}</span>
+                    </div>
+                  ) : (
+                    <div className="skill-strip">
+                      <i className="bx bx-extension skill-strip-icon" />
+                      <span className="skill-strip-chips">
+                        {m.body.split("|").map((name, i) => (
+                          <span key={i} className="skill-strip-chip">{name.trim()}</span>
+                        ))}
+                      </span>
+                      <span className="skill-strip-badge">applied</span>
+                      <span className="skill-strip-ts">{m.ts}</span>
+                    </div>
+                  )}
+                </div>
+              );
+            }
+
             return (
               <div key={m.id} className={`chat-msg ${m.agent || "ai"}`}>
                 <div className="chat-msg-ai-wrap">
                   <span className={`chat-avatar ${m.agent || "ai"}`}>
                     {m.agent === "system" ? (
-                      <i className="bx bx-error-circle" />
+                      <i className="bx bx-comment-dots" />
                     ) : m.agent === "tool" ? (
                       <i className="bx bx-list-check" />
                     ) : m.agent === "diff" ? (
@@ -2514,7 +3070,7 @@ export const ChatPanel: React.FC<{
                   </span>
                   <div className="chat-msg-ai-content">
                 <div className="chat-msg-meta">
-                  <span className="chat-sender">{m.agent === "system" ? "System" : m.agent === "tool" ? "Tool call" : m.agent === "diff" ? "Diff view" : "Integraded"}</span>
+                  <span className="chat-sender">{m.agent === "system" ? "Agent" : m.agent === "tool" ? "Tool call" : m.agent === "diff" ? "Diff view" : "Integraded"}</span>
                   <span className="chat-ts">{m.ts}</span>
                 </div>
                 <div className={`chat-bubble-ai${m.agent === "system" ? " system-msg" : ""}${m.agent === "tool" ? " tool-msg" : ""}${m.agent === "diff" ? " diff-msg" : ""}`}>
@@ -2529,10 +3085,10 @@ export const ChatPanel: React.FC<{
                       )}
                   <div className="chat-bubble-body">
                     {m.agent === "tool" && m.toolLog
-                      ? renderToolLog(m.toolLog)
-                      : m.agent === "diff" && m.diffLog
-                        ? renderDiffLog(m.diffLog)
-                        : (m.body ? formatBody(m.body) : null)}
+                        ? renderToolLog(m.toolLog)
+                        : m.agent === "diff" && m.diffLog
+                          ? renderDiffLog(m.diffLog)
+                          : (m.body ? formatBody(m.body) : null)}
                         {renderAttachments(m.attachments)}
                         {m.streaming && <span className="chat-stream-cursor" />}
                       </div>
@@ -2573,20 +3129,10 @@ export const ChatPanel: React.FC<{
       )}
       </div>
 
-      {/* ── Composer ── */}
+      {/* ── Composer — Mission Control Console ── */}
       <form className="chat-composer" onSubmit={send}>
         <div className="chat-composer-inner">
           <div className="chat-input-box">
-            <textarea
-              ref={textareaRef}
-              className="chat-textarea"
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={isRecording ? "Listening…" : agentQuestions.some(q => !q.answered) ? "Type an answer for the waiting agent…" : "Describe the task…"}
-              rows={1}
-              disabled={isRecording || isProcessing}
-            />
             {composerAttachments.length > 0 && (
               <div className="chat-composer-attachments">
                 {composerAttachments.map(att => (
@@ -2600,167 +3146,224 @@ export const ChatPanel: React.FC<{
                 ))}
               </div>
             )}
-            <div className="chat-input-footer">
-              {/* Model picker */}
-              <div className="chat-model-pill" ref={modelDropdownRef}>
-                <button
-                  ref={pillBtnRef}
-                  type="button"
-                  className="chat-pill-btn"
-                  onClick={() => {
-                    setModelDropdownOpen(o => {
-                      if (!o) {
-                        setModelSearch("");
-                        // Compute position: anchor dropdown above the button
-                        const rect = pillBtnRef.current?.getBoundingClientRect();
-                        if (rect) {
-                          // Place dropdown above the button, left-aligned
-                          setDropdownPos({
-                            top: rect.top - 8,   // will be shifted up by transform
-                            left: Math.max(8, rect.left),
-                          });
-                        }
-                      }
-                      return !o;
-                    });
-                  }}
-                >
-                  <i className="bx bx-chip" />
-                  <span className="chat-model-name">{selectedModel ? selectedModel.split('/').pop() : 'model'}</span>
-                  <i className={`bx bx-chevron-up ${modelDropdownOpen ? 'open' : ''}`} />
-                </button>
-                {modelDropdownOpen && dropdownPos && (
-                  <div
-                    className="chat-pill-dropdown chat-pill-dropdown-wide"
-                    data-model-dropdown="true"
-                    style={{
-                      top: dropdownPos ? dropdownPos.top : 0,
-                      left: dropdownPos ? dropdownPos.left : 0,
-                      transform: 'translateY(-100%)',
-                    }}
-                  >
-                    <div className="chat-pill-search">
-                      <i className="bx bx-search" />
-                      <input type="text" placeholder="Search models…" value={modelSearch} onChange={e => setModelSearch(e.target.value)} autoFocus onKeyDown={e => e.stopPropagation()} />
-                    </div>
-                    <div className="chat-pill-scroll">
-                      {(() => {
-                        const filt = models.filter(m => !modelSearch || m.value.toLowerCase().includes(modelSearch.toLowerCase()) || (m.label||"").toLowerCase().includes(modelSearch.toLowerCase()) || m.providerName.toLowerCase().includes(modelSearch.toLowerCase()));
-                        const grouped: {provider:string;providerName:string;items:ModelEntry[]}[] = [];
-                        const seen = new Set<string>();
-                        for (const m of filt) {
-                          if (!seen.has(m.provider)) { seen.add(m.provider); grouped.push({ provider: m.provider, providerName: m.providerName, items: filt.filter(x => x.provider === m.provider) }); }
-                        }
-                        if (!grouped.length) return <div className="chat-pill-empty">No models found</div>;
-                        return grouped.map(g => (
-                          <div key={g.provider} className="chat-pill-group">
-                            <div className="chat-pill-group-label">{g.providerName}</div>
-                            {g.items.map(m => (
-                              <button key={m.value} type="button" className={`chat-pill-item ${m.value === selectedModel ? 'active' : ''}`} onClick={() => { setSelectedModel(m.value); setSelectedCloudProvider(m.provider); setModelDropdownOpen(false); }}>
-                                <span className="chat-pill-item-text">{m.label || m.value.split('/').pop()}</span>
-                                {m.value === selectedModel && <i className="bx bx-check" />}
-                              </button>
-                            ))}
-                          </div>
-                        ));
-                      })()}
-                    </div>
-                  </div>
-                )}
-              </div>
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                accept="image/*,.txt,.md,.json,.ts,.tsx,.js,.jsx,.css,.html"
-                className="chat-file-input"
-                onChange={event => attachFiles(event.target.files)}
+
+            <div className="chat-textarea-wrap">
+              <textarea
+                ref={textareaRef}
+                className="chat-textarea"
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder={isRecording ? "Listening…" : agentQuestions.some(q => !q.answered) ? "Type an answer for the waiting agent…" : "Describe the task…"}
+                rows={1}
+                disabled={isRecording || isProcessing}
               />
-              <div className="chat-mode-pill" ref={modeDropdownRef} title="Choose how the chatbot handles the next message">
-                <button
-                  ref={modeBtnRef}
-                  type="button"
-                  className="chat-pill-btn chat-mode-btn"
-                  onClick={() => {
-                    setModeDropdownOpen(o => {
-                      if (!o) {
-                        const rect = modeBtnRef.current?.getBoundingClientRect();
-                        if (rect) {
-                          setModeDropdownPos({
-                            top: rect.top - 8,
-                            left: Math.max(8, Math.min(rect.left, window.innerWidth - 190)),
-                          });
+            </div>
+
+            <div className="chat-toolbar">
+              {/* ── Spec strip (left): model + mode ── */}
+              <div className="chat-spec-strip">
+                <div className="chat-model-pill" ref={modelDropdownRef}>
+                  <button
+                    ref={pillBtnRef}
+                    type="button"
+                    className="chat-pill-btn"
+                    onClick={() => {
+                      setModelDropdownOpen(o => {
+                        if (!o) {
+                          setModelSearch("");
+                          const rect = pillBtnRef.current?.getBoundingClientRect();
+                          if (rect) {
+                            setDropdownPos({
+                              top: rect.top - 8,
+                              left: Math.max(8, rect.left),
+                            });
+                          }
                         }
-                      }
-                      return !o;
-                    });
-                  }}
-                >
-                  <span className="chat-mode-name">{chatMode === "build" ? "Build" : "Plan"}</span>
-                  <i className={`bx bx-chevron-up ${modeDropdownOpen ? "open" : ""}`} />
-                </button>
-                {modeDropdownOpen && modeDropdownPos && (
-                  <div
-                    className="chat-pill-dropdown chat-mode-dropdown"
-                    data-mode-dropdown="true"
-                    style={{
-                      top: modeDropdownPos.top,
-                      left: modeDropdownPos.left,
-                      transform: "translateY(-100%)",
+                        return !o;
+                      });
                     }}
                   >
-                    {([
-                      { value: "build" as const, label: "Build", icon: null, desc: "Coordinate agents and implement" },
-                      { value: "plan" as const, label: "Plan", icon: null, desc: "Draft an implementation plan in chat" },
-                    ]).map(option => (
-                      <button
-                        key={option.value}
-                        type="button"
-                        className={`chat-pill-item chat-mode-item ${chatMode === option.value ? "active" : ""}`}
-                        onClick={() => {
-                          setChatMode(option.value);
-                          setModeDropdownOpen(false);
-                        }}
-                      >
-                        {option.icon && <i className={`bx ${option.icon}`} />}
-                        <span className="chat-pill-item-text">
-                          <strong>{option.label}</strong>
-                          <small>{option.desc}</small>
-                        </span>
-                        {chatMode === option.value && <i className="bx bx-check" />}
-                      </button>
-                    ))}
-                  </div>
+                    <span className="chat-pill-key">model</span>
+                    <i className="bx bx-chip chat-pill-icon" />
+                    <span className="chat-model-name" title={selectedModel || 'model'}>{selectedModel ? selectedModel.split('/').pop() : 'model'}</span>
+                    <i className={`bx bx-chevron-up chat-pill-caret ${modelDropdownOpen ? 'open' : ''}`} />
+                  </button>
+                  {modelDropdownOpen && dropdownPos && (
+                    <div
+                      className="chat-pill-dropdown chat-pill-dropdown-wide"
+                      data-model-dropdown="true"
+                      style={{
+                        top: dropdownPos ? dropdownPos.top : 0,
+                        left: dropdownPos ? dropdownPos.left : 0,
+                        transform: 'translateY(-100%)',
+                      }}
+                    >
+                      <div className="chat-pill-search">
+                        <i className="bx bx-search" />
+                        <input type="text" placeholder="Search models…" value={modelSearch} onChange={e => setModelSearch(e.target.value)} autoFocus onKeyDown={e => e.stopPropagation()} />
+                      </div>
+                      <div className="chat-pill-scroll">
+                        {(() => {
+                          const q = modelSearch.toLowerCase();
+                          const filt = models.filter(m =>
+                            !q ||
+                            m.value.toLowerCase().includes(q) ||
+                            (m.label || "").toLowerCase().includes(q) ||
+                            m.providerName.toLowerCase().includes(q)
+                          );
+                          const providerOrder: string[] = [];
+                          const byProvider = new Map<string, ModelEntry[]>();
+                          for (const m of filt) {
+                            if (!byProvider.has(m.provider)) {
+                              byProvider.set(m.provider, []);
+                              providerOrder.push(m.provider);
+                            }
+                            byProvider.get(m.provider)!.push(m);
+                          }
+                          if (!providerOrder.length) return <div className="chat-pill-empty">No models found</div>;
+                          return providerOrder.map(prov => {
+                            const items = byProvider.get(prov)!;
+                            const providerName = items[0].providerName;
+                            return (
+                              <div key={prov} className="chat-pill-group">
+                                <div className="chat-pill-group-label">{providerName}</div>
+                                {items.map(m => {
+                                  const isActive = m.value === selectedModel && m.provider === selectedCloudProvider;
+                                  return (
+                                    <button
+                                      key={`${m.provider}::${m.value}`}
+                                      type="button"
+                                      className={`chat-pill-item ${isActive ? "active" : ""}`}
+                                      onClick={() => { selectModel(m.value, m.provider); setModelDropdownOpen(false); }}
+                                    >
+                                      <span className="chat-pill-item-text">{m.label || m.value.split("/").pop()}</span>
+                                      {isActive && <i className="bx bx-check" />}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            );
+                          });
+                        })()}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <span className="chat-toolbar-divider" aria-hidden="true" />
+
+                <div className="chat-mode-pill" ref={modeDropdownRef} title="Choose how the chatbot handles the next message">
+                  <button
+                    ref={modeBtnRef}
+                    type="button"
+                    className={`chat-pill-btn chat-mode-btn chat-mode-${chatMode}`}
+                    onClick={() => {
+                      setModeDropdownOpen(o => {
+                        if (!o) {
+                          const rect = modeBtnRef.current?.getBoundingClientRect();
+                          if (rect) {
+                            setModeDropdownPos({
+                              top: rect.top - 8,
+                              left: Math.max(8, Math.min(rect.left, window.innerWidth - 190)),
+                            });
+                          }
+                        }
+                        return !o;
+                      });
+                    }}
+                  >
+                    <span className="chat-pill-key">mode</span>
+                    <span className="chat-mode-name">{chatMode === "build" ? "Build" : "Plan"}</span>
+                    <i className={`bx bx-chevron-up chat-pill-caret ${modeDropdownOpen ? "open" : ""}`} />
+                  </button>
+                  {modeDropdownOpen && modeDropdownPos && (
+                    <div
+                      className="chat-pill-dropdown chat-mode-dropdown"
+                      data-mode-dropdown="true"
+                      style={{
+                        top: modeDropdownPos.top,
+                        left: modeDropdownPos.left,
+                        transform: "translateY(-100%)",
+                      }}
+                    >
+                      {([
+                        { value: "build" as const, label: "Build", icon: "bx-cog", desc: "Coordinate agents and implement" },
+                        { value: "plan" as const, label: "Plan", icon: "bx-notepad", desc: "Draft an implementation plan in chat" },
+                      ]).map(option => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className={`chat-pill-item chat-mode-item ${chatMode === option.value ? "active" : ""}`}
+                          onClick={() => {
+                            setChatMode(option.value);
+                            setModeDropdownOpen(false);
+                          }}
+                        >
+                          <i className={`bx ${option.icon} chat-mode-icon`} />
+                          <span className="chat-pill-item-text">
+                            <strong>{option.label}</strong>
+                            <small>{option.desc}</small>
+                          </span>
+                          {chatMode === option.value && <i className="bx bx-check chat-mode-check" />}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* ── Utility cluster (right): attach + mic + send ── */}
+              <div className="chat-utility-cluster">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  accept="image/*,.txt,.md,.json,.ts,.tsx,.js,.jsx,.css,.html"
+                  className="chat-file-input"
+                  onChange={event => attachFiles(event.target.files)}
+                />
+                <button
+                  type="button"
+                  className="chat-utility-btn"
+                  onClick={() => fileInputRef.current?.click()}
+                  title="Attach image or file"
+                  aria-label="Attach file"
+                >
+                  <i className="bx bx-paperclip" />
+                </button>
+                <button
+                  type="button"
+                  className={`chat-utility-btn ${isRecording ? "recording" : ""}`}
+                  onClick={toggleRecording}
+                  title={isRecording ? "Stop recording" : "Voice input"}
+                  aria-label={isRecording ? "Stop recording" : "Voice input"}
+                >
+                  <i className={`bx bx-microphone${isRecording ? "-off" : ""}`} />
+                  {isRecording && <span className="chat-utility-pulse" aria-hidden="true" />}
+                </button>
+
+                <span className="chat-toolbar-divider chat-toolbar-divider-end" aria-hidden="true" />
+
+                {isProcessing ? (
+                  <button type="button" className="chat-send-btn stop" onClick={handleStop} title="Stop" aria-label="Stop">
+                    <i className="bx bx-stop" />
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    className="chat-send-btn"
+                    disabled={!input.trim() && composerAttachments.length === 0}
+                    title="Send (Enter)"
+                    aria-label="Send message"
+                  >
+                    <span className="chat-send-btn-label">SEND</span>
+                    <i className="bx bx-send chat-send-btn-icon" />
+                  </button>
                 )}
               </div>
-              <button
-                type="button"
-                className="chat-mic-btn"
-                onClick={() => fileInputRef.current?.click()}
-                title="Attach image or file"
-              >
-                <i className="bx bx-paperclip" />
-              </button>
-              <button
-                type="button"
-                className={`chat-mic-btn ${isRecording ? "recording" : ""}`}
-                onClick={toggleRecording}
-                title={isRecording ? "Stop" : "Voice input"}
-              >
-                <i className={`bx bx-microphone${isRecording ? "-off" : ""}`} />
-              </button>
             </div>
           </div>
-
-          {isProcessing ? (
-            <button type="button" className="chat-send-btn stop" onClick={handleStop} title="Stop">
-              <i className="bx bx-stop" />
-            </button>
-          ) : (
-            <button type="submit" className="chat-send-btn" disabled={!input.trim() && composerAttachments.length === 0}>
-              <i className="bx bx-send" />
-            </button>
-          )}
         </div>
       </form>
     </div>

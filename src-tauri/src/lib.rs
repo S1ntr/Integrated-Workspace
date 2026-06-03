@@ -42,6 +42,10 @@ pub struct StreamState(Mutex<HashMap<String, u32>>);
 #[derive(Default)]
 pub struct WorkspaceState(pub Mutex<Vec<String>>);
 
+// ─── Dev Server State — tracks spawned background PID so we can kill it ───────
+#[derive(Default)]
+pub struct DevServerState(Mutex<Option<u32>>);
+
 #[derive(Serialize, Clone)]
 struct BrowserNewWindowPayload {
     source_label: String,
@@ -367,15 +371,22 @@ fn list_files(dir_path: &str, state: State<'_, WorkspaceState>) -> Result<Vec<Fi
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 let is_dir = file_path.is_dir();
 
-                if file_name == "node_modules"
-                    || file_name == ".git"
+                // Always skip heavy/noisy directories regardless of name.
+                let is_blocked_dir = is_dir && (
+                    file_name == "node_modules"
                     || file_name == "target"
                     || file_name == "dist"
+                    || file_name == "build"
+                    || file_name == ".git"
                     || file_name == ".idea"
                     || file_name == ".vscode"
-                    || file_name == "build"
+                    || file_name == ".next"
+                    || file_name == ".nuxt"
+                    || file_name == "__pycache__"
+                    // Generic hidden dirs (start with dot) — but NOT hidden files
                     || file_name.starts_with('.')
-                {
+                );
+                if is_blocked_dir {
                     continue;
                 }
 
@@ -677,94 +688,297 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub thinking_preview: bool,
     pub api_keys: HashMap<String, String>,
+    #[serde(default)]
+    pub disabled_providers: Vec<String>,
 }
 
-fn default_true() -> bool {
-    true
+fn default_true() -> bool { true }
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig {
+            provider: "cloud".into(),
+            lmstudio_url: "http://localhost:1234".into(),
+            ollama_url: "http://localhost:11434".into(),
+            cloud_provider: "openai".into(),
+            active_model: String::new(),
+            streaming: true,
+            thinking_preview: true,
+            api_keys: HashMap::new(),
+            disabled_providers: Vec::new(),
+        }
+    }
 }
 
-// ─── Key storage (v2: salted per-key cipher) ──────────────────────────────────
+// ─── Model info returned to the frontend ──────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String, // display name (may equal id if none provided)
+}
+
+// ─── Live model fetching ───────────────────────────────────────────────────────
+
+/// Make an authenticated GET request and return the raw response body.
+async fn authed_get(url: &str, headers: &[(&str, &str)]) -> Result<String, String> {
+    validate_url(url)?;
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args(["-s", "-f", "--max-time", "15", url]);
+    for (name, value) in headers {
+        cmd.args(["-H", &format!("{}: {}", name, value)]);
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        cmd.output(),
+    )
+    .await
+    .map_err(|_| "Request timed out after 20 seconds".to_string())?
+    .map_err(|e| format!("curl error: {}", e))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Err(format!("HTTP error: {}", stderr.lines().last().unwrap_or("unknown")))
+    }
+}
+
+/// Return true if the model ID looks like a chat-capable model for OpenAI.
+fn openai_is_chat_model(id: &str) -> bool {
+    let id = id.to_lowercase();
+    // Exclude non-chat capabilities
+    let excluded = ["dall-e", "whisper", "tts", "text-embedding", "babbage",
+                    "davinci", "curie", "ada", "instruct", "realtime",
+                    "transcribe", "search", "similarity", "moderation"];
+    if excluded.iter().any(|e| id.contains(e)) { return false; }
+    // Keep gpt-*, o1, o3, o4, chatgpt
+    id.starts_with("gpt-") || id.starts_with("o1") || id.starts_with("o3")
+    || id.starts_with("o4") || id.starts_with("chatgpt")
+}
+
+/// Parse a provider API response into a Vec<ModelInfo>.
+fn parse_models(body: &str, provider: &str) -> Result<Vec<ModelInfo>, String> {
+    let json: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| format!("JSON parse error: {}", e))?;
+
+    let mut models: Vec<ModelInfo> = match provider {
+        // ── Anthropic ─────────────────────────────────────────────────────────
+        // {"data":[{"id":"claude-…","display_name":"Claude …","type":"model"}]}
+        "anthropic" => {
+            let arr = json["data"].as_array().ok_or("missing data array")?;
+            arr.iter().filter_map(|m| {
+                let id = m["id"].as_str()?.to_string();
+                let name = m["display_name"].as_str().unwrap_or(&id).to_string();
+                // Only include text models, skip image/vision-only ones
+                Some(ModelInfo { id, name })
+            }).collect()
+        }
+
+        // ── Google Gemini ─────────────────────────────────────────────────────
+        // {"models":[{"name":"models/gemini-…","displayName":"…","supportedGenerationMethods":[…]}]}
+        "google" => {
+            let arr = json["models"].as_array().ok_or("missing models array")?;
+            arr.iter().filter_map(|m| {
+                let raw = m["name"].as_str()?;
+                let id = raw.strip_prefix("models/").unwrap_or(raw).to_string();
+                // Only models that support generateContent (chat-capable)
+                let supported = m["supportedGenerationMethods"].as_array()
+                    .map(|a| a.iter().any(|v| v.as_str() == Some("generateContent")))
+                    .unwrap_or(false);
+                if !supported { return None; }
+                // Exclude embedding, aqa, legacy tuned models
+                if id.contains("embedding") || id.contains("aqa") || id.contains("tuned") { return None; }
+                let name = m["displayName"].as_str().unwrap_or(&id).to_string();
+                Some(ModelInfo { id, name })
+            }).collect()
+        }
+
+        // ── Mistral ───────────────────────────────────────────────────────────
+        // {"data":[{"id":"…","capabilities":{"completion_chat":true}}]}
+        "mistral" => {
+            let arr = json["data"].as_array().ok_or("missing data array")?;
+            arr.iter().filter_map(|m| {
+                let id = m["id"].as_str()?.to_string();
+                // Keep only chat-capable models
+                let is_chat = m["capabilities"]["completion_chat"].as_bool().unwrap_or(true);
+                if !is_chat { return None; }
+                if id.contains("embed") { return None; }
+                let name = m["name"].as_str().unwrap_or(&id).to_string();
+                Some(ModelInfo { id, name })
+            }).collect()
+        }
+
+        // ── Together AI ───────────────────────────────────────────────────────
+        // Returns a top-level array: [{"id":"…","display_name":"…","type":"chat"}]
+        "together" => {
+            let arr = if json.is_array() {
+                json.as_array().unwrap()
+            } else {
+                json["data"].as_array().ok_or("missing data")?
+            };
+            arr.iter().filter_map(|m| {
+                let id = m["id"].as_str()?.to_string();
+                let model_type = m["type"].as_str().unwrap_or("chat");
+                // Keep chat and language models, skip image/code/embedding
+                if model_type == "image" || model_type == "embedding" || model_type == "moderation" {
+                    return None;
+                }
+                let name = m["display_name"].as_str()
+                    .or_else(|| m["name"].as_str())
+                    .unwrap_or(&id)
+                    .to_string();
+                Some(ModelInfo { id, name })
+            }).collect()
+        }
+
+        // ── OpenRouter ────────────────────────────────────────────────────────
+        // {"data":[{"id":"openai/gpt-4o","name":"GPT-4o","context_length":128000}]}
+        "openrouter" => {
+            let arr = json["data"].as_array().ok_or("missing data array")?;
+            arr.iter().filter_map(|m| {
+                let id = m["id"].as_str()?.to_string();
+                let name = m["name"].as_str().unwrap_or(&id).to_string();
+                Some(ModelInfo { id, name })
+            }).collect()
+        }
+
+        // ── OpenAI + DeepSeek + Grok (OpenAI-compatible /v1/models) ──────────
+        // {"data":[{"id":"gpt-4o","object":"model"}]}
+        _ => {
+            let arr = json["data"].as_array().ok_or("missing data array")?;
+            let mut list: Vec<ModelInfo> = arr.iter().filter_map(|m| {
+                let id = m["id"].as_str()?.to_string();
+                let name = m["name"].as_str()
+                    .or_else(|| m["display_name"].as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| id.clone());
+                Some(ModelInfo { id, name })
+            }).collect();
+
+            // For OpenAI, filter down to chat-capable models only
+            if provider == "openai" {
+                list.retain(|m| openai_is_chat_model(&m.id));
+                // Sort: newest first (by rough version heuristic)
+                list.sort_by(|a, b| b.id.cmp(&a.id));
+            }
+
+            list
+        }
+    };
+
+    // Deduplicate by id
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|m| seen.insert(m.id.clone()));
+
+    Ok(models)
+}
+
+/// Fetch the list of available models for a cloud provider.
+/// The API key is retrieved directly from the OS keychain — never exposed to the frontend.
+#[tauri::command]
+async fn fetch_provider_models(provider: String) -> Result<Vec<ModelInfo>, String> {
+    let key = keychain_get(&provider)
+        .ok_or_else(|| format!("No API key stored for '{}'", provider))?;
+
+    let body = match provider.as_str() {
+        "openai" => authed_get(
+            "https://api.openai.com/v1/models",
+            &[("Authorization", &format!("Bearer {}", key))],
+        ).await?,
+
+        "anthropic" => authed_get(
+            "https://api.anthropic.com/v1/models?limit=100",
+            &[
+                ("x-api-key", &key),
+                ("anthropic-version", "2023-06-01"),
+            ],
+        ).await?,
+
+        "deepseek" => authed_get(
+            "https://api.deepseek.com/models",
+            &[("Authorization", &format!("Bearer {}", key))],
+        ).await?,
+
+        "mistral" => authed_get(
+            "https://api.mistral.ai/v1/models",
+            &[("Authorization", &format!("Bearer {}", key))],
+        ).await?,
+
+        "google" => {
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models?key={}&pageSize=100",
+                key
+            );
+            authed_get(&url, &[]).await?
+        }
+
+        "grok" => authed_get(
+            "https://api.x.ai/v1/models",
+            &[("Authorization", &format!("Bearer {}", key))],
+        ).await?,
+
+        "together" => authed_get(
+            "https://api.together.xyz/v1/models",
+            &[("Authorization", &format!("Bearer {}", key))],
+        ).await?,
+
+        "openrouter" => authed_get(
+            "https://openrouter.ai/api/v1/models",
+            &[("Authorization", &format!("Bearer {}", key))],
+        ).await?,
+
+        other => return Err(format!("Unsupported provider: '{}'", other)),
+    };
+
+    parse_models(&body, &provider)
+}
+
+// ─── OS Keychain storage ───────────────────────────────────────────────────────
 //
 // Security model:
-//   • Each stored key has a unique 16-byte random salt.
-//   • The key-encryption key is derived from the salt + machine-specific env
-//     values (username, computer name, home path) using 256 rounds of mixing.
-//   • Stored format: "v2:<32-hex-salt>:<encrypted-hex>"
-//   • Without knowing both the salt AND the machine env, decryption is infeasible.
-//   • Backward-compat: values without the "v2:" prefix use the old v1 decoder.
+//   • API keys are stored exclusively in the OS-native credential store:
+//       Windows  — Windows Credential Manager (DPAPI-encrypted, user-scoped)
+//       macOS    — macOS Keychain Services
+//       Linux    — FreeDesktop Secret Service (gnome-keyring / kwallet)
+//   • The config.json file on disk NEVER contains actual key material.
+//   • This is the same approach used by Anthropic's Claude Code CLI, GitHub CLI,
+//     VS Code, and other professional desktop tools.
 
-/// Generate a 16-byte salt from system entropy (no external crate needed).
-fn generate_salt() -> [u8; 16] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-    let p = std::process::id() as u64;
-    // Xorshift mix for pseudo-randomness
-    let mut s = t
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(p.wrapping_mul(2862933555777941757))
-        .wrapping_add(1442695040888963407);
-    let mut salt = [0u8; 16];
-    for i in 0..16 {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        salt[i] = (s >> (8 * (i % 8))) as u8;
-    }
-    salt
+const KEYCHAIN_SERVICE: &str = "integraded";
+
+/// All cloud provider IDs known to the application.
+const KNOWN_PROVIDERS: &[&str] = &[
+    "openai", "anthropic", "deepseek", "mistral",
+    "google", "grok", "together", "openrouter", "ollama_cloud",
+];
+
+/// Store a secret in the OS keychain under service="integraded", account=provider.
+fn keychain_set(provider: &str, secret: &str) -> Result<(), String> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, provider)
+        .map_err(|e| format!("Keychain init error for '{}': {}", provider, e))?
+        .set_password(secret)
+        .map_err(|e| format!("Failed to store key for '{}' in OS keychain: {}", provider, e))
 }
 
-/// Derive a 64-byte encryption key from the salt + machine-specific material
-/// using 256 rounds of byte-level diffusion.
-fn derive_key(salt: &[u8]) -> [u8; 64] {
-    let mut material: Vec<u8> = Vec::new();
-    for var in ["USERNAME", "COMPUTERNAME", "USERPROFILE", "USER", "HOSTNAME", "HOME"] {
-        if let Ok(val) = std::env::var(var) {
-            material.extend_from_slice(val.as_bytes());
-            material.push(0x3A); // colon delimiter
-        }
-    }
-    // Fallback if no env vars are available
-    if material.is_empty() {
-        material.extend_from_slice(b"INTEGRADED_DEFAULT_MACHINE_FALLBACK");
-    }
-
-    let mut out = [0u8; 64];
-    for i in 0..64usize {
-        let mut v: u8 = material[i % material.len()].wrapping_add(salt[i % salt.len()]);
-        // 256 rounds of mixing (deterministic, salt-dependent)
-        for round in 0u8..=255 {
-            let prev = if i > 0 { out[i - 1] } else { 0xA5u8 };
-            let m = material[(i.wrapping_add(round as usize)) % material.len()];
-            let s = salt[(i.wrapping_add(round as usize * 3)) % salt.len()];
-            v = v
-                .rotate_left(((round % 5) + 1) as u32)
-                .wrapping_add(m)
-                .wrapping_add(prev)
-                ^ s
-                ^ (round.wrapping_mul(0x6B));
-        }
-        out[i] = v;
-    }
-    out
+/// Retrieve a secret from the OS keychain. Returns None if not found.
+fn keychain_get(provider: &str) -> Option<String> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, provider).ok()?
+        .get_password().ok()
 }
 
-/// Encrypt a plaintext string → "v2:{salt-hex}:{cipher-hex}"
-fn scramble(data: &str) -> String {
-    let salt = generate_salt();
-    let key = derive_key(&salt);
-    let cipher: Vec<u8> = data
-        .as_bytes()
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| b ^ key[i % key.len()])
-        .collect();
-    let salt_hex: String = salt.iter().map(|b| format!("{:02x}", b)).collect();
-    let cipher_hex: String = cipher.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("v2:{}:{}", salt_hex, cipher_hex)
+/// Delete a secret from the OS keychain (silently ignores "not found").
+fn keychain_delete(provider: &str) {
+    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, provider) {
+        let _ = entry.delete_credential();
+    }
 }
 
-/// Decode a hex string to bytes.
+// ─── Legacy decryption (migration only) ───────────────────────────────────────
+//
+// These functions exist solely to migrate old XOR-obfuscated values from
+// config.json into the keychain on first run. They are NOT used for new storage.
+
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(hex.len() / 2);
     let mut chars = hex.chars();
@@ -777,27 +991,45 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Decrypt. Handles both v2 (salted) and legacy v1 (plain XOR hex) formats.
-fn unscramble(hex_str: &str) -> Result<String, String> {
+fn legacy_derive_key(salt: &[u8]) -> [u8; 64] {
+    let mut material: Vec<u8> = Vec::new();
+    for var in ["USERNAME", "COMPUTERNAME", "USERPROFILE", "USER", "HOSTNAME", "HOME"] {
+        if let Ok(val) = std::env::var(var) {
+            material.extend_from_slice(val.as_bytes());
+            material.push(0x3A);
+        }
+    }
+    if material.is_empty() {
+        material.extend_from_slice(b"INTEGRADED_DEFAULT_MACHINE_FALLBACK");
+    }
+    let mut out = [0u8; 64];
+    for i in 0..64usize {
+        let mut v: u8 = material[i % material.len()].wrapping_add(salt[i % salt.len()]);
+        for round in 0u8..=255 {
+            let prev = if i > 0 { out[i - 1] } else { 0xA5u8 };
+            let m = material[(i.wrapping_add(round as usize)) % material.len()];
+            let s = salt[(i.wrapping_add(round as usize * 3)) % salt.len()];
+            v = v.rotate_left(((round % 5) + 1) as u32).wrapping_add(m).wrapping_add(prev) ^ s ^ (round.wrapping_mul(0x6B));
+        }
+        out[i] = v;
+    }
+    out
+}
+
+/// Attempt to decrypt a legacy XOR-obfuscated key value (v1 or v2 format).
+/// Used only during one-time migration to the keychain.
+fn legacy_unscramble(hex_str: &str) -> Result<String, String> {
     if let Some(rest) = hex_str.strip_prefix("v2:") {
-        // ── v2: salted format ─────────────────────────────────────────────
         let mut parts = rest.splitn(2, ':');
         let salt_hex = parts.next().ok_or("Missing salt")?;
         let cipher_hex = parts.next().ok_or("Missing cipher")?;
-
         let salt = hex_to_bytes(salt_hex)?;
         let cipher = hex_to_bytes(cipher_hex)?;
-        let key = derive_key(&salt);
-
-        let plain: Vec<u8> = cipher
-            .iter()
-            .enumerate()
-            .map(|(i, &b)| b ^ key[i % key.len()])
-            .collect();
+        let key = legacy_derive_key(&salt);
+        let plain: Vec<u8> = cipher.iter().enumerate().map(|(i, &b)| b ^ key[i % key.len()]).collect();
         String::from_utf8(plain).map_err(|e| format!("Invalid UTF-8: {}", e))
     } else {
-        // ── v1: legacy plain XOR — kept for backward compat ───────────────
-        // Build the old machine key (verbatim from previous implementation)
+        // v1 format
         let mut key = b"INTEGRADED_DYNAMIC_CIPHER_CORE_KEY_".to_vec();
         for var in ["USERNAME", "COMPUTERNAME", "USERPROFILE", "USER", "HOSTNAME", "HOME"] {
             if let Ok(val) = std::env::var(var) {
@@ -808,11 +1040,7 @@ fn unscramble(hex_str: &str) -> Result<String, String> {
             key.extend_from_slice(b"SECURE_HARDENED_INTEGRADED_CIPHER_FALLBACK_VAL_1985_!");
         }
         let cipher = hex_to_bytes(hex_str)?;
-        let plain: Vec<u8> = cipher
-            .iter()
-            .enumerate()
-            .map(|(i, &b)| b ^ key[i % key.len()])
-            .collect();
+        let plain: Vec<u8> = cipher.iter().enumerate().map(|(i, &b)| b ^ key[i % key.len()]).collect();
         String::from_utf8(plain).map_err(|e| format!("Invalid UTF-8: {}", e))
     }
 }
@@ -842,36 +1070,30 @@ fn get_config_path() -> Result<std::path::PathBuf, String> {
 }
 
 #[tauri::command]
-fn save_config(mut config: AppConfig) -> Result<(), String> {
+fn save_config(config: AppConfig) -> Result<(), String> {
     let path = get_config_path()?;
-    
-    // Load existing config to check for unchanged masked keys
-    let existing = if path.exists() {
-        let json = fs::read_to_string(&path).ok();
-        json.and_then(|j| serde_json::from_str::<AppConfig>(&j).ok())
-    } else {
-        None
-    };
-    
-    for (k, val) in config.api_keys.iter_mut() {
-        if val == "••••••••••••••••" {
-            // Retrieve previous encrypted scrambled key
-            if let Some(ref ext) = existing {
-                if let Some(existing_val) = ext.api_keys.get(k) {
-                    *val = existing_val.clone();
-                    continue;
-                }
-            }
-            *val = "".to_string();
-        } else if !val.is_empty() {
-            // Scramble new credentials
-            *val = scramble(val);
+
+    // ── Persist API keys in the OS keychain, NOT in the config file ───────────
+    for (provider, key_val) in &config.api_keys {
+        if key_val == "••••••••••••••••" {
+            // Unchanged masked placeholder — keychain entry already correct; do nothing.
+        } else if key_val.is_empty() {
+            // User explicitly cleared this key — remove it from the keychain.
+            keychain_delete(provider);
+        } else {
+            // New or updated plaintext key — store in OS keychain.
+            keychain_set(provider, key_val)?;
         }
     }
-    
-    let json = serde_json::to_string_pretty(&config)
+
+    // Build a sanitized copy without any key material for the config file.
+    let mut file_config = config;
+    for val in file_config.api_keys.values_mut() {
+        *val = String::new();
+    }
+
+    let json = serde_json::to_string_pretty(&file_config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
-    
     fs::write(path, json).map_err(|e| format!("Failed to write config: {}", e))?;
     Ok(())
 }
@@ -879,57 +1101,143 @@ fn save_config(mut config: AppConfig) -> Result<(), String> {
 #[tauri::command]
 fn load_config() -> Result<AppConfig, String> {
     let path = get_config_path()?;
-    if !path.exists() {
-        return Ok(AppConfig {
-            provider: "cloud".to_string(),
-            lmstudio_url: "http://localhost:1234".to_string(),
-            ollama_url: "http://localhost:11434".to_string(),
-            cloud_provider: "openai".to_string(),
-            active_model: "".to_string(),
-            streaming: true,
-            thinking_preview: true,
-            api_keys: HashMap::new(),
-        });
-    }
-    
-    let json = fs::read_to_string(path).map_err(|e| format!("Failed to read config: {}", e))?;
-    let mut config: AppConfig = serde_json::from_str(&json)
-        .map_err(|e| format!("Failed to parse config: {}", e))?;
-    
-    for (_k, val) in config.api_keys.iter_mut() {
-        if !val.is_empty() {
-            // Check that the keys on frontend are returned ONLY as masked placeholder value
-            // Plaintext decrypted secrets are strictly confined to the backend
-            if unscramble(val).is_ok() {
-                *val = "••••••••••••••••".to_string();
+
+    let mut config = if !path.exists() {
+        AppConfig::default()
+    } else {
+        let json = fs::read_to_string(&path).map_err(|e| format!("Failed to read config: {}", e))?;
+        serde_json::from_str::<AppConfig>(&json)
+            .map_err(|e| format!("Failed to parse config: {}", e))?
+    };
+
+    // ── One-time migration: decrypt old XOR-obfuscated keys → keychain ────────
+    let mut needs_resave = false;
+    for (provider, val) in config.api_keys.iter_mut() {
+        if val.is_empty() { continue; }
+        // Any non-empty value in the file is a legacy encrypted key.
+        // Try to decrypt it and move it into the keychain.
+        match legacy_unscramble(val) {
+            Ok(plaintext) if !plaintext.is_empty() => {
+                // Only migrate if the keychain doesn't already have a value.
+                if keychain_get(provider).is_none() {
+                    let _ = keychain_set(provider, &plaintext);
+                }
             }
+            _ => {} // Unreadable — ignore; user will need to re-enter the key.
+        }
+        *val = String::new();
+        needs_resave = true;
+    }
+    if needs_resave {
+        // Rewrite config.json without legacy key material.
+        if let Ok(json) = serde_json::to_string_pretty(&config) {
+            let _ = fs::write(&path, json);
         }
     }
-    
+
+    // ── Populate api_keys with masked markers for every provider in keychain ──
+    // The frontend uses these markers to know a key is set (e.g. to show the
+    // model picker) without ever receiving the actual key value.
+    for &provider in KNOWN_PROVIDERS {
+        if keychain_get(provider).is_some() {
+            config.api_keys.insert(provider.to_string(), "••••••••••••••••".to_string());
+        }
+    }
+
     Ok(config)
+}
+
+/// Persist the active model and provider selection without touching API keys.
+#[tauri::command]
+fn save_active_model(model: String, provider: String) -> Result<(), String> {
+    let path = get_config_path()?;
+    let mut config = if path.exists() {
+        let json = fs::read_to_string(&path).map_err(|e| format!("Read error: {}", e))?;
+        serde_json::from_str::<AppConfig>(&json).unwrap_or_default()
+    } else {
+        AppConfig::default()
+    };
+    config.active_model = model;
+    config.cloud_provider = provider;
+    // Clear key values before writing to disk
+    for v in config.api_keys.values_mut() { *v = String::new(); }
+    let json = serde_json::to_string_pretty(&config).map_err(|e| format!("Serialize error: {}", e))?;
+    fs::write(path, json).map_err(|e| format!("Write error: {}", e))
+}
+
+/// Toggle a provider on or off (disabled providers' models are hidden from the picker).
+#[tauri::command]
+fn set_provider_enabled(provider: String, enabled: bool) -> Result<(), String> {
+    let path = get_config_path()?;
+    let mut config = if path.exists() {
+        let json = fs::read_to_string(&path).map_err(|e| format!("Read error: {}", e))?;
+        serde_json::from_str::<AppConfig>(&json).unwrap_or_default()
+    } else {
+        AppConfig::default()
+    };
+    if enabled {
+        config.disabled_providers.retain(|p| p != &provider);
+    } else if !config.disabled_providers.contains(&provider) {
+        config.disabled_providers.push(provider);
+    }
+    for v in config.api_keys.values_mut() { *v = String::new(); }
+    let json = serde_json::to_string_pretty(&config).map_err(|e| format!("Serialize error: {}", e))?;
+    fs::write(path, json).map_err(|e| format!("Write error: {}", e))
+}
+
+/// Retrieve the plaintext API key for a provider from the OS keychain.
+/// Called by the frontend immediately before making an outbound API request.
+/// Tauri commands are only callable from the app's own sandboxed webview.
+#[tauri::command]
+fn get_api_key(provider: String) -> Result<String, String> {
+    keychain_get(&provider)
+        .ok_or_else(|| format!("No API key stored for provider '{}'. Please add it in Settings.", provider))
 }
 
 // ─── Outbound Destination Whitelisting (SSRF Mitigation) ──────────────────────
 fn validate_url(url: &str) -> Result<(), String> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    // Parse the URL properly to extract scheme + host, preventing bypasses like
+    // http://localhost:80@evil.com/ which starts_with checks would miss.
+    let parsed = url.parse::<tauri::Url>()
+        .map_err(|_| "Access Denied: Malformed URL.".to_string())?;
+
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
         return Err("Access Denied: Only HTTP and HTTPS protocol endpoints are allowed.".to_string());
     }
-    
-    let parsed_url = url.to_lowercase();
-    
-    let is_allowed = parsed_url.starts_with("http://localhost:")
-        || parsed_url.starts_with("http://127.0.0.1:")
-        || parsed_url.starts_with("https://api.openai.com/")
-        || parsed_url.starts_with("https://api.anthropic.com/")
-        || parsed_url.starts_with("https://api.deepseek.com/")
-        || parsed_url.starts_with("https://api.mistral.ai/")
-        || parsed_url.starts_with("https://generativelanguage.googleapis.com/")
-        || parsed_url.starts_with("https://api.x.ai/")
-        || parsed_url.starts_with("https://api.together.xyz/")
-        || parsed_url.starts_with("https://openrouter.ai/")
-        || parsed_url.starts_with("https://ollama.com/");
-        
-    if is_allowed {
+
+    // Reject any URL that has credentials (user@host) — used in bypass attacks.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Access Denied: URLs with credentials are not allowed.".to_string());
+    }
+
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    let port = parsed.port();
+
+    // Local providers: http(s) allowed for loopback addresses.
+    let is_local = (scheme == "http" || scheme == "https")
+        && (host == "localhost" || host == "127.0.0.1" || host == "::1");
+    let _ = port; // port is unrestricted for local
+
+    // Whitelisted cloud API hosts (https only).
+    let allowed_https_hosts = [
+        "api.openai.com",
+        "api.anthropic.com",
+        "api.deepseek.com",
+        "api.mistral.ai",
+        "generativelanguage.googleapis.com",
+        "api.x.ai",
+        "api.together.xyz",
+        "openrouter.ai",
+        "ollama.com",
+        "skills.sh",
+        "www.skills.sh",
+        "raw.githubusercontent.com",
+        "api.github.com",
+    ];
+    let is_cloud = scheme == "https" && allowed_https_hosts.iter().any(|&h| host == h);
+
+    if is_local || is_cloud {
         Ok(())
     } else {
         Err("Access Denied: Destination URL is not in the secure API white-list.".to_string())
@@ -1180,6 +1488,378 @@ async fn curl_post_stream(
     Ok(())
 }
 
+// ─── Skills system ────────────────────────────────────────────────────────────
+//
+// Skills are reusable AI agent capabilities from skills.sh.
+// Installed skills are stored under ~/.integraded-workspace/skills/{safe-id}/
+// and contain SKILL.md plus optional supporting files.
+
+const SKILLS_DIR: &str = ".integraded-workspace/skills";
+const SKILLS_BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/// Scrape the description from a skills.sh skill page HTML.
+/// Extracts it from <meta name="description" content="..."> since the API requires auth.
+async fn scrape_skills_sh_description(skill_id: &str) -> Option<String> {
+    let url = format!("https://www.skills.sh/{}", skill_id);
+    if validate_url(&url).is_err() { return None; }
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args([
+        "-s", "-L", "--max-time", "15",
+        "-H", &format!("User-Agent: {}", SKILLS_BROWSER_UA),
+        "-H", "Accept: text/html",
+        &url,
+    ]);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
+        .await.ok()?.ok()?;
+    let html = String::from_utf8_lossy(&out.stdout).into_owned();
+    // Extract from <meta name="description" content="..."> or og:description
+    for pattern in &[
+        r#"name="description" content=""#,
+        r#"property="og:description" content=""#,
+    ] {
+        if let Some(start) = html.find(pattern) {
+            let after = &html[start + pattern.len()..];
+            if let Some(end) = after.find('"') {
+                let raw = &after[..end];
+                // Decode basic HTML entities
+                let decoded = raw
+                    .replace("&amp;", "&")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&#39;", "'")
+                    .replace("&hellip;", "...")
+                    .replace("…", "...");
+                let trimmed = decoded.trim_end_matches("…").trim_end_matches("...").trim().to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Metadata saved to meta.json alongside the SKILL.md on disk.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct InstalledSkill {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub source: String,
+    pub installs: u64,
+    pub description: String,
+    pub triggers: Vec<String>,
+    pub skill_md: String,
+    pub installed_at: u64,
+}
+
+fn skills_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let home = app.path().home_dir().map_err(|e| format!("Cannot resolve home: {}", e))?;
+    let dir = home.join(SKILLS_DIR);
+    fs::create_dir_all(&dir).map_err(|e| format!("Cannot create skills dir: {}", e))?;
+    Ok(dir)
+}
+
+/// Convert a skill id like "owner/repo/slug" to a safe directory name.
+/// Each component is sanitized to alphanumeric + hyphen/underscore, then joined
+/// with "--" so that path traversal via ".." or absolute paths is impossible.
+fn skill_id_to_dir(id: &str) -> String {
+    id.split('/')
+        .map(|part| {
+            let safe: String = part
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect();
+            safe.trim_matches('_').to_string()
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("--")
+}
+
+/// Parse frontmatter from SKILL.md to extract description and triggers.
+fn parse_skill_md(content: &str) -> (String, Vec<String>) {
+    // Find YAML frontmatter between first pair of "---" delimiters
+    let stripped = content.trim_start_matches('\n');
+    if !stripped.starts_with("---") {
+        return (String::new(), Vec::new());
+    }
+    let after_open = &stripped[3..];
+    let end = match after_open.find("\n---") {
+        Some(pos) => pos,
+        None => return (String::new(), Vec::new()),
+    };
+    let fm = &after_open[..end];
+
+    // description: single line value
+    let description = fm.lines()
+        .find_map(|l| l.strip_prefix("description:").map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string()))
+        .unwrap_or_default();
+
+    // triggers: YAML block list or inline array
+    let mut triggers: Vec<String> = Vec::new();
+    let mut in_triggers = false;
+    for line in fm.lines() {
+        if line.starts_with("triggers:") {
+            let rest = line["triggers:".len()..].trim();
+            if rest.starts_with('[') {
+                // inline: triggers: [react, frontend, css]
+                triggers = rest.trim_matches(|c| c == '[' || c == ']')
+                    .split(',')
+                    .map(|t| t.trim().trim_matches('"').trim_matches('\'').to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                in_triggers = false;
+            } else {
+                in_triggers = true;
+            }
+            continue;
+        }
+        if in_triggers {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                let item = line.trim().trim_start_matches('-').trim();
+                if !item.is_empty() {
+                    triggers.push(item.trim_matches('"').trim_matches('\'').to_string());
+                }
+            } else {
+                in_triggers = false;
+            }
+        }
+    }
+
+    (description, triggers)
+}
+
+/// Returns current unix timestamp in seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// List all installed skills from ~/.integraded-workspace/skills/.
+#[tauri::command]
+fn skills_list_installed(app: AppHandle) -> Result<Vec<InstalledSkill>, String> {
+    let dir = skills_dir(&app)?;
+    let mut skills = Vec::new();
+    let entries = fs::read_dir(&dir).map_err(|e| format!("Cannot read skills dir: {}", e))?;
+    for entry in entries.flatten() {
+        let meta_path = entry.path().join("meta.json");
+        if meta_path.exists() {
+            if let Ok(content) = fs::read_to_string(&meta_path) {
+                if let Ok(skill) = serde_json::from_str::<InstalledSkill>(&content) {
+                    skills.push(skill);
+                }
+            }
+        }
+    }
+    skills.sort_by(|a, b| b.installed_at.cmp(&a.installed_at));
+    Ok(skills)
+}
+
+/// Download and install a skill from GitHub raw URLs (bypasses rate-limited API).
+#[tauri::command]
+async fn skill_install(
+    skill_id: String,
+    skill_name: String,
+    source: String,
+    installs: u64,
+    app: AppHandle,
+) -> Result<InstalledSkill, String> {
+    let (owner, repo, slug) = {
+        let parts: Vec<&str> = skill_id.split('/').collect();
+        if parts.len() != 3 {
+            return Err("Invalid skill ID format. Expected owner/repo/slug".to_string());
+        }
+        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string())
+    };
+
+    let dir = skills_dir(&app)?;
+    let safe_id = skill_id_to_dir(&skill_id);
+    let skill_dir = dir.join(&safe_id);
+    fs::create_dir_all(&skill_dir)
+        .map_err(|e| format!("Cannot create skill directory: {}", e))?;
+
+    let mut skill_md = String::new();
+
+    // Candidate raw URLs — try subdirectory format first, then root fallback
+    let candidate_urls = vec![
+        format!("https://raw.githubusercontent.com/{}/{}/main/skills/{}/SKILL.md", owner, repo, slug),
+        format!("https://raw.githubusercontent.com/{}/{}/master/skills/{}/SKILL.md", owner, repo, slug),
+        format!("https://raw.githubusercontent.com/{}/{}/main/SKILL.md", owner, repo),
+        format!("https://raw.githubusercontent.com/{}/{}/master/SKILL.md", owner, repo),
+    ];
+
+    let mut found = false;
+    for url in &candidate_urls {
+        if validate_url(url).is_err() { continue; }
+        let mut cmd = tokio::process::Command::new("curl");
+        cmd.args([
+            "-s", "-L", "--max-time", "15",
+            "-H", &format!("User-Agent: {}", SKILLS_BROWSER_UA),
+            url,
+        ]);
+        if let Ok(Ok(out)) = tokio::time::timeout(
+            std::time::Duration::from_secs(20), cmd.output()
+        ).await {
+            let body = String::from_utf8_lossy(&out.stdout).into_owned();
+            if !body.trim().is_empty()
+                && !body.contains("404: Not Found")
+                && !body.starts_with('{')
+                && body.contains("---")
+            {
+                skill_md = body.clone();
+                let full_path = skill_dir.join("SKILL.md");
+                let _ = fs::write(&full_path, body.as_bytes());
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if !found {
+        return Err(format!(
+            "Could not download SKILL.md for \"{}\". The skill may have been removed or its GitHub repository has a non-standard structure.",
+            slug
+        ));
+    }
+
+    // Try to also fetch supporting files from the same directory via GitHub tree API
+    // (best-effort only — failure here does NOT block installation)
+    let branch_candidates = ["main", "master"];
+    let subdir = if candidate_urls[0].contains("/skills/") {
+        format!("skills/{}", slug)
+    } else {
+        String::new()
+    };
+    'outer: for branch in &branch_candidates {
+        let tree_url = format!(
+            "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=0",
+            owner, repo, branch
+        );
+        if let Ok(body) = github_get(&tree_url, "application/vnd.github+json").await {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(tree) = data["tree"].as_array() {
+                    for item in tree {
+                        if item["type"].as_str() != Some("blob") { continue; }
+                        let path = item["path"].as_str().unwrap_or("");
+                        // Only download files from the same skill's directory (not SKILL.md — already done)
+                        let in_subdir = !subdir.is_empty() && path.starts_with(&format!("{}/", subdir));
+                        let is_root = subdir.is_empty() && !path.contains('/');
+                        if (in_subdir || is_root) && !path.ends_with("SKILL.md") {
+                            let file_name = path.rsplit('/').next().unwrap_or(path);
+                            let raw_url = format!(
+                                "https://raw.githubusercontent.com/{}/{}/{}/{}",
+                                owner, repo, branch, path
+                            );
+                            if let Ok(Ok(out)) = tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                tokio::process::Command::new("curl")
+                                    .args(["-s", "-L", "--max-time", "10",
+                                           "-H", &format!("User-Agent: {}", SKILLS_BROWSER_UA),
+                                           &raw_url])
+                                    .output()
+                            ).await {
+                                let content = String::from_utf8_lossy(&out.stdout).into_owned();
+                                if !content.is_empty() {
+                                    let _ = fs::write(skill_dir.join(file_name), content.as_bytes());
+                                }
+                            }
+                        }
+                    }
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    // Get description from SKILL.md frontmatter; if empty, try skills.sh page
+    let (mut description, triggers) = parse_skill_md(&skill_md);
+    if description.is_empty() {
+        if let Some(desc) = scrape_skills_sh_description(&skill_id).await {
+            description = desc;
+        }
+    }
+
+    let installed = InstalledSkill {
+        id: skill_id,
+        slug: slug.to_string(),
+        name: skill_name,
+        source,
+        installs,
+        description,
+        triggers,
+        skill_md,
+        installed_at: unix_now(),
+    };
+
+    // Save metadata
+    let meta_json = serde_json::to_string_pretty(&installed)
+        .map_err(|e| format!("Cannot serialize skill metadata: {}", e))?;
+    fs::write(skill_dir.join("meta.json"), meta_json.as_bytes())
+        .map_err(|e| format!("Cannot write skill metadata: {}", e))?;
+
+    Ok(installed)
+}
+
+/// Uninstall a skill — removes its directory from ~/.integraded-workspace/skills/.
+#[tauri::command]
+fn skill_uninstall(skill_id: String, app: AppHandle) -> Result<(), String> {
+    let dir = skills_dir(&app)?;
+    let skill_dir = dir.join(skill_id_to_dir(&skill_id));
+    if skill_dir.exists() {
+        fs::remove_dir_all(&skill_dir)
+            .map_err(|e| format!("Failed to remove skill: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Read SKILL.md content for a specific installed skill (for terminal injection).
+#[tauri::command]
+fn skill_read_content(skill_id: String, app: AppHandle) -> Result<String, String> {
+    let dir = skills_dir(&app)?;
+    let skill_md = dir.join(skill_id_to_dir(&skill_id)).join("SKILL.md");
+    fs::read_to_string(&skill_md).map_err(|e| format!("Cannot read SKILL.md: {}", e))
+}
+
+/// Write a skill file into the workspace's .integraded-skills/ directory.
+/// Creates the directory automatically. Returns the written file path.
+/// Slug is sanitized to prevent path traversal — only [a-zA-Z0-9_-] allowed.
+#[tauri::command]
+fn write_skill_to_workspace(
+    workspace_dir: String,
+    slug: String,
+    content: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<String, String> {
+    let roots = workspace_roots(&state)?;
+    // Validate workspace_dir itself is inside an active workspace
+    validate_in_workspace(&workspace_dir, &roots)?;
+
+    // Sanitize slug: only alphanumeric + hyphen/underscore, strip leading/trailing underscores
+    let safe_slug: String = slug
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let safe_slug = safe_slug.trim_matches('_');
+    if safe_slug.is_empty() {
+        return Err("Invalid skill slug: must contain alphanumeric characters.".to_string());
+    }
+
+    let ws_path = Path::new(&workspace_dir);
+    let skills_subdir = ws_path.join(".integraded-skills");
+    fs::create_dir_all(&skills_subdir)
+        .map_err(|e| format!("Cannot create .integraded-skills/ directory: {}", e))?;
+
+    let file_path = skills_subdir.join(format!("{}.md", safe_slug));
+    fs::write(&file_path, content.as_bytes())
+        .map_err(|e| format!("Cannot write skill file: {}", e))?;
+
+    Ok(file_path.to_string_lossy().into_owned())
+}
+
 // ─── Dev server detection ─────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1312,13 +1992,10 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
     )
 }
 
-/// Start the dev server as a detached background process (no visible terminal window).
-/// Stdout, stderr and stdin are all routed to /dev/null (Unix) or NUL (Windows).
-/// On Windows the CREATE_NO_WINDOW flag is set so no console flashes up.
+/// Start the dev server as a detached background process.
 #[tauri::command]
-fn start_dev_server_background(dir: String, command: String) -> Result<(), String> {
+fn start_dev_server_background(dir: String, command: String, state: State<'_, DevServerState>) -> Result<(), String> {
     let mut cmd = if cfg!(target_os = "windows") {
-        // Use cmd.exe /c so that .cmd / .bat shims (npm, pnpm, yarn, …) resolve correctly.
         let mut c = std::process::Command::new("cmd.exe");
         c.args(["/c", &command]);
         c
@@ -1327,52 +2004,245 @@ fn start_dev_server_background(dir: String, command: String) -> Result<(), Strin
         c.args(["-c", &command]);
         c
     };
-
     if !dir.is_empty() && Path::new(&dir).exists() {
         cmd.current_dir(&dir);
     }
-
-    // Suppress all I/O — we only care whether the port comes up, not the output.
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
     cmd.stdin(std::process::Stdio::null());
-
-    // Windows: prevent a console window from briefly appearing.
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-
-    cmd.spawn()
-        .map_err(|e| format!("Failed to start dev server in background: {}", e))?;
-
+    let child = cmd.spawn().map_err(|e| format!("Failed to start dev server in background: {}", e))?;
+    let pid = child.id();
+    std::mem::forget(child);
+    let mut guard = state.0.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
+    *guard = Some(pid);
     Ok(())
 }
 
-/// Attempt a TCP connection to 127.0.0.1:port or [::1]:port; returns true if something is
-/// already listening there (i.e. the dev server is up).
+#[tauri::command]
+fn stop_dev_server_background(port: u16, state: State<'_, DevServerState>) -> Result<(), String> {
+    let mut guard = state.0.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
+    if let Some(pid) = guard.take() {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd.exe")
+            .args(["/c", &format!(
+                "for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :{port} ^| findstr LISTENING') do taskkill /F /PID %a"
+            )])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null || lsof -ti:{} | xargs -r kill -9", port, port)])
+            .spawn();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn check_port_open(port: u16) -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
-    
-    // Check IPv4 loopback
     if TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         Duration::from_millis(200),
-    )
-    .is_ok() {
+    ).is_ok() {
         return true;
     }
-
-    // Check IPv6 loopback
     TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
         Duration::from_millis(200),
-    )
-    .is_ok()
+    ).is_ok()
+}
+
+// ─── Skills system (GitHub extensions) ─────────────────────────────────────────
+
+/// Fetch JSON from a URL with optional headers (used for GitHub API / raw content).
+async fn github_get(url: &str, accept: &str) -> Result<String, String> {
+    validate_url(url)?;
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args([
+        "-s", "-L", "--max-time", "15",
+        "-H", &format!("Accept: {}", accept),
+        "-H", "User-Agent: Integraded-App/1.0",
+        url,
+    ]);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
+        .await
+        .map_err(|_| "GitHub request timed out".to_string())?
+        .map_err(|e| format!("curl error: {}", e))?;
+    let body = String::from_utf8_lossy(&out.stdout).into_owned();
+    if body.trim().is_empty() {
+        return Err(format!("Empty GitHub response: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(body)
+}
+
+/// Scrape install count from formatted strings like "1.8M", "479.2K", "123".
+fn parse_installs_str(s: &str) -> u64 {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix('M') {
+        return (n.parse::<f64>().unwrap_or(0.0) * 1_000_000.0) as u64;
+    }
+    if let Some(n) = s.strip_suffix('K') {
+        return (n.parse::<f64>().unwrap_or(0.0) * 1_000.0) as u64;
+    }
+    s.parse().unwrap_or(0)
+}
+
+/// List/search skills by scraping the public skills.sh website (no API key required).
+/// query = "" → fetch the leaderboard; query ≥ 2 chars → filter results.
+#[tauri::command]
+async fn skills_fetch_list(query: String, page: u32) -> Result<String, String> {
+    // Scrape the skills.sh homepage which is server-side rendered
+    let url = "https://www.skills.sh/";
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args([
+        "-s", "-L", "--max-time", "20",
+        "-H", &format!("User-Agent: {}", SKILLS_BROWSER_UA),
+        "-H", "Accept: text/html",
+        url,
+    ]);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(25), cmd.output())
+        .await
+        .map_err(|_| "skills.sh request timed out".to_string())?
+        .map_err(|e| format!("curl error: {}", e))?;
+    let html = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    if html.trim().is_empty() || html.len() < 5000 {
+        return Err("skills.sh returned an empty or unexpected response".to_string());
+    }
+
+    // Parse skill cards: <a href="/owner/repo/slug">...<h3>name</h3><p>source</p>...<span>installs</span>
+    // The homepage uses SSR so the data is embedded in the static HTML.
+    let mut skills: Vec<serde_json::Value> = Vec::new();
+    let q = query.trim().to_lowercase();
+    let per_page: usize = 50;
+    let offset = page as usize * per_page;
+
+    // Use a simple state-machine parser to extract skill cards from HTML
+    // Pattern: href="/owner/repo/slug" → h3 → p (source) → span with digits
+    let sections = html.split("class=\"h-[72px] lg:h-[56px]\"").skip(1);
+    for section in sections {
+        // Extract href
+        let href = {
+            let start = match section.find("href=\"/") {
+                Some(i) => i + 6,  // points to '/'
+                None => continue,
+            };
+            let rest = &section[start..];
+            let end = match rest.find('"') {
+                Some(i) => i,
+                None => continue,
+            };
+            let path = &rest[..end]; // e.g. "/owner/repo/slug"
+            // Must have exactly 3 path segments (owner/repo/slug)
+            let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+            if segs.len() != 3 { continue; }
+            // Skip navigation paths
+            let owner = segs[0];
+            if ["agents", "_next", "api", "docs", "topic", "agent", "trending",
+                "hot", "official", "audits", "about", "contact", "privacy",
+                "terms", "search", "favicon", "og"].contains(&owner) {
+                continue;
+            }
+            path.trim_start_matches('/').to_string() // "owner/repo/slug"
+        };
+
+        let segs: Vec<&str> = href.split('/').collect();
+        let owner = segs[0];
+        let repo  = segs[1];
+        let slug  = segs[2];
+
+        // Extract skill name from <h3>
+        let name = {
+            let start = match section.find("<h3 ") {
+                Some(i) => i,
+                None => continue,
+            };
+            let inner = &section[start..];
+            let content_start = match inner.find('>') {
+                Some(i) => i + 1,
+                None => continue,
+            };
+            let content_end = match inner[content_start..].find("</h3>") {
+                Some(i) => content_start + i,
+                None => continue,
+            };
+            inner[content_start..content_end].trim().to_string()
+        };
+
+        // Extract source (<p> right after h3)
+        let source = format!("{}/{}", owner, repo);
+
+        // Extract install count from <span class="font-mono text-sm text-foreground">
+        let installs = {
+            let marker = "font-mono text-sm text-foreground\">";
+            if let Some(pos) = section.rfind(marker) {
+                let rest = &section[pos + marker.len()..];
+                let end = rest.find('<').unwrap_or(rest.len());
+                parse_installs_str(&rest[..end])
+            } else {
+                0u64
+            }
+        };
+
+        // Apply query filter
+        if !q.is_empty() && q.len() >= 2 {
+            let haystack = format!("{} {} {}", name, slug, source).to_lowercase();
+            if !haystack.contains(&q) { continue; }
+        }
+
+        skills.push(serde_json::json!({
+            "id": href,              // "owner/repo/slug"
+            "slug": slug,
+            "name": name,
+            "source": source,
+            "installs": installs,
+            "description": ""        // loaded lazily on expand
+        }));
+    }
+
+    let total = skills.len();
+    // Paginate
+    let page_items: Vec<serde_json::Value> = skills.into_iter().skip(offset).take(per_page).collect();
+    let has_more = offset + per_page < total;
+
+    let response = serde_json::json!({
+        "data": page_items,
+        "pagination": {
+            "page": page,
+            "perPage": per_page,
+            "total": total,
+            "hasMore": has_more
+        }
+    });
+    Ok(response.to_string())
 }
 
 // ─── App entry point ──────────────────────────────────────────────────────────
@@ -1384,6 +2254,7 @@ pub fn run() {
         .manage(PtyState::default())
         .manage(WorkspaceState::default())
         .manage(StreamState::default())
+        .manage(DevServerState::default())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 if let Some(icon) = app.default_window_icon() {
@@ -1417,6 +2288,16 @@ pub fn run() {
             pty_kill,
             save_config,
             load_config,
+            get_api_key,
+            save_active_model,
+            set_provider_enabled,
+            fetch_provider_models,
+            skills_fetch_list,
+            skills_list_installed,
+            skill_install,
+            skill_uninstall,
+            skill_read_content,
+            write_skill_to_workspace,
             curl_get,
             curl_post,
             curl_post_stream,
@@ -1424,6 +2305,7 @@ pub fn run() {
             detect_dev_project,
             check_port_open,
             start_dev_server_background,
+            stop_dev_server_background,
             save_chat_to_workspace,
         ])
         .run(tauri::generate_context!())

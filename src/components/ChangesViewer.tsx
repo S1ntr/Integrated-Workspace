@@ -109,12 +109,33 @@ interface ChangesViewerProps {
   changedFiles: ChangedFile[];
   baselineSnapshot: Record<string, string>;
   onFileSelect: (path: string, name: string, baselineContent?: string) => void;
+  workspaceDir?: string;
+}
+
+function shortPath(fullPath: string, workspaceDir?: string): string {
+  if (!workspaceDir) {
+    // No workspace — show last two segments: parent/file.ext
+    const parts = fullPath.replace(/\\/g, "/").split("/").filter(Boolean);
+    return parts.length > 1 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : fullPath;
+  }
+  const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "");
+  const base = norm(workspaceDir);
+  const full = norm(fullPath);
+  if (full.toLowerCase().startsWith(base.toLowerCase())) {
+    const rel = full.slice(base.length).replace(/^\//, "");
+    const wsName = base.split("/").pop() || base;
+    return `${wsName}/${rel}`;
+  }
+  // Fallback: last two path segments
+  const parts = full.split("/").filter(Boolean);
+  return parts.length > 1 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : fullPath;
 }
 
 export const ChangesViewer: React.FC<ChangesViewerProps> = ({
   changedFiles,
   baselineSnapshot,
   onFileSelect,
+  workspaceDir,
 }) => {
   const [expandedFile, setExpandedFile] = useState<string | null>(null);
   const [diffData, setDiffData] = useState<DiffLine[] | null>(null);
@@ -168,7 +189,7 @@ export const ChangesViewer: React.FC<ChangesViewerProps> = ({
                   <i className={`bx ${file.status === "new" ? "bx-file-blank text-ok" : "bx-edit-alt text-warn"} change-status-icon`} />
                   <div className="change-file-details">
                     <span className="change-file-name">{file.name}</span>
-                    <span className="change-file-path">{file.path}</span>
+                    <span className="change-file-path">{shortPath(file.path, workspaceDir)}</span>
                   </div>
                   <span className={`change-badge ${file.status}`}>
                     {file.status === "new" ? "NEW" : "MODIFIED"}

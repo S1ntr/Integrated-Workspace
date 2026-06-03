@@ -19,6 +19,12 @@ interface TerminalGridProps {
   onStatusChange?: (id: number, status: "booting" | "running" | "exited") => void;
 }
 
+// Notify all TerminalPanels that a drag-resize just ended so they can
+// do a full fit+refresh pass and clear any stale canvas pixels.
+function dispatchResizeEnd() {
+  window.dispatchEvent(new Event("termgrid-resize-end"));
+}
+
 // ── Snap helper ────────────────────────────────────────────────────────────────
 const SNAP_POINTS = [25, 33, 50, 67, 75];
 const SNAP_THRESHOLD = 3.5; // % — snap zone radius
@@ -176,6 +182,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
       setIsResizing(false);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      dispatchResizeEnd();
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -195,6 +202,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
       setIsResizing(false);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      dispatchResizeEnd();
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -214,6 +222,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
       setIsResizing(false);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      dispatchResizeEnd();
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -233,6 +242,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
       setIsResizing(false);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      dispatchResizeEnd();
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -277,6 +287,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
       setIsResizing(false);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      dispatchResizeEnd();
     };
 
     window.addEventListener("mousemove", onMove);
@@ -317,6 +328,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
       setIsResizing(false);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      dispatchResizeEnd();
     };
 
     window.addEventListener("mousemove", onMove);
