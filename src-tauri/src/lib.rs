@@ -548,11 +548,27 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
 fn get_clipboard_file_paths() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
+        // Try Get-Clipboard -Format FileDropList (PowerShell 5.1+)
         let ps = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command",
-                "[System.Windows.Forms.Clipboard]::GetFileDropList() | ForEach-Object { $_ }"])
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "try { $files = Get-Clipboard -Format FileDropList -ErrorAction Stop; if ($files) { $files | ForEach-Object { $_.FullName } } } catch { }"])
             .output();
         if let Ok(out) = ps {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let paths: Vec<String> = text.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            if !paths.is_empty() {
+                return paths;
+            }
+        }
+        // Fallback: Add-Type approach
+        let ps2 = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $files = [System.Windows.Forms.Clipboard]::GetFileDropList(); $files | ForEach-Object { $_ }"])
+            .output();
+        if let Ok(out) = ps2 {
             let text = String::from_utf8_lossy(&out.stdout);
             return text.lines()
                 .map(|l| l.trim().to_string())
