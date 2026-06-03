@@ -35,7 +35,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
     claude:      0,
   });
   const [skipClaudePerms, setSkipClaudePerms] = useState(true);
-  const [customEntries, setCustomEntries] = useState<{ id: number; label: string; command: string }[]>([]);
+  const [customEntries, setCustomEntries] = useState<{ id: number; label: string; command: string; count: number }[]>([]);
   const [nextCustomId, setNextCustomId] = useState(1);
 
   const pickDir = async () => {
@@ -66,12 +66,21 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
 
   const addCustomEntry = () => {
     if (totalCount >= 16) return;
-    setCustomEntries(prev => [...prev, { id: nextCustomId, label: "", command: "" }]);
+    setCustomEntries(prev => [...prev, { id: nextCustomId, label: "", command: "", count: 1 }]);
     setNextCustomId(n => n + 1);
   };
 
   const updateCustomEntry = (id: number, field: "label" | "command", value: string) => {
     setCustomEntries(prev => prev.map(e => e.id === id ? { ...e, [field]: value } : e));
+  };
+
+  const changeCustomCount = (id: number, delta: number) => {
+    setCustomEntries(prev => prev.map(e => {
+      if (e.id !== id) return e;
+      const otherTotal = sessions.length - e.count;
+      const max = Math.max(1, 16 - otherTotal);
+      return { ...e, count: Math.max(1, Math.min(max, e.count + delta)) };
+    }));
   };
 
   const removeCustomEntry = (id: number) => {
@@ -90,7 +99,9 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
     }
     for (const entry of customEntries) {
       if (entry.command.trim()) {
-        list.push({ label: entry.label.trim() || entry.command.trim(), command: entry.command.trim() });
+        for (let i = 0; i < entry.count; i++) {
+          list.push({ label: entry.label.trim() || entry.command.trim(), command: entry.command.trim() });
+        }
       }
     }
     return list;
@@ -201,8 +212,20 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
                 placeholder="Launch command (e.g. aider)"
                 value={entry.command}
                 onChange={e => updateCustomEntry(entry.id, "command", e.target.value)}
-                autoFocus
               />
+              <div className="agent-chip-counter ob-custom-counter" onClick={e => e.stopPropagation()}>
+                <button
+                  className="agent-count-btn"
+                  onClick={() => changeCustomCount(entry.id, -1)}
+                  disabled={entry.count <= 1}
+                >−</button>
+                <span className="agent-count-val">{entry.count}</span>
+                <button
+                  className="agent-count-btn"
+                  onClick={() => changeCustomCount(entry.id, +1)}
+                  disabled={totalCount >= 16}
+                >+</button>
+              </div>
               <button className="ob-custom-remove" onClick={() => removeCustomEntry(entry.id)} title="Remove">
                 <i className="bx bx-x" />
               </button>

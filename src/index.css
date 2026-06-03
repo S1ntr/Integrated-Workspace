@@ -519,6 +519,7 @@ input, textarea { font-family: var(--font-ui); }
 .ob-custom-input:focus { border-color: var(--accent-border); }
 .ob-custom-input::placeholder { color: var(--text-3); }
 .ob-custom-cmd { flex: 2; }
+.ob-custom-counter { flex-shrink: 0; }
 .ob-custom-remove {
   width: 22px; height: 22px;
   display: flex; align-items: center; justify-content: center;
