@@ -35,6 +35,8 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
     claude:      0,
   });
   const [skipClaudePerms, setSkipClaudePerms] = useState(true);
+  const [customEntries, setCustomEntries] = useState<{ id: number; label: string; command: string }[]>([]);
+  const [nextCustomId, setNextCustomId] = useState(1);
 
   const pickDir = async () => {
     try {
@@ -62,6 +64,20 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
     });
   };
 
+  const addCustomEntry = () => {
+    if (totalCount >= 16) return;
+    setCustomEntries(prev => [...prev, { id: nextCustomId, label: "", command: "" }]);
+    setNextCustomId(n => n + 1);
+  };
+
+  const updateCustomEntry = (id: number, field: "label" | "command", value: string) => {
+    setCustomEntries(prev => prev.map(e => e.id === id ? { ...e, [field]: value } : e));
+  };
+
+  const removeCustomEntry = (id: number) => {
+    setCustomEntries(prev => prev.filter(e => e.id !== id));
+  };
+
   // Build flat ordered session list
   const buildSessions = (): AgentSession[] => {
     const list: AgentSession[] = [];
@@ -70,6 +86,11 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
       for (let i = 0; i < n; i++) {
         const command = agent.key === "claude" && skipClaudePerms ? "claude --dangerously-skip-permissions" : agent.command;
         list.push({ label: agent.label, command });
+      }
+    }
+    for (const entry of customEntries) {
+      if (entry.command.trim()) {
+        list.push({ label: entry.label.trim() || entry.command.trim(), command: entry.command.trim() });
       }
     }
     return list;
@@ -162,6 +183,39 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
               );
             })}
           </div>
+
+          {/* Custom terminals */}
+          {customEntries.map(entry => (
+            <div key={entry.id} className="ob-custom-entry" onClick={e => e.stopPropagation()}>
+              <i className="bx bx-code-curly ob-custom-icon" />
+              <input
+                className="ob-custom-input"
+                type="text"
+                placeholder="Label (optional)"
+                value={entry.label}
+                onChange={e => updateCustomEntry(entry.id, "label", e.target.value)}
+              />
+              <input
+                className="ob-custom-input ob-custom-cmd"
+                type="text"
+                placeholder="Launch command (e.g. aider)"
+                value={entry.command}
+                onChange={e => updateCustomEntry(entry.id, "command", e.target.value)}
+                autoFocus
+              />
+              <button className="ob-custom-remove" onClick={() => removeCustomEntry(entry.id)} title="Remove">
+                <i className="bx bx-x" />
+              </button>
+            </div>
+          ))}
+          <button
+            className="ob-add-custom"
+            type="button"
+            disabled={totalCount >= 16}
+            onClick={addCustomEntry}
+          >
+            <i className="bx bx-plus" /> Add Custom Terminal
+          </button>
 
           {totalCount > 0 && (
             <div className={`ob-total-hint ${totalCount >= 16 ? "ob-total-full" : ""}`}>

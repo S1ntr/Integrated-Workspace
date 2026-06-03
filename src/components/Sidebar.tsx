@@ -417,10 +417,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ directory, activeFilePath, onF
           onClick={e => e.stopPropagation()}
         >
           <button className="context-menu-item" onClick={() => startCreate("file")}>
-            <i className="bx bx-file-plus" /> New File
+            <i className="bx bx-file-blank" /> New File
           </button>
           <button className="context-menu-item" onClick={() => startCreate("folder")}>
-            <i className="bx bx-folder-plus" /> New Folder
+            <i className="bx bx-folder" /> New Folder
           </button>
 
           {/* Paste from OS clipboard always available */}

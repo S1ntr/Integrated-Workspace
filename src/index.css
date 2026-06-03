@@ -491,6 +491,53 @@ input, textarea { font-family: var(--font-ui); }
 }
 .ob-warn  { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--warn); }
 .ob-ready { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ok); }
+
+/* Custom terminal entries in onboarding */
+.ob-custom-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius-sm);
+}
+.ob-custom-icon { font-size: 14px; color: var(--text-3); flex-shrink: 0; }
+.ob-custom-input {
+  flex: 1;
+  height: 26px;
+  padding: 0 8px;
+  background: var(--bg-base);
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius-xs);
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  outline: none;
+  min-width: 80px;
+}
+.ob-custom-input:focus { border-color: var(--accent-border); }
+.ob-custom-input::placeholder { color: var(--text-3); }
+.ob-custom-cmd { flex: 2; }
+.ob-custom-remove {
+  width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: none;
+  color: var(--text-3); cursor: pointer; border-radius: var(--radius-xs); flex-shrink: 0;
+}
+.ob-custom-remove:hover { background: var(--err-dim); color: var(--err); }
+.ob-add-custom {
+  display: flex; align-items: center; gap: 6px;
+  height: 30px; padding: 0 12px;
+  background: transparent;
+  border: 1px dashed var(--bg-5);
+  border-radius: var(--radius-sm);
+  color: var(--text-3); font-size: 11.5px; cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+  align-self: flex-start;
+}
+.ob-add-custom:hover:not(:disabled) { border-color: var(--accent-border); color: var(--accent); }
+.ob-add-custom:disabled { opacity: 0.4; cursor: default; }
 .ob-footer {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 18px 32px 24px; border-top: 1px solid var(--bg-4); background: var(--bg-base);
