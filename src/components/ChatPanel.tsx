@@ -307,6 +307,28 @@ function formatBody(body: string): React.ReactNode {
 
 // ─── SSE parser ───────────────────────────────────────────────────────────────
 
+/**
+ * Returns true if the model's text describes intending to spawn/send/use agents
+ * but produced zero tool_call blocks — used to warn the user when a model ignores
+ * the required tool call format.
+ */
+function detectsAgentIntent(text: string): boolean {
+  if (!text.trim()) return false;
+  // Already has tool calls → no warning needed
+  if (/<tool_call>/i.test(text) || /```tool_call/i.test(text)) return false;
+  const lower = text.toLowerCase();
+  return (
+    /\bspawn\b|\bspawnu\b|\bspawním\b/.test(lower) ||
+    /\buse (an? |one |the )?agent\b/.test(lower) ||
+    /\bcreate (an? |one |the )?agent\b/.test(lower) ||
+    /\bopen(code|code agent)\b/.test(lower) ||
+    /\b(pošlu|spustím|použiji|vytvořím|zavolám).{0,30}agent/.test(lower) ||
+    /agent.{0,30}(spustím|pošlu|použiji|vytvořím|zavolám)/.test(lower) ||
+    /\bI('ll| will) (spawn|use|create|start|launch|dispatch).{0,30}agent/.test(lower) ||
+    /\bI('ll| will) (use|task|assign).{0,30}(opencode|claude|codex)/.test(lower)
+  );
+}
+
 /** Extract a human-readable error string from any provider error JSON, or null. */
 function parseStreamError(d: any): string | null {
   if (!d || typeof d !== "object") return null;
@@ -619,9 +641,19 @@ ${sessionList}
 - \`shell\` — PowerShell/bash (commands, installs, scripts)
 - \`antigravity\` — Antigravity CLI
 
-## Tool Calls
-Tool calls execute automatically. Raw tool call syntax is hidden from the normal chat bubble and the app renders an inline log message instead. Prefer this exact XML form:
+## ⚡ MANDATORY: Tool Calls — you MUST output these, always
+Tool calls are **not optional**. Every time you decide to spawn, send, or manage an agent you MUST output the tool call XML — outputting only prose that describes what you intend to do is NOT enough and the action will never execute.
 
+Rule: **think in prose, act in tool calls**. Write one short visible sentence explaining what you are doing, then IMMEDIATELY follow it with the tool call(s). Do NOT describe the action and stop there.
+
+✅ CORRECT (prose + tool call together):
+I'll spawn one opencode agent to build the snake game.
+<tool_call>{"tool":"agent.spawn","agentType":"opencode","label":"Snake Game","prompt":"Create a modern snake game in index.html using HTML, CSS and JS. Single file, full game with score, speed increase and game-over screen."}</tool_call>
+
+❌ WRONG (describing action without tool call — never do this):
+I'll use one of the existing opencode agents to handle this task.
+
+Available tool calls:
 <tool_call>{"tool":"agent.send","label":"Existing Agent Label","prompt":"Message to send to the CLI agent"}</tool_call>
 <tool_call>{"tool":"agent.spawn","agentType":"opencode","label":"Frontend Agent","prompt":"Focused task for this new agent"}</tool_call>
 <tool_call>{"tool":"agent.broadcast","label":"all","prompt":"Shared coordination update for every useful open agent"}</tool_call>
@@ -633,7 +665,11 @@ Tool calls execute automatically. Raw tool call syntax is hidden from the normal
 <tool_call>{"tool":"read_file","path":"src/App.tsx"}</tool_call>
 <tool_call>{"tool":"exec_cmd","command":"npm test"}</tool_call>
 
-If your model has trouble with XML, a fenced JSON block named tool_call is also accepted. Never show raw tool calls in visible prose. Visible prose should summarize what is happening and what you need from the user.
+If XML is not supported by your model, a fenced code block is also accepted:
+\`\`\`tool_call
+{"tool":"agent.spawn","agentType":"opencode","label":"Agent Name","prompt":"Task"}
+\`\`\`
+Tool call XML/blocks are hidden from the user — they see only your visible prose summary and an inline action log.
 
 ## read_file / exec_cmd (direct tools — no agent needed)
 Use \`read_file\` to inspect any workspace file yourself before deciding on a plan. Use \`exec_cmd\` to run a quick command (test, lint, build check) and see the output in chat. These run instantly without spawning a terminal agent.
@@ -2783,13 +2819,34 @@ export const ChatPanel: React.FC<{
         const actions = parseAgentActions(finalText);
         const visible = stripAgentTags(finalText);
         setMsgs(p => p.map(m => m.id === aiMsgId ? { ...m, streaming:false, body: visible, actions: actions.length ? actions : undefined } : m));
-        if (actions.length) autoDispatchActions(actions);
+        if (actions.length) {
+          autoDispatchActions(actions);
+        } else if (detectsAgentIntent(finalText)) {
+          // Model described spawning/sending but forgot the tool call format
+          setMsgs(p => [...p, {
+            id: `hint-${Date.now()}`,
+            role: "ai",
+            agent: "system",
+            body: "⚠️ The model described an agent action in text but did not output a `<tool_call>`. No agents were spawned. Try re-sending — the model was reminded to always include tool calls.",
+            ts: ts(),
+          }]);
+        }
       } else {
         const resp = await callLLM(llmMsgs);
         const actions = parseAgentActions(resp);
         const visible = stripAgentTags(resp);
         setMsgs(p => [...p, { id: aiMsgId, role:"ai", agent:"orchestrator", body: visible, actions: actions.length ? actions : undefined, ts: ts() }]);
-        if (actions.length) autoDispatchActions(actions);
+        if (actions.length) {
+          autoDispatchActions(actions);
+        } else if (detectsAgentIntent(resp)) {
+          setMsgs(p => [...p, {
+            id: `hint-${Date.now()}`,
+            role: "ai",
+            agent: "system",
+            body: "⚠️ The model described an agent action in text but did not output a `<tool_call>`. No agents were spawned. Try re-sending.",
+            ts: ts(),
+          }]);
+        }
       }
     } catch (err: any) {
       const detail = err?.message || String(err || "Failed to get AI response.");
