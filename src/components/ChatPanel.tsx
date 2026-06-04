@@ -1123,6 +1123,8 @@ export const ChatPanel: React.FC<{
   // Local provider models (Ollama / LM Studio) stored separately to prevent
   // the cloud-merge effect from accidentally wiping them on each cloudModels update.
   const [localModels, setLocalModels] = useState<ModelEntry[]>([]);
+  // Tracks reachability of local servers so the dropdown can show online/offline status.
+  const [localProviderOnline, setLocalProviderOnline] = useState<Record<string, boolean>>({});
 
   /** Select a model and persist immediately to config.json */
   const selectModel = (value: string, provider: string) => {
@@ -1506,17 +1508,21 @@ export const ChatPanel: React.FC<{
     if (!config) return;
     const pollLocal = async () => {
       const local: ModelEntry[] = [];
+      const online: Record<string, boolean> = {};
       try {
         const lmUrl = (config.lmstudio_url || "http://localhost:1234").replace(/\/+$/, "");
         const d = JSON.parse(await invoke<string>("curl_get", { url: `${lmUrl}/v1/models` }));
         for (const m of d.data) local.push({ value: m.id, label: m.id, provider: "lmstudio", providerName: "LM Studio", type: "local" });
-      } catch {}
+        online.lmstudio = true;
+      } catch { online.lmstudio = false; }
       try {
         const olUrl = (config.ollama_url || "http://localhost:11434").replace(/\/+$/, "");
         const d = JSON.parse(await invoke<string>("curl_get", { url: `${olUrl}/api/tags` }));
         for (const m of d.models) local.push({ value: m.name, label: m.name, provider: "ollama", providerName: "Ollama", type: "local" });
-      } catch {}
+        online.ollama = true;
+      } catch { online.ollama = false; }
       setLocalModels(local);
+      setLocalProviderOnline(online);
     };
     pollLocal();
     const t = setInterval(pollLocal, 5000);
@@ -3432,17 +3438,38 @@ export const ChatPanel: React.FC<{
                     >
                       <div className="chat-pill-search">
                         <i className="bx bx-search" />
-                        <input type="text" placeholder="Search models…" value={modelSearch} onChange={e => setModelSearch(e.target.value)} autoFocus onKeyDown={e => e.stopPropagation()} />
+                        <input
+                          type="text"
+                          placeholder="Search… or #provider to filter"
+                          value={modelSearch}
+                          onChange={e => setModelSearch(e.target.value)}
+                          autoFocus
+                          onKeyDown={e => e.stopPropagation()}
+                        />
+                        {modelSearch && (
+                          <button className="chat-pill-search-clear" onClick={() => setModelSearch("")} title="Clear">
+                            <i className="bx bx-x" />
+                          </button>
+                        )}
                       </div>
                       <div className="chat-pill-scroll">
                         {(() => {
-                          const q = modelSearch.toLowerCase();
-                          const filt = models.filter(m =>
-                            !q ||
-                            m.value.toLowerCase().includes(q) ||
-                            (m.label || "").toLowerCase().includes(q) ||
-                            m.providerName.toLowerCase().includes(q)
-                          );
+                          const raw = modelSearch.toLowerCase().trim();
+                          // #provider filter: "#openai" → show only models from openai
+                          const isProviderFilter = raw.startsWith("#");
+                          const providerQ = isProviderFilter ? raw.slice(1) : "";
+                          const textQ = isProviderFilter ? "" : raw;
+                          const filt = models.filter(m => {
+                            if (isProviderFilter) {
+                              return !providerQ ||
+                                m.provider.toLowerCase().includes(providerQ) ||
+                                m.providerName.toLowerCase().includes(providerQ);
+                            }
+                            return !textQ ||
+                              m.value.toLowerCase().includes(textQ) ||
+                              (m.label || "").toLowerCase().includes(textQ) ||
+                              m.providerName.toLowerCase().includes(textQ);
+                          });
                           const providerOrder: string[] = [];
                           const byProvider = new Map<string, ModelEntry[]>();
                           for (const m of filt) {
@@ -3452,13 +3479,49 @@ export const ChatPanel: React.FC<{
                             }
                             byProvider.get(m.provider)!.push(m);
                           }
+                          // When typing just "#" with no text, show all providers grouped + local status
+                          const localOnlineProviders = ["ollama", "lmstudio"];
+                          if (!providerOrder.length && isProviderFilter && !providerQ) {
+                            // show all available providers as hints
+                            const allProvs = Array.from(new Set(models.map(m => m.provider)));
+                            return allProvs.length === 0
+                              ? <div className="chat-pill-empty">No models loaded yet</div>
+                              : <div style={{ padding: "8px 10px", fontSize: "11px", color: "var(--text-3)" }}>
+                                  {allProvs.map(p => {
+                                    const name = models.find(m => m.provider === p)?.providerName || p;
+                                    const isLocal = localOnlineProviders.includes(p);
+                                    const online = isLocal ? localProviderOnline[p] : true;
+                                    return (
+                                      <span
+                                        key={p}
+                                        className="chat-pill-provider-chip"
+                                        onClick={() => setModelSearch(`#${p} `)}
+                                      >
+                                        <span className={`chat-pill-dot ${online ? "online" : "offline"}`} />
+                                        {name}
+                                      </span>
+                                    );
+                                  })}
+                                </div>;
+                          }
                           if (!providerOrder.length) return <div className="chat-pill-empty">No models found</div>;
                           return providerOrder.map(prov => {
                             const items = byProvider.get(prov)!;
                             const providerName = items[0].providerName;
+                            const isLocal = localOnlineProviders.includes(prov);
+                            const online = isLocal ? localProviderOnline[prov] : true;
                             return (
                               <div key={prov} className="chat-pill-group">
-                                <div className="chat-pill-group-label">{providerName}</div>
+                                <div className="chat-pill-group-label">
+                                  {isLocal && (
+                                    <span
+                                      className={`chat-pill-dot ${online ? "online" : "offline"}`}
+                                      title={online ? "Server online" : "Server offline"}
+                                    />
+                                  )}
+                                  {providerName}
+                                  {isLocal && !online && <span style={{ marginLeft: 4, color: "var(--err)", fontSize: "10px" }}>(offline)</span>}
+                                </div>
                                 {items.map(m => {
                                   const isActive = m.value === selectedModel && m.provider === selectedCloudProvider;
                                   return (
