@@ -1132,10 +1132,9 @@ export const ChatPanel: React.FC<{
   };
 
   const [cloudModels, setCloudModels] = useState<ModelEntry[]>([]);
-  // Cache: provider → fetched entries. Only entries for changed providers are
-  // invalidated so existing providers serve from cache immediately.
+  // Cache: provider → fetched entries (undefined = not yet fetched).
+  // Cleared fully on every config change so stale/failed results are retried.
   const cloudModelCacheRef = useRef<Partial<Record<string, ModelEntry[]>>>({});
-  const prevConfiguredProvidersRef = useRef<Set<string>>(new Set());
   const [modelSearch, setModelSearch] = useState("");
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
@@ -1467,51 +1466,36 @@ export const ChatPanel: React.FC<{
   useEffect(() => {
     if (!config) return;
 
+    // Clear cache on every config change so failed/stale entries are always retried.
+    cloudModelCacheRef.current = {};
+
     const CLOUD_PROVIDERS_IDS = Object.keys(PROVIDER_NAMES);
     const keys = config.api_keys || {};
 
-    // Invalidate cache only for providers whose key status changed (added/removed).
-    // Keeps cached results for unchanged providers so they appear instantly.
-    const configuredNow = new Set(
-      CLOUD_PROVIDERS_IDS.filter(p => keys[p] && (keys[p] as string).length > 5)
-    );
-    for (const prov of configuredNow) {
-      if (!prevConfiguredProvidersRef.current.has(prov)) delete cloudModelCacheRef.current[prov];
-    }
-    for (const prov of prevConfiguredProvidersRef.current) {
-      if (!configuredNow.has(prov)) delete cloudModelCacheRef.current[prov];
-    }
-    prevConfiguredProvidersRef.current = configuredNow;
-
-    // Providers already cached — show immediately without waiting for any fetch.
-    const cached = CLOUD_PROVIDERS_IDS.flatMap(p => cloudModelCacheRef.current[p] || []);
-    if (cached.length > 0) setCloudModels(cached);
-
-    // Fetch uncached providers individually and update as each one resolves.
-    const providersTofetch = CLOUD_PROVIDERS_IDS.filter(
-      prov => keys[prov] && (keys[prov] as string).length > 5 && !cloudModelCacheRef.current[prov]
-    );
-
-    providersTofetch.forEach(async (prov) => {
-      try {
-        const fetched = await invoke<{ id: string; name: string }[]>(
-          "fetch_provider_models", { provider: prov }
-        );
-        const entries: ModelEntry[] = fetched.map(m => ({
-          value: m.id,
-          label: m.name || m.id,
-          provider: prov,
-          providerName: PROVIDER_NAMES[prov] || prov,
-          type: "cloud" as const,
-        }));
-        cloudModelCacheRef.current[prov] = entries;
-      } catch {
-        cloudModelCacheRef.current[prov] = [];
-      }
-      // Update UI as soon as this provider resolves — don't wait for others.
-      const all = CLOUD_PROVIDERS_IDS.flatMap(p => cloudModelCacheRef.current[p] || []);
-      setCloudModels(all);
-    });
+    // Fetch each configured provider independently — no waiting for others.
+    // Each one updates cloudModels the moment it resolves (progressive).
+    CLOUD_PROVIDERS_IDS
+      .filter(prov => keys[prov] && (keys[prov] as string).length > 5)
+      .forEach(async (prov) => {
+        try {
+          const fetched = await invoke<{ id: string; name: string }[]>(
+            "fetch_provider_models", { provider: prov }
+          );
+          cloudModelCacheRef.current[prov] = fetched.map(m => ({
+            value: m.id,
+            label: m.name || m.id,
+            provider: prov,
+            providerName: PROVIDER_NAMES[prov] || prov,
+            type: "cloud" as const,
+          }));
+        } catch (err) {
+          console.error(`[models] fetch failed for ${prov}:`, err);
+          cloudModelCacheRef.current[prov] = [];
+        }
+        // Push update immediately — other providers may still be loading.
+        const all = CLOUD_PROVIDERS_IDS.flatMap(p => cloudModelCacheRef.current[p] || []);
+        setCloudModels(all);
+      });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config]);
 
