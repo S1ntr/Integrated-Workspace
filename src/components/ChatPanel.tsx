@@ -307,30 +307,41 @@ function formatBody(body: string): React.ReactNode {
 
 // ─── SSE parser ───────────────────────────────────────────────────────────────
 
+/** Extract a human-readable error string from any provider error JSON, or null. */
+function parseStreamError(d: any): string | null {
+  if (!d || typeof d !== "object") return null;
+  const e = d.error;
+  if (!e) return null;
+  if (typeof e === "string") return e;
+  if (typeof e === "object") return e.message || e.msg || JSON.stringify(e);
+  return null;
+}
+
 function parseStreamDelta(line: string, provider: string): string | null {
   if (!line.trim()) return null;
   // Strip SSE "data: " prefix universally — all providers may send SSE lines
   const jsonStr = line.startsWith("data: ") ? line.slice(6).trim() : line.trim();
   if (!jsonStr || jsonStr === "[DONE]") return null;
 
-  if (provider === "ollama" || provider === "ollama_cloud") {
-    // Ollama NDJSON: {"response":"..."} or {"message":{"content":"..."}}
-    // Ollama Cloud may also use OpenAI-compat SSE: {"choices":[{"delta":{"content":"..."}}]}
-    try {
-      const d = JSON.parse(jsonStr);
+  try {
+    const d = JSON.parse(jsonStr);
+    // Surface API-level errors as visible content so they're never silently swallowed
+    const err = parseStreamError(d);
+    if (err) return `\n⚠️ **API error:** ${err}\n`;
+
+    if (provider === "ollama" || provider === "ollama_cloud") {
+      // Ollama NDJSON: {"response":"..."} or {"message":{"content":"..."}}
+      // Ollama Cloud may also use OpenAI-compat SSE: {"choices":[{"delta":{"content":"..."}}]}
       return d.response || d.message?.content || d.choices?.[0]?.delta?.content || null;
-    } catch { return null; }
-  }
-  if (provider === "anthropic") {
-    // Anthropic SSE data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
-    try {
-      const d = JSON.parse(jsonStr);
+    }
+    if (provider === "anthropic") {
+      // Anthropic SSE data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
       if (d.type === "content_block_delta" && d.delta?.type === "text_delta") return d.delta.text || null;
       return null;
-    } catch { return null; }
-  }
-  // OpenAI-compatible SSE: {"choices":[{"delta":{"content":"..."}}]}
-  try { const d = JSON.parse(jsonStr); return d.choices?.[0]?.delta?.content || null; } catch { return null; }
+    }
+    // OpenAI-compatible SSE: {"choices":[{"delta":{"content":"..."}}]}
+    return d.choices?.[0]?.delta?.content || null;
+  } catch { return null; }
 }
 
 function parseStreamThinking(line: string, provider: string): string | null {
@@ -2159,10 +2170,12 @@ export const ChatPanel: React.FC<{
       const elapsedMs = streamThinkingElapsedRef.current ?? (streamThinkingStartRef.current !== null ? Math.max(0, Date.now() - streamThinkingStartRef.current) : 0);
       streamThinkingElapsedRef.current = elapsedMs;
       
+      const finalBody = visibleStreamText(extracted.content);
       setMsgs(p => p.map(m => m.id === msgId ? {
         ...m,
         streaming: false,
-        body: visibleStreamText(extracted.content),
+        // If stream finished with no content, surface a hint instead of silent empty bubble
+        body: finalBody || "_(No response received. The model may be loading, offline, or returned an empty reply. Check the console for details.)_",
         thinking: thinkingPreviewEnabled && hasThinkingText
           ? { text: combinedThinkingText, elapsedMs, open: m.thinking?.open ?? false, done: true }
           : m.thinking,
