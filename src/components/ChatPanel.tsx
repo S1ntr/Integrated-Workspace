@@ -1137,6 +1137,9 @@ export const ChatPanel: React.FC<{
   // Cache: provider → fetched entries (undefined = not yet fetched).
   // Cleared fully on every config change so stale/failed results are retried.
   const cloudModelCacheRef = useRef<Partial<Record<string, ModelEntry[]>>>({});
+  // Increment to force a full model re-fetch without changing config.
+  const [modelRefreshTick, setModelRefreshTick] = useState(0);
+  const [modelRefreshing, setModelRefreshing] = useState(false);
   const [modelSearch, setModelSearch] = useState("");
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
@@ -1463,43 +1466,43 @@ export const ChatPanel: React.FC<{
   }, []);
 
   // ── Cloud model fetching ───────────────────────────────────────────────────
-  // Runs once per config change (e.g. new key saved). Each provider is fetched
-  // concurrently and results are cached so re-renders don't trigger extra calls.
+  // Runs on config change OR manual refresh tick. Clears cache so all providers
+  // are re-fetched fresh. Each provider updates cloudModels as soon as it resolves.
   useEffect(() => {
     if (!config) return;
 
-    // Clear cache on every config change so failed/stale entries are always retried.
     cloudModelCacheRef.current = {};
+    setModelRefreshing(true);
 
     const CLOUD_PROVIDERS_IDS = Object.keys(PROVIDER_NAMES);
     const keys = config.api_keys || {};
+    const toFetch = CLOUD_PROVIDERS_IDS.filter(prov => keys[prov] && (keys[prov] as string).length > 5);
+    if (toFetch.length === 0) { setModelRefreshing(false); return; }
 
-    // Fetch each configured provider independently — no waiting for others.
-    // Each one updates cloudModels the moment it resolves (progressive).
-    CLOUD_PROVIDERS_IDS
-      .filter(prov => keys[prov] && (keys[prov] as string).length > 5)
-      .forEach(async (prov) => {
-        try {
-          const fetched = await invoke<{ id: string; name: string }[]>(
-            "fetch_provider_models", { provider: prov }
-          );
-          cloudModelCacheRef.current[prov] = fetched.map(m => ({
-            value: m.id,
-            label: m.name || m.id,
-            provider: prov,
-            providerName: PROVIDER_NAMES[prov] || prov,
-            type: "cloud" as const,
-          }));
-        } catch (err) {
-          console.error(`[models] fetch failed for ${prov}:`, err);
-          cloudModelCacheRef.current[prov] = [];
-        }
-        // Push update immediately — other providers may still be loading.
-        const all = CLOUD_PROVIDERS_IDS.flatMap(p => cloudModelCacheRef.current[p] || []);
-        setCloudModels(all);
-      });
+    let resolved = 0;
+    toFetch.forEach(async (prov) => {
+      try {
+        const fetched = await invoke<{ id: string; name: string }[]>(
+          "fetch_provider_models", { provider: prov }
+        );
+        cloudModelCacheRef.current[prov] = fetched.map(m => ({
+          value: m.id,
+          label: m.name || m.id,
+          provider: prov,
+          providerName: PROVIDER_NAMES[prov] || prov,
+          type: "cloud" as const,
+        }));
+      } catch (err) {
+        console.error(`[models] fetch failed for ${prov}:`, err);
+        cloudModelCacheRef.current[prov] = [];
+      }
+      const all = CLOUD_PROVIDERS_IDS.flatMap(p => cloudModelCacheRef.current[p] || []);
+      setCloudModels(all);
+      resolved++;
+      if (resolved === toFetch.length) setModelRefreshing(false);
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [config]);
+  }, [config, modelRefreshTick]);
 
   // ── Local provider polling (LM Studio + Ollama) ────────────────────────────
   // Poll every 5 s. Results go into localModels state which is merged cleanly
@@ -3451,6 +3454,14 @@ export const ChatPanel: React.FC<{
                             <i className="bx bx-x" />
                           </button>
                         )}
+                        <button
+                          className="chat-pill-search-clear"
+                          title="Refresh all models"
+                          onClick={() => setModelRefreshTick(t => t + 1)}
+                          disabled={modelRefreshing}
+                        >
+                          <i className={`bx bx-refresh ${modelRefreshing ? "bx-spin" : ""}`} />
+                        </button>
                       </div>
                       <div className="chat-pill-scroll">
                         {(() => {
