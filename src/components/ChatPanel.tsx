@@ -1479,37 +1479,35 @@ export const ChatPanel: React.FC<{
     }
     prevConfiguredProvidersRef.current = configuredNow;
 
-    const fetchCloud = async () => {
-      const results = await Promise.allSettled(
-        CLOUD_PROVIDERS_IDS
-          .filter(prov => keys[prov] && (keys[prov] as string).length > 5)
-          .map(async (prov) => {
-            if (cloudModelCacheRef.current[prov]) return; // already fetched
-            try {
-              const fetched = await invoke<{ id: string; name: string }[]>(
-                "fetch_provider_models", { provider: prov }
-              );
-              const entries: ModelEntry[] = fetched.map(m => ({
-                value: m.id,
-                label: m.name || m.id,
-                provider: prov,
-                providerName: PROVIDER_NAMES[prov] || prov,
-                type: "cloud" as const,
-              }));
-              cloudModelCacheRef.current[prov] = entries;
-            } catch {
-              // Provider unreachable or key invalid — silently skip
-              cloudModelCacheRef.current[prov] = [];
-            }
-          })
-      );
-      void results; // we care only about the cache side-effects
+    // Providers already cached — show immediately without waiting for any fetch.
+    const cached = CLOUD_PROVIDERS_IDS.flatMap(p => cloudModelCacheRef.current[p] || []);
+    if (cached.length > 0) setCloudModels(cached);
 
+    // Fetch uncached providers individually and update as each one resolves.
+    const providersTofetch = CLOUD_PROVIDERS_IDS.filter(
+      prov => keys[prov] && (keys[prov] as string).length > 5 && !cloudModelCacheRef.current[prov]
+    );
+
+    providersTofetch.forEach(async (prov) => {
+      try {
+        const fetched = await invoke<{ id: string; name: string }[]>(
+          "fetch_provider_models", { provider: prov }
+        );
+        const entries: ModelEntry[] = fetched.map(m => ({
+          value: m.id,
+          label: m.name || m.id,
+          provider: prov,
+          providerName: PROVIDER_NAMES[prov] || prov,
+          type: "cloud" as const,
+        }));
+        cloudModelCacheRef.current[prov] = entries;
+      } catch {
+        cloudModelCacheRef.current[prov] = [];
+      }
+      // Update UI as soon as this provider resolves — don't wait for others.
       const all = CLOUD_PROVIDERS_IDS.flatMap(p => cloudModelCacheRef.current[p] || []);
       setCloudModels(all);
-    };
-
-    fetchCloud();
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config]);
 
