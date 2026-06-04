@@ -963,6 +963,16 @@ fn parse_models(body: &str, provider: &str) -> Result<Vec<ModelInfo>, String> {
             }).collect()
         }
 
+        // ── Ollama Cloud (ollama.com) ─────────────────────────────────────────
+        // Same format as local Ollama: {"models":[{"name":"llama3.2:latest",...}]}
+        "ollama_cloud" => {
+            let arr = json["models"].as_array().ok_or("missing models array")?;
+            arr.iter().filter_map(|m| {
+                let name = m["name"].as_str()?.to_string();
+                Some(ModelInfo { id: name.clone(), name })
+            }).collect()
+        }
+
         // ── OpenRouter ────────────────────────────────────────────────────────
         // {"data":[{"id":"openai/gpt-4o","name":"GPT-4o","context_length":128000}]}
         "openrouter" => {
@@ -1056,6 +1066,12 @@ async fn fetch_provider_models(provider: String) -> Result<Vec<ModelInfo>, Strin
 
         "openrouter" => authed_get(
             "https://openrouter.ai/api/v1/models",
+            &[("Authorization", &format!("Bearer {}", key))],
+        ).await?,
+
+        // Ollama Cloud (ollama.com hosted service) — same /api/tags format as local Ollama
+        "ollama_cloud" => authed_get(
+            "https://ollama.com/api/tags",
             &[("Authorization", &format!("Bearer {}", key))],
         ).await?,
 
