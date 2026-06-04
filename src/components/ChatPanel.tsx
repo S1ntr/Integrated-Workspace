@@ -3311,9 +3311,11 @@ export const ChatPanel: React.FC<{
                         ? renderToolLog(m.toolLog)
                         : m.agent === "diff" && m.diffLog
                           ? renderDiffLog(m.diffLog)
-                          : (m.body ? formatBody(m.body) : null)}
+                          : m.streaming && !m.body
+                            ? <div className="chat-typing"><span/><span/><span/></div>
+                            : (m.body ? formatBody(m.body) : null)}
                         {renderAttachments(m.attachments)}
-                        {m.streaming && <span className="chat-stream-cursor" />}
+                        {m.streaming && m.body && <span className="chat-stream-cursor" />}
                       </div>
                     </div>
                   </div>
