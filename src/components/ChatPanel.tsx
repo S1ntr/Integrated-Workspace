@@ -309,42 +309,50 @@ function formatBody(body: string): React.ReactNode {
 
 function parseStreamDelta(line: string, provider: string): string | null {
   if (!line.trim()) return null;
+  // Strip SSE "data: " prefix universally — all providers may send SSE lines
+  const jsonStr = line.startsWith("data: ") ? line.slice(6).trim() : line.trim();
+  if (!jsonStr || jsonStr === "[DONE]") return null;
+
   if (provider === "ollama" || provider === "ollama_cloud") {
-    try { const d = JSON.parse(line); return d.response || d.message?.content || null; } catch { return null; }
+    // Ollama NDJSON: {"response":"..."} or {"message":{"content":"..."}}
+    // Ollama Cloud may also use OpenAI-compat SSE: {"choices":[{"delta":{"content":"..."}}]}
+    try {
+      const d = JSON.parse(jsonStr);
+      return d.response || d.message?.content || d.choices?.[0]?.delta?.content || null;
+    } catch { return null; }
   }
   if (provider === "anthropic") {
-    try { const d = JSON.parse(line); return d.type === "content_block_delta" ? d.delta?.text || null : null; } catch { return null; }
+    // Anthropic SSE data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+    try {
+      const d = JSON.parse(jsonStr);
+      if (d.type === "content_block_delta" && d.delta?.type === "text_delta") return d.delta.text || null;
+      return null;
+    } catch { return null; }
   }
-  if (line.startsWith("data: ")) {
-    const j = line.slice(6).trim();
-    if (j === "[DONE]") return null;
-    try { const d = JSON.parse(j); return d.choices?.[0]?.delta?.content || null; } catch { return null; }
-  }
-  return null;
+  // OpenAI-compatible SSE: {"choices":[{"delta":{"content":"..."}}]}
+  try { const d = JSON.parse(jsonStr); return d.choices?.[0]?.delta?.content || null; } catch { return null; }
 }
 
 function parseStreamThinking(line: string, provider: string): string | null {
   if (!line.trim()) return null;
+  const jsonStr = line.startsWith("data: ") ? line.slice(6).trim() : line.trim();
+  if (!jsonStr || jsonStr === "[DONE]") return null;
   try {
+    const d = JSON.parse(jsonStr);
     if (provider === "ollama" || provider === "ollama_cloud") {
-      const d = JSON.parse(line);
       return d.message?.thinking || d.message?.reasoning || d.thinking || d.reasoning || null;
     }
     if (provider === "anthropic") {
-      const d = JSON.parse(line);
-      return d.delta?.thinking || d.delta?.text_delta?.thinking || null;
+      // Anthropic extended thinking: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"..."}}
+      if (d.type === "content_block_delta" && d.delta?.type === "thinking_delta") return d.delta.thinking || null;
+      return null;
     }
-    if (line.startsWith("data: ")) {
-      const j = line.slice(6).trim();
-      if (j === "[DONE]") return null;
-      const d = JSON.parse(j);
-      const delta = d.choices?.[0]?.delta || {};
-      return delta.reasoning_content || delta.reasoning || delta.thinking || null;
-    }
+    // OpenAI-compat (DeepSeek, OpenRouter reasoning, etc.)
+    const delta = d.choices?.[0]?.delta || {};
+    return delta.reasoning_content || delta.reasoning || delta.thinking || null;
   } catch {
     return null;
   }
-  return null;
 }
 
 // ─── Agent action parser ──────────────────────────────────────────────────────
