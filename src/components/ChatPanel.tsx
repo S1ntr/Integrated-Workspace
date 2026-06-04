@@ -1128,9 +1128,10 @@ export const ChatPanel: React.FC<{
   };
 
   const [cloudModels, setCloudModels] = useState<ModelEntry[]>([]);
-  // Cache: provider → fetched entries. Cleared when config changes so newly
-  // added providers get fetched immediately without waiting for the next poll.
+  // Cache: provider → fetched entries. Only entries for changed providers are
+  // invalidated so existing providers serve from cache immediately.
   const cloudModelCacheRef = useRef<Partial<Record<string, ModelEntry[]>>>({});
+  const prevConfiguredProvidersRef = useRef<Set<string>>(new Set());
   const [modelSearch, setModelSearch] = useState("");
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
@@ -1461,11 +1462,22 @@ export const ChatPanel: React.FC<{
   // concurrently and results are cached so re-renders don't trigger extra calls.
   useEffect(() => {
     if (!config) return;
-    // Reset cache when config changes so newly added providers get fetched fresh
-    cloudModelCacheRef.current = {};
 
     const CLOUD_PROVIDERS_IDS = Object.keys(PROVIDER_NAMES);
     const keys = config.api_keys || {};
+
+    // Invalidate cache only for providers whose key status changed (added/removed).
+    // Keeps cached results for unchanged providers so they appear instantly.
+    const configuredNow = new Set(
+      CLOUD_PROVIDERS_IDS.filter(p => keys[p] && (keys[p] as string).length > 5)
+    );
+    for (const prov of configuredNow) {
+      if (!prevConfiguredProvidersRef.current.has(prov)) delete cloudModelCacheRef.current[prov];
+    }
+    for (const prov of prevConfiguredProvidersRef.current) {
+      if (!configuredNow.has(prov)) delete cloudModelCacheRef.current[prov];
+    }
+    prevConfiguredProvidersRef.current = configuredNow;
 
     const fetchCloud = async () => {
       const results = await Promise.allSettled(
@@ -1533,8 +1545,10 @@ export const ChatPanel: React.FC<{
       const local = prev.filter(m => m.type === "local");
       const visibleCloud = cloudModels.filter(m => !disabledProvidersRef.current.has(m.provider));
       const merged = [...visibleCloud, ...local];
-      // Auto-select first model if current selection is not in the visible list
-      if (!merged.some(m => m.value === selectedModelRef.current) && merged.length > 0) {
+      // Auto-select first model only when there is no saved selection (e.g. first
+      // launch). If a model is already saved, leave it alone — its provider may
+      // still be loading and would appear once the fetch completes.
+      if (!selectedModelRef.current && merged.length > 0) {
         selectModel(merged[0].value, merged[0].provider);
       }
       return merged;
