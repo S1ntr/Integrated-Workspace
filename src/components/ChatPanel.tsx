@@ -1120,6 +1120,10 @@ export const ChatPanel: React.FC<{
   const [disabledProviders, setDisabledProviders] = useState<Set<string>>(new Set());
   const disabledProvidersRef = useRef<Set<string>>(new Set());
 
+  // Local provider models (Ollama / LM Studio) stored separately to prevent
+  // the cloud-merge effect from accidentally wiping them on each cloudModels update.
+  const [localModels, setLocalModels] = useState<ModelEntry[]>([]);
+
   /** Select a model and persist immediately to config.json */
   const selectModel = (value: string, provider: string) => {
     setSelectedModel(value);
@@ -1512,7 +1516,8 @@ export const ChatPanel: React.FC<{
   }, [config]);
 
   // ── Local provider polling (LM Studio + Ollama) ────────────────────────────
-  // Poll every 8 s so newly downloaded models appear without a restart.
+  // Poll every 5 s. Results go into localModels state which is merged cleanly
+  // by the effect below — no risk of being overwritten by cloudModels updates.
   useEffect(() => {
     if (!config) return;
     const pollLocal = async () => {
@@ -1520,39 +1525,33 @@ export const ChatPanel: React.FC<{
       try {
         const lmUrl = (config.lmstudio_url || "http://localhost:1234").replace(/\/+$/, "");
         const d = JSON.parse(await invoke<string>("curl_get", { url: `${lmUrl}/v1/models` }));
-        for (const m of d.data) local.push({ value: m.id, provider: "lmstudio", providerName: "LM Studio", type: "local" });
+        for (const m of d.data) local.push({ value: m.id, label: m.id, provider: "lmstudio", providerName: "LM Studio", type: "local" });
       } catch {}
       try {
         const olUrl = (config.ollama_url || "http://localhost:11434").replace(/\/+$/, "");
         const d = JSON.parse(await invoke<string>("curl_get", { url: `${olUrl}/api/tags` }));
-        for (const m of d.models) local.push({ value: m.name, provider: "ollama", providerName: "Ollama", type: "local" });
+        for (const m of d.models) local.push({ value: m.name, label: m.name, provider: "ollama", providerName: "Ollama", type: "local" });
       } catch {}
-      setModels(prev => {
-        const cloud = prev.filter(m => m.type === "cloud");
-        return [...cloud, ...local];
-      });
+      setLocalModels(local);
     };
     pollLocal();
-    const t = setInterval(pollLocal, 8000);
+    const t = setInterval(pollLocal, 5000);
     return () => clearInterval(t);
   }, [config]);
 
   // ── Merge cloud + local into the combined models list ─────────────────────
   useEffect(() => {
-    setModels(prev => {
-      const local = prev.filter(m => m.type === "local");
-      const visibleCloud = cloudModels.filter(m => !disabledProvidersRef.current.has(m.provider));
-      const merged = [...visibleCloud, ...local];
-      // Auto-select first model only when there is no saved selection (e.g. first
-      // launch). If a model is already saved, leave it alone — its provider may
-      // still be loading and would appear once the fetch completes.
-      if (!selectedModelRef.current && merged.length > 0) {
-        selectModel(merged[0].value, merged[0].provider);
-      }
-      return merged;
-    });
+    const visibleCloud = cloudModels.filter(m => !disabledProvidersRef.current.has(m.provider));
+    const merged = [...visibleCloud, ...localModels];
+    // Auto-select first model only when there is no saved selection (e.g. first
+    // launch). If a model is already saved, leave it alone — its provider may
+    // still be loading and would appear once the fetch completes.
+    if (!selectedModelRef.current && merged.length > 0) {
+      selectModel(merged[0].value, merged[0].provider);
+    }
+    setModels(merged);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cloudModels, disabledProviders]);
+  }, [cloudModels, localModels, disabledProviders]);
 
   // ── Load installed skills (and refresh when user installs/uninstalls) ────────
   useEffect(() => {
