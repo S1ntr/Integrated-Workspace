@@ -821,9 +821,14 @@ pub struct AppConfig {
     pub api_keys: HashMap<String, String>,
     #[serde(default)]
     pub disabled_providers: Vec<String>,
+    /// "ask" = Accept Only (default): show confirmation before read_file/exec_cmd
+    /// "bypass" = Bypass Permissions: execute all chat tools immediately
+    #[serde(default = "default_ask")]
+    pub chat_tool_mode: String,
 }
 
 fn default_true() -> bool { true }
+fn default_ask() -> String { "ask".into() }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -837,6 +842,7 @@ impl Default for AppConfig {
             thinking_preview: true,
             api_keys: HashMap::new(),
             disabled_providers: Vec::new(),
+            chat_tool_mode: "ask".into(),
         }
     }
 }

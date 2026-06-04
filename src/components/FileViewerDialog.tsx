@@ -357,6 +357,8 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
   
   // Diff-specific state
   const [diffLines, setDiffLines] = useState<DiffLine[] | null>(null);
+  // When true, show file as "new" (all lines added, ignoring baseline)
+  const [showAsNew, setShowAsNew] = useState<boolean>(false);
 
   // Implicitly always editable
   const [editedContent, setEditedContent] = useState<string>("");
@@ -392,7 +394,12 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
           setContent(text);
           setEditedContent(text);
           if (isDiffMode && baselineContent !== undefined) {
-            setDiffLines(computeLineDiff(baselineContent, text));
+            const lines = computeLineDiff(baselineContent, text);
+            setDiffLines(lines);
+            // Auto-enable "View as new" when the file is a complete rewrite
+            // (no unchanged lines = old and new share nothing meaningful)
+            const unchanged = lines.filter(l => l.type === "unchanged").length;
+            if (unchanged === 0 && lines.length > 0) setShowAsNew(true);
           }
         }
       } catch (err) {
@@ -606,9 +613,23 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
                 )}
               </div>
             </div>
-            <button className="stng-close" onClick={onClose}>
-              <i className="bx bx-x" />
-            </button>
+            <div className="file-viewer-actions" style={{ gap: "6px" }}>
+              {!loading && !error && diffLines && (
+                <button
+                  type="button"
+                  className={`stng-btn ${showAsNew ? "stng-btn-primary" : "stng-btn-ghost"}`}
+                  onClick={() => setShowAsNew(v => !v)}
+                  title={showAsNew ? "Show diff vs baseline" : "Show as new file (all added lines)"}
+                  style={{ fontSize: "11px" }}
+                >
+                  <i className={`bx ${showAsNew ? "bx-git-compare" : "bx-file-blank"}`} />
+                  {showAsNew ? "Show diff" : "View as new"}
+                </button>
+              )}
+              <button className="stng-close" onClick={onClose}>
+                <i className="bx bx-x" />
+              </button>
+            </div>
           </div>
 
           <div className="stng-body file-viewer-body">
@@ -627,19 +648,25 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
             ) : diffLines ? (
               <div className="code-editor-viewport diff-full-viewport">
                 <div className="diff-scroll" ref={diffScrollRef} onScroll={handleDiffScroll} style={{ flex: 1, overflow: "auto", fontFamily: "var(--font-mono)", fontSize: "13px", lineHeight: "1.55", padding: "8px 0" }}>
-                  {diffLines.length === 0 && (
-                    <div className="diff-empty-line">This file is empty, so there are no changed lines to display yet.</div>
-                  )}
-                  {diffLines.map((line, i) => (
-                    <div key={i} className={`diff-line ${line.type}`} style={{ height: "20.15px" }}>
-                      <span className="diff-ln diff-ln-old">{line.oldLine ?? ""}</span>
-                      <span className="diff-ln diff-ln-new">{line.newLine ?? ""}</span>
-                      <span style={{ width: "18px", flexShrink: 0, textAlign: "center", color: line.type === "added" ? "var(--ok)" : line.type === "removed" ? "var(--err)" : "var(--text-3)", fontSize: "12px", userSelect: "none" }}>
-                        {line.type === "added" ? "+" : line.type === "removed" ? "−" : " "}
-                      </span>
-                      <span style={{ whiteSpace: "pre", color: "var(--text-1)", paddingRight: "16px" }}>{line.text || " "}</span>
-                    </div>
-                  ))}
+                  {/* When showAsNew: render only the current file content as all-added lines */}
+                  {(() => {
+                    const displayLines = showAsNew
+                      ? content.split("\n").map((text, i) => ({ type: "added" as const, text, newLine: i + 1 }))
+                      : diffLines;
+                    if (displayLines.length === 0) {
+                      return <div className="diff-empty-line">This file is empty, so there are no changed lines to display yet.</div>;
+                    }
+                    return displayLines.map((line, i) => (
+                      <div key={i} className={`diff-line ${line.type}`} style={{ height: "20.15px" }}>
+                        <span className="diff-ln diff-ln-old">{!showAsNew ? (line.oldLine ?? "") : ""}</span>
+                        <span className="diff-ln diff-ln-new">{line.newLine ?? ""}</span>
+                        <span style={{ width: "18px", flexShrink: 0, textAlign: "center", color: line.type === "added" ? "var(--ok)" : line.type === "removed" ? "var(--err)" : "var(--text-3)", fontSize: "12px", userSelect: "none" }}>
+                          {line.type === "added" ? "+" : line.type === "removed" ? "−" : " "}
+                        </span>
+                        <span style={{ whiteSpace: "pre", color: "var(--text-1)", paddingRight: "16px" }}>{line.text || " "}</span>
+                      </div>
+                    ));
+                  })()}
                 </div>
               </div>
             ) : null}

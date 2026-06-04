@@ -247,6 +247,7 @@ const TABS = [
   { id: "skills",     label: "Skills",     icon: "bx-extension" },
   { id: "behavior",   label: "Behavior",   icon: "bx-slider" },
   { id: "appearance", label: "Appearance", icon: "bx-palette" },
+  { id: "security",   label: "Security",   icon: "bx-shield" },
 ];
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
@@ -260,6 +261,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
     streaming: true,
     thinking_preview: true,
     api_keys: {},
+    chat_tool_mode: "ask",
   });
 
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
@@ -317,7 +319,8 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
           streaming: loaded.streaming ?? true,
           thinking_preview: loaded.thinking_preview ?? true,
           api_keys: loaded.api_keys || {},
-        });
+          chat_tool_mode: (loaded as any).chat_tool_mode || "ask",
+        } as any);
         Object.entries(loaded.api_keys || {}).forEach(([k, v]) => {
           if (v && v.length > 5) setKeyStatus(prev => ({ ...prev, [k]: "ok" }));
         });
@@ -862,6 +865,53 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                         <span className="font-option-name" style={{ fontFamily: f.value }}>{f.label}</span>
                         <span className="font-option-meta">{f.category}</span>
                       </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+          {/* ── Security tab ── */}
+          {activeTab === "security" && (
+            <div className="stng-tab-content">
+              <div className="stng-section">
+                <div className="stng-section-header">
+                  <i className="bx bx-shield" />
+                  <span>Chat Tool Permissions</span>
+                </div>
+                <div className="stng-section-body">
+                  <p className="stng-section-desc">
+                    Controls whether the AI can run <code>read_file</code> and <code>exec_cmd</code> tools automatically or needs your approval first.
+                  </p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginTop: "8px" }}>
+                    {([
+                      {
+                        value: "ask",
+                        label: "Accept Only (Recommended)",
+                        desc: "AI tool calls (file reads, commands) show a confirmation prompt before executing. You approve or deny each one.",
+                        icon: "bx-check-shield",
+                      },
+                      {
+                        value: "bypass",
+                        label: "Bypass Permissions",
+                        desc: "All AI tool calls execute immediately without confirmation. Faster but less control.",
+                        icon: "bx-bolt-circle",
+                      },
+                    ] as { value: string; label: string; desc: string; icon: string }[]).map(opt => (
+                      <div
+                        key={opt.value}
+                        className={`stng-perm-option ${(config as any).chat_tool_mode === opt.value ? "active" : ""}`}
+                        onClick={() => setConfig(prev => ({ ...prev, chat_tool_mode: opt.value } as any))}
+                      >
+                        <i className={`bx ${opt.icon} stng-perm-icon`} />
+                        <div className="stng-perm-text">
+                          <span className="stng-perm-label">{opt.label}</span>
+                          <span className="stng-perm-desc">{opt.desc}</span>
+                        </div>
+                        <div className={`stng-perm-radio ${(config as any).chat_tool_mode === opt.value ? "checked" : ""}`} />
+                      </div>
                     ))}
                   </div>
                 </div>

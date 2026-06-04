@@ -1166,6 +1166,10 @@ export const ChatPanel: React.FC<{
   const [selectedCloudProvider, setSelectedCloudProvider] = useState("openai");
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [thinkingPreviewEnabled, setThinkingPreviewEnabled] = useState(true);
+  // "ask" = Accept Only (default), "bypass" = execute tools without confirmation
+  const [chatToolMode, setChatToolMode] = useState<"ask" | "bypass">("ask");
+  // Pending tool approvals: id → executor function
+  const pendingApprovalsRef = useRef<Map<string, () => void>>(new Map());
   const [chatMode, setChatMode] = useState<"build" | "plan">("build");
   const [pendingPlan, setPendingPlan] = useState<PendingPlan | null>(null);
   // ── Installed skills ───────────────────────────────────────────────────────
@@ -1351,6 +1355,9 @@ export const ChatPanel: React.FC<{
       // Persist disabled provider list
       if (Array.isArray(loaded.disabled_providers)) {
         setDisabledProviders(new Set(loaded.disabled_providers as string[]));
+      }
+      if (loaded.chat_tool_mode === "bypass" || loaded.chat_tool_mode === "ask") {
+        setChatToolMode(loaded.chat_tool_mode);
       }
     } catch {}
   };
@@ -2512,47 +2519,90 @@ export const ChatPanel: React.FC<{
       }
 
       if (action.type === "read_file" && action.filePath) {
-        updateToolLog(logId, "running", `Reading ${action.filePath}`);
-        invoke<string>("read_file_content", { filePath: action.filePath })
-          .then(content => {
-            const lines = content.split("\n").length;
-            const preview = content.slice(0, 3000);
-            updateToolLog(logId, "done", `${lines} lines`);
-            setMsgs(p => [...p, {
-              id: `rf-${Date.now()}`,
-              role: "ai" as const,
-              agent: "system" as const,
-              body: `**File:** \`${action.filePath}\`\n\`\`\`\n${preview}${content.length > 3000 ? "\n…[clipped]" : ""}\n\`\`\``,
-              ts: ts(),
-            }]);
-          })
-          .catch(err => updateToolLog(logId, "failed", String(err)));
+        // Resolve relative paths against the workspace directory
+        const rawPath = action.filePath;
+        const isAbsolute = /^([A-Za-z]:[\\\/]|\/|\\\\)/.test(rawPath);
+        const resolvedPath = (!isAbsolute && workspaceDir)
+          ? `${workspaceDir}\\${rawPath.replace(/\//g, "\\")}` : rawPath;
+
+        const executeReadFile = () => {
+          updateToolLog(logId, "running", `Reading ${rawPath}`);
+          invoke<string>("read_file_content", { filePath: resolvedPath })
+            .then(content => {
+              const lines = content.split("\n").length;
+              const preview = content.slice(0, 3000);
+              updateToolLog(logId, "done", `${lines} lines`);
+              setMsgs(p => [...p, {
+                id: `rf-${Date.now()}`,
+                role: "ai" as const,
+                agent: "system" as const,
+                body: `**File:** \`${rawPath}\`\n\`\`\`\n${preview}${content.length > 3000 ? "\n…[clipped]" : ""}\n\`\`\``,
+                ts: ts(),
+              }]);
+            })
+            .catch(err => updateToolLog(logId, "failed", String(err)));
+        };
+
+        if (chatToolMode === "bypass") {
+          executeReadFile();
+        } else {
+          // Ask mode: show approval message
+          const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2,5)}`;
+          pendingApprovalsRef.current.set(approvalId, executeReadFile);
+          updateToolLog(logId, "waiting", `Awaiting approval`);
+          setMsgs(p => [...p, {
+            id: approvalId,
+            role: "ai" as const,
+            agent: "system" as const,
+            body: `🔒 **Permission Request:** AI wants to read \`${rawPath}\`.\n\nAllow this action?`,
+            pendingApproval: { approvalId, logId, denyLabel: "Deny read_file" },
+            ts: ts(),
+          } as any]);
+        }
       }
 
       if (action.type === "exec_cmd" && action.cmdString) {
-        updateToolLog(logId, "running", action.cmdString);
-        invoke<string>("run_command_in_dir", { cmd: action.cmdString, dir: workspaceDir || "." })
-          .then(output => {
-            const preview = output.trim().slice(0, 2000);
-            updateToolLog(logId, "done", preview.split("\n").slice(0, 2).join(" "));
-            setMsgs(p => [...p, {
-              id: `ec-${Date.now()}`,
-              role: "ai" as const,
-              agent: "system" as const,
-              body: `**$** \`${action.cmdString}\`\n\`\`\`\n${preview}${output.length > 2000 ? "\n…[clipped]" : ""}\n\`\`\``,
-              ts: ts(),
-            }]);
-          })
-          .catch(err => {
-            updateToolLog(logId, "failed", String(err));
-            setMsgs(p => [...p, {
-              id: `ec-err-${Date.now()}`,
-              role: "ai" as const,
-              agent: "system" as const,
-              body: `**$** \`${action.cmdString}\`\n\`\`\`\n${String(err)}\n\`\`\``,
-              ts: ts(),
-            }]);
-          });
+        const executeCmd = () => {
+          updateToolLog(logId, "running", action.cmdString!);
+          invoke<string>("run_command_in_dir", { cmd: action.cmdString, dir: workspaceDir || "." })
+            .then(output => {
+              const preview = output.trim().slice(0, 2000);
+              updateToolLog(logId, "done", preview.split("\n").slice(0, 2).join(" "));
+              setMsgs(p => [...p, {
+                id: `ec-${Date.now()}`,
+                role: "ai" as const,
+                agent: "system" as const,
+                body: `**$** \`${action.cmdString}\`\n\`\`\`\n${preview}${output.length > 2000 ? "\n…[clipped]" : ""}\n\`\`\``,
+                ts: ts(),
+              }]);
+            })
+            .catch(err => {
+              updateToolLog(logId, "failed", String(err));
+              setMsgs(p => [...p, {
+                id: `ec-err-${Date.now()}`,
+                role: "ai" as const,
+                agent: "system" as const,
+                body: `**$** \`${action.cmdString}\`\n\`\`\`\n${String(err)}\n\`\`\``,
+                ts: ts(),
+              }]);
+            });
+        };
+
+        if (chatToolMode === "bypass") {
+          executeCmd();
+        } else {
+          const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2,5)}`;
+          pendingApprovalsRef.current.set(approvalId, executeCmd);
+          updateToolLog(logId, "waiting", `Awaiting approval`);
+          setMsgs(p => [...p, {
+            id: approvalId,
+            role: "ai" as const,
+            agent: "system" as const,
+            body: `🔒 **Permission Request:** AI wants to run \`${action.cmdString}\`.\n\nAllow this command?`,
+            pendingApproval: { approvalId, logId, denyLabel: "Deny exec_cmd" },
+            ts: ts(),
+          } as any]);
+        }
       }
     }
     if (monitorLabels.length) {
@@ -3386,6 +3436,31 @@ export const ChatPanel: React.FC<{
                             : (m.body ? formatBody(m.body) : null)}
                         {renderAttachments(m.attachments)}
                         {m.streaming && m.body && <span className="chat-stream-cursor" />}
+                        {(m as any).pendingApproval && (
+                          <div className="chat-approval-btns">
+                            <button
+                              className="stng-btn stng-btn-primary"
+                              style={{ fontSize: "11.5px", padding: "5px 12px" }}
+                              onClick={() => {
+                                const { approvalId, logId: aLogId } = (m as any).pendingApproval;
+                                const executor = pendingApprovalsRef.current.get(approvalId);
+                                if (executor) { executor(); pendingApprovalsRef.current.delete(approvalId); }
+                                setMsgs(p => p.map(x => x.id === m.id ? { ...x, pendingApproval: undefined, body: x.body + "\n\n✅ **Approved**" } : x));
+                                updateToolLog(aLogId, "running", "Approved");
+                              }}
+                            >Allow</button>
+                            <button
+                              className="stng-btn stng-btn-ghost"
+                              style={{ fontSize: "11.5px", padding: "5px 12px", color: "var(--err)" }}
+                              onClick={() => {
+                                const { approvalId, logId: aLogId, denyLabel } = (m as any).pendingApproval;
+                                pendingApprovalsRef.current.delete(approvalId);
+                                setMsgs(p => p.map(x => x.id === m.id ? { ...x, pendingApproval: undefined, body: x.body + "\n\n❌ **Denied**" } : x));
+                                updateToolLog(aLogId, "failed", `${denyLabel} denied by user`);
+                              }}
+                            >Deny</button>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
