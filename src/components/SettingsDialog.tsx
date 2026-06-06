@@ -871,7 +871,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
               </div>
             </div>
           )}
-        </div>
 
           {/* ── Security tab ── */}
           {activeTab === "security" && (
