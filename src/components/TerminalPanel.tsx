@@ -106,7 +106,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       letterSpacing:     0,
       cursorBlink:       true,
       cursorStyle:       "block",
-      scrollback:        5000,
+      scrollback:        2000,
       // The app uses a 3px custom xterm scrollbar. FitAddon otherwise assumes
       // the default 14px gutter and under-counts columns in narrow panes.
       overviewRuler:     { width: 3 },

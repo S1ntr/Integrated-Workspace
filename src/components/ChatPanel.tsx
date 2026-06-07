@@ -1463,10 +1463,14 @@ export const ChatPanel: React.FC<{
   // Persistence synchronizations
   useEffect(() => {
     if (!historyHydrated) return;
+    // Skip while any message is streaming — msgs changes on every token, so
+    // writing to disk/localStorage each time causes unnecessary I/O.
+    // The effect re-fires once streaming ends and the final state is persisted.
+    if (msgs.some(m => m.streaming)) return;
     try {
       localStorage.setItem(storageKey("current_msgs"), JSON.stringify(normalizeMessages(msgs)));
     } catch {}
-    
+
     // Save only current active session to the workspace-scoped file
     const cleanMsgs = normalizeMessages(msgs);
     const currentName = cleanMsgs.find(m => m.role === "user")?.body.slice(0, 60) || "Current chat";
@@ -1590,7 +1594,7 @@ export const ChatPanel: React.FC<{
       setLocalProviderOnline(online);
     };
     pollLocal();
-    const t = setInterval(pollLocal, 5000);
+    const t = setInterval(pollLocal, 20000);
     return () => clearInterval(t);
   }, [config]);
 
@@ -1645,7 +1649,7 @@ export const ChatPanel: React.FC<{
       } catch {}
     };
     loadFiles();
-    const id = window.setInterval(loadFiles, 8000);
+    const id = window.setInterval(loadFiles, 30000);
     return () => window.clearInterval(id);
   }, [workspaceDir]);
 

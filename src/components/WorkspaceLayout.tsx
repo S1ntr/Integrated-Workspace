@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Sidebar, FileEntry } from "./Sidebar";
+import { Sidebar } from "./Sidebar";
 import { ChatPanel, type MentionFile, type TerminalTranscriptEntry } from "./ChatPanel";
 import { BrowserOverlay } from "./BrowserOverlay";
 import { TerminalGrid, Session } from "./TerminalGrid";
@@ -342,28 +342,16 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const [terminalOutputs, setTerminalOutputs] = useState<Record<string, string>>({});
   const [terminalTranscripts, setTerminalTranscripts] = useState<Record<string, TerminalTranscriptEntry[]>>({});
 
+  // Lightweight metadata baseline — only mtime + size, no file content.
+  // Used by the scanner to detect changes without reading file bytes.
+  const baselineMetaRef = React.useRef<Record<string, { mtime_secs: number; size: number }>>({});
+
   // Transcript batching — accumulate PTY output chunks per session, flush every 350ms.
   // Prevents flooding transcript (and thus LLM context) with 100s of tiny entries per second.
   const transcriptBatchRef = React.useRef<Record<string, string>>({});
   const transcriptBatchTimerRef = React.useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   // We need a stable reference to appendTerminalTranscript for the batch flush closure.
   const appendTerminalTranscriptRef = React.useRef<((s: Pick<Session, "sessionId" | "label">, k: TerminalTranscriptEntry["kind"], t: string) => void) | null>(null);
-
-  // Helper to recursively collect all file entries (leaves only)
-  const collectAllFiles = (entries: FileEntry[]): FileEntry[] => {
-    const result: FileEntry[] = [];
-    const recurse = (list: FileEntry[]) => {
-      for (const entry of list) {
-        if (entry.is_dir) {
-          if (entry.children) recurse(entry.children);
-        } else {
-          result.push(entry);
-        }
-      }
-    };
-    recurse(entries);
-    return result;
-  };
 
   const appendTerminalTranscript = (
     session: Pick<Session, "sessionId" | "label">,
@@ -390,32 +378,47 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   appendTerminalTranscriptRef.current = appendTerminalTranscript;
 
   // ── Baseline Snapshotting ────────────────────────────────────────────────
+  // Strategy: record file metadata (mtime + size) for ALL files, but only store
+  // file CONTENT for source files ≤ 200 KB. Large files (binaries, lockfiles, etc.)
+  // are tracked by path only so the diff viewer can still mark them as changed.
+  // This prevents the snapshot from consuming hundreds of MB on large projects.
   useEffect(() => {
     if (!directory || !isActive) return;
     void invoke("set_active_workspace", { dirPath: directory });
     if (baselineReady) return;
     setBaselineReady(false);
     setChangedFiles([]);
+    const MAX_CONTENT_BYTES = 200 * 1024; // 200 KB per file
     const takeBaseline = async () => {
       try {
-        // Initialize secure workspace scoping in backend first
         await invoke("set_active_workspace", { dirPath: directory });
 
-        const entries = await invoke<FileEntry[]>("list_files", { dirPath: directory });
-        const files = collectAllFiles(entries);
+        type FileMeta = { path: string; mtime_secs: number; size: number };
+        const fileMetas = await invoke<FileMeta[]>("list_files_meta", { dirPath: directory });
+
+        // Populate metadata ref (no React state — avoids re-renders)
+        const meta: Record<string, { mtime_secs: number; size: number }> = {};
+        for (const f of fileMetas) meta[f.path] = { mtime_secs: f.mtime_secs, size: f.size };
+        baselineMetaRef.current = meta;
+
+        // Read content only for small files — large files kept as empty string markers
         const snapshot: Record<string, string> = {};
-        for (const f of files) {
-          try {
-            const content = await invoke<string>("read_file_content", { filePath: f.path });
-            snapshot[f.path] = content;
-          } catch {
-            snapshot[f.path] = "";
+        for (const f of fileMetas) {
+          if (f.size <= MAX_CONTENT_BYTES) {
+            try {
+              snapshot[f.path] = await invoke<string>("read_file_content", { filePath: f.path });
+            } catch {
+              snapshot[f.path] = "";
+            }
+          } else {
+            snapshot[f.path] = ""; // tracked but content not loaded
           }
         }
         setBaselineSnapshot(snapshot);
         setBaselineReady(true);
       } catch (err) {
         console.error("Failed to take baseline snapshot:", err);
+        baselineMetaRef.current = {};
         setBaselineSnapshot({});
         setBaselineReady(true);
       }
@@ -423,29 +426,26 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     takeBaseline();
   }, [directory, isActive, baselineReady]);
 
-  // ── Periodic Files Scanner (every 2.5s) ──────────────────────────────────
+  // ── Periodic Files Scanner (every 5s) ────────────────────────────────────
+  // Uses file metadata (mtime + size) instead of reading file contents, so a
+  // scan on a 10 000-file project costs ~0 bytes of heap vs. the old approach
+  // which read every file on every tick.
   useEffect(() => {
     if (!directory || !baselineReady || !isActive) return;
 
     const scan = async () => {
       try {
-        const entries = await invoke<FileEntry[]>("list_files", { dirPath: directory });
-        const currentFiles = collectAllFiles(entries);
+        type FileMeta = { path: string; mtime_secs: number; size: number };
+        const fileMetas = await invoke<FileMeta[]>("list_files_meta", { dirPath: directory });
         const changes: ChangedFile[] = [];
 
-        for (const f of currentFiles) {
-          if (!Object.prototype.hasOwnProperty.call(baselineSnapshot, f.path)) {
-            // Created file
-            changes.push({ name: f.name, path: f.path, status: "new" });
-          } else {
-            // Modified file
-            try {
-              const currentContent = await invoke<string>("read_file_content", { filePath: f.path });
-              const baselineContent = baselineSnapshot[f.path];
-              if (currentContent !== baselineContent) {
-                changes.push({ name: f.name, path: f.path, status: "modified" });
-              }
-            } catch {}
+        for (const f of fileMetas) {
+          const name = f.path.split(/[\\/]/).pop() || f.path;
+          const baseMeta = baselineMetaRef.current[f.path];
+          if (!baseMeta) {
+            changes.push({ name, path: f.path, status: "new" });
+          } else if (baseMeta.mtime_secs !== f.mtime_secs || baseMeta.size !== f.size) {
+            changes.push({ name, path: f.path, status: "modified" });
           }
         }
         setChangedFiles(changes);
@@ -455,9 +455,10 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     };
 
     scan();
-    const id = setInterval(scan, 2500);
+    const id = setInterval(scan, 5000);
     return () => clearInterval(id);
-  }, [directory, baselineSnapshot, baselineReady, isActive]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [directory, baselineReady, isActive]);
 
 
 

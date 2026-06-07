@@ -209,25 +209,27 @@ fn pty_create(
     let sid = session_id.clone();
     let app_clone = app.clone();
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
+        // Pre-compute event names once — avoids a heap allocation per read() call.
+        let data_event = format!("pty-data-{}", sid);
+        let exit_event = format!("pty-exit-{}", sid);
+        // Larger buffer reduces syscall frequency for high-throughput agents.
+        let mut buf = [0u8; 8192];
         let mut partial: Vec<u8> = Vec::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    // Prepend any bytes left from previous incomplete UTF-8 sequence
                     if partial.is_empty() {
-                        match String::from_utf8(buf[..n].to_vec()) {
+                        // Fast path: try to interpret bytes as UTF-8 without allocating.
+                        match std::str::from_utf8(&buf[..n]) {
                             Ok(s) => {
-                                let event_name = format!("pty-data-{}", sid);
-                                let _ = app_clone.emit(&event_name, s);
+                                let _ = app_clone.emit(&data_event, s);
                             }
                             Err(e) => {
-                                let valid = e.utf8_error().valid_up_to();
+                                let valid = e.valid_up_to();
                                 if valid > 0 {
-                                    if let Ok(s) = String::from_utf8(buf[..valid].to_vec()) {
-                                        let event_name = format!("pty-data-{}", sid);
-                                        let _ = app_clone.emit(&event_name, s);
+                                    if let Ok(s) = std::str::from_utf8(&buf[..valid]) {
+                                        let _ = app_clone.emit(&data_event, s);
                                     }
                                 }
                                 partial = buf[valid..n].to_vec();
@@ -237,16 +239,14 @@ fn pty_create(
                         partial.extend_from_slice(&buf[..n]);
                         match String::from_utf8(std::mem::take(&mut partial)) {
                             Ok(s) => {
-                                let event_name = format!("pty-data-{}", sid);
-                                let _ = app_clone.emit(&event_name, s);
+                                let _ = app_clone.emit(&data_event, s);
                             }
                             Err(e) => {
                                 let valid = e.utf8_error().valid_up_to();
                                 let bytes = e.into_bytes();
                                 if valid > 0 {
-                                    if let Ok(s) = String::from_utf8(bytes[..valid].to_vec()) {
-                                        let event_name = format!("pty-data-{}", sid);
-                                        let _ = app_clone.emit(&event_name, s);
+                                    if let Ok(s) = std::str::from_utf8(&bytes[..valid]) {
+                                        let _ = app_clone.emit(&data_event, s);
                                     }
                                 }
                                 partial = bytes[valid..].to_vec();
@@ -257,14 +257,11 @@ fn pty_create(
                 Err(_) => break,
             }
         }
-        // Flush any remaining partial bytes
         if !partial.is_empty() {
             let s = String::from_utf8_lossy(&partial).to_string();
-            let event_name = format!("pty-data-{}", sid);
-            let _ = app_clone.emit(&event_name, s);
+            let _ = app_clone.emit(&data_event, s);
         }
-        // Emit exit event
-        let _ = app_clone.emit(&format!("pty-exit-{}", sid), ());
+        let _ = app_clone.emit(&exit_event, ());
     });
 
     Ok(())
@@ -424,6 +421,58 @@ fn read_file_content(file_path: &str, state: State<'_, WorkspaceState>) -> Resul
     let roots = workspace_roots(&state)?;
     let canonical_file = validate_in_workspace(file_path, &roots)?;
     fs::read_to_string(canonical_file).map_err(|e| e.to_string())
+}
+
+/// Lightweight file metadata scan — returns path + mtime + size for every file
+/// in the workspace tree, without reading any file contents.
+/// Used by the frontend change-detector so it can compare files by metadata
+/// instead of re-reading full content on every poll tick.
+#[derive(Serialize, Clone)]
+pub struct FileMetaEntry {
+    pub path: String,
+    pub mtime_secs: u64,
+    pub size: u64,
+}
+
+#[tauri::command]
+fn list_files_meta(dir_path: &str, state: State<'_, WorkspaceState>) -> Result<Vec<FileMetaEntry>, String> {
+    let roots = workspace_roots(&state)?;
+    let canonical_dir = validate_in_workspace(dir_path, &roots)?;
+
+    fn collect(dir: &Path, depth: usize, out: &mut Vec<FileMetaEntry>) {
+        if depth > 4 { return; }
+        let Ok(rd) = fs::read_dir(dir) else { return; };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                // Same block-list as list_files
+                if name == "node_modules" || name == "target" || name == "dist"
+                    || name == "build" || name == ".git" || name == ".idea"
+                    || name == ".vscode" || name == ".next" || name == ".nuxt"
+                    || name == "__pycache__" || name.starts_with('.')
+                {
+                    continue;
+                }
+                collect(&path, depth + 1, out);
+            } else if let Ok(meta) = entry.metadata() {
+                let mtime_secs = meta.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                out.push(FileMetaEntry {
+                    path: path.to_string_lossy().into_owned(),
+                    mtime_secs,
+                    size: meta.len(),
+                });
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    collect(&canonical_dir, 0, &mut entries);
+    Ok(entries)
 }
 
 fn validate_parent_in_workspace(target_path_str: &str, workspace_roots: &[String]) -> Result<std::path::PathBuf, String> {
@@ -1400,23 +1449,22 @@ fn validate_url(url: &str) -> Result<(), String> {
 #[tauri::command]
 async fn curl_get(url: String) -> Result<String, String> {
     validate_url(&url)?;
-    
+
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::process::Command::new("curl")
-            .args(&["-s", "-N", &url])
+            .args(&["-s", &url])
             .output(),
     )
     .await
     .map_err(|_| "Request timed out after 30 seconds.".to_string())?
     .map_err(|e| format!("Failed to execute curl: {}", e))?;
-    
+
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(stdout)
+        Ok(String::from_utf8(output.stdout)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        Err(format!("curl error: {}", stderr))
+        Err(format!("curl error: {}", String::from_utf8_lossy(&output.stderr)))
     }
 }
 
@@ -1606,20 +1654,23 @@ async fn curl_post_stream(
     let reader = tokio::io::BufReader::new(stdout);
     let mut lines = reader.lines();
     
-    let sid = session_id.clone();
     let app_clone = app.clone();
-    
+    // Pre-compute event names to avoid a heap allocation on every streamed token.
+    let chunk_event = format!("stream-chunk-{}", session_id);
+    let done_event  = format!("stream-done-{}", session_id);
+
     loop {
         let timeout_result = tokio::time::timeout(
             std::time::Duration::from_secs(300),
             lines.next_line(),
         ).await;
-        
+
         match timeout_result {
             Ok(Ok(Some(line))) => {
-                let trimmed = line.trim().to_string();
+                let trimmed = line.trim();
                 if !trimmed.is_empty() {
-                    let _ = app_clone.emit(&format!("stream-chunk-{}", sid), &trimmed);
+                    // Emit &str directly — no extra String allocation per token.
+                    let _ = app_clone.emit(&chunk_event, trimmed);
                 }
             }
             Ok(Ok(None)) => break, // EOF
@@ -1627,13 +1678,13 @@ async fn curl_post_stream(
             Err(_) => break,       // timeout
         }
     }
-    
+
     // Unregister and emit done
     {
         let mut streams = state.0.lock().map_err(|e| format!("Lock failed: {}", e))?;
         streams.remove(&session_id);
     }
-    let _ = app.emit(&format!("stream-done-{}", session_id), ());
+    let _ = app.emit(&done_event, ());
     
     // Wait for curl to finish (ignore errors – we already got the data)
     let _ = child.wait().await;
@@ -2429,6 +2480,7 @@ pub fn run() {
             copy_item,
             move_item,
             paste_external_file,
+            list_files_meta,
             run_command_in_dir,
             reveal_in_explorer,
             get_clipboard_file_paths,
