@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useNotify } from "./Notification";
@@ -141,7 +141,7 @@ interface WorkMonitor {
   id: string;
   startedAt: number;
   actions: number;
-  labels: string[];
+  sessionIds: string[];
 }
 
 interface ModelEntry {
@@ -204,7 +204,7 @@ function buildSkillFileRef(skills: InstalledSkill[], filePaths: string[]): strin
 }
 
 /** Render a SkillLog entry (similar to renderToolLog). Pure function, no hooks. */
-function renderSkillLog(log: SkillLog): React.ReactNode {
+export function renderSkillLog(log: SkillLog): React.ReactNode {
   const statusIcon = log.status === "detected" ? "bx-search"
     : log.status === "file_written" ? "bx-file"
     : log.status === "failed" ? "bx-error-circle"
@@ -257,6 +257,7 @@ const PROVIDER_NAMES: Record<string, string> = {
   openai: "OpenAI", anthropic: "Anthropic", deepseek: "DeepSeek",
   mistral: "Mistral", google: "Google", grok: "Grok",
   together: "Together AI", openrouter: "OpenRouter", ollama_cloud: "Ollama Cloud",
+  nvidia: "NVIDIA NIM",
 };
 
 // ─── Markdown helpers ─────────────────────────────────────────────────────────
@@ -550,23 +551,31 @@ function detectTerminalQuestion(text: string): string | null {
   return null;
 }
 
-function detectAgentCompletionSummary(text: string): string | null {
+export function detectAgentCompletionSummary(text: string): string | null {
   const cleaned = stripAnsi(text).trim();
   if (!cleaned) return null;
   const lines = cleaned.split("\n").map(l => l.trim()).filter(Boolean).slice(-18);
-  const joined = lines.join("\n");
+  
+  // Filter out TUI status bars, hotkey reminders, progress indicators, or raw terminal block elements
+  const textLines = lines.filter(line => {
+    if (/^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(line)) return false;
+    if (looksLikeTerminalNoise(line)) return false;
+    if (/\b(ctrl\+p|ctrl\+c|commands|hotkeys)\b/i.test(line)) return false;
+    return true;
+  });
+
+  const joined = textLines.join("\n");
   if (detectTerminalQuestion(joined)) return null;
-  if (looksLikeTerminalNoise(joined)) return null;
+  
   if (!/\b(summary|changes made|task complete|completed|finished|all set|done|implemented|fixed)\b/i.test(joined)) {
     return null;
   }
-  if (/\b(let me|i will|i'll|going to|updating todos|checking|reading)\b/i.test(lines.slice(-4).join(" "))) {
+  if (/\b(let me|i will|i'll|going to|updating todos|checking|reading)\b/i.test(textLines.slice(-4).join(" "))) {
     return null;
   }
-  const summaryLines = lines
-    .filter(line => !/^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(line))
+  
+  const summaryLines = textLines
     .filter(line => !/^thought:?/i.test(line))
-    .filter(line => !looksLikeTerminalNoise(line))
     .slice(-8);
   const summary = summaryLines.join("\n").slice(0, 900);
   if (!summary || looksLikeTerminalNoise(summary)) return null;
@@ -705,7 +714,7 @@ Classify the request first, then pick the right agent count:
 When in doubt, go ONE step LOWER on agent count.
 
 ## Coordination Rules
-1. **AVOID UNNECESSARY SPAWNS**: DO NOT spawn or use multiple agents for simple, minor, or single-file tasks. If the user's request is straightforward (e.g., a simple bug fix, modifying a single file, writing a small script, or answering a question), use a single agent (like \`claude\` or \`opencode\`) to handle the entire request.
+1. **AVOID UNNECESSARY SPAWNS**: Do not *spawn new* sessions for simple, minor, or single-file tasks. However, if the user already has multiple active sessions open in the workspace, prefer to distribute and parallelize sub-tasks among all of them (e.g. dividing file research, test runs, and edits) to maximize speed, rather than letting active agents sit idle or closing them. Never kill or close active terminal sessions unless the user explicitly requests it.
 2. **SCALE UP FOR COMPLEX WORK**: For large projects with many independent concerns, spawn agents to fill the available terminal slots (up to the limit shown above). Parallel work on independent modules/layers saves significant time. Do NOT bottleneck a large project through a single terminal.
 3. **REUSE ACTIVE SESSIONS**: ALWAYS prefer sending tasks to already active sessions. If a running active session listed under "Active Sessions" above can handle the task, use \`agent.send\` to send the prompt to it. Do not spawn a new session if a matching/compatible session already exists.
 4. Unique descriptive labels: "HTML Builder", "CSS Stylist", "JS Developer", etc.
@@ -720,6 +729,10 @@ When in doubt, go ONE step LOWER on agent count.
 13. After dispatching, briefly summarize what each agent is doing (visible to user)
 14. The user may mention files with @filename, @path/file, or quoted @"path with spaces". Pass exact resolved paths to agents and tell them to inspect those files before editing. If a mention is unresolved, tell the agent to locate it with workspace search before touching files.
 15. When all dispatched agents are quiet and no unanswered questions remain, provide one concise final project-ready summary with changed files, verification, risks, and run/preview hints. Avoid repeating noisy terminal UI output.
+16. **UNIQUE SUB-TASKS ONLY**: Each agent MUST receive a completely unique, specialized sub-task prompt. You MUST NOT send the exact same prompt or instructions to multiple agents. Work MUST be partitioned and divided logically between them. If you partition work across multiple parallel agents, you (the Orchestrator) must manage the aggregation: wait for all worker agents to finish, collect their outputs from the console logs, and pass that information to a synthesis/report agent. Do not instruct an agent to look at or wait for another terminal.
+17. **COORDINATED DISPATCH (WAIT FOR ALL AGENTS)**: You MUST wait for ALL active agents in the context to complete their tasks (i.e. all monitored sessions must finish running, showing summaries/questions, or exiting) before you dispatch the next set of prompts or prompt any agent again. Do not dispatch follow-up prompts or intermediate tasks dynamically while other agents are still actively working. Analyze the collective output of all completed agents before issuing the next coordinated prompts.
+18. **CONTEXT-AWARE TERMINAL SUITABILITY**: When deciding which remaining active agents to prompt, analyze which agent's terminal context (their history, tools, and written files) is most suitable for the sub-task, rather than routing tasks arbitrarily or showing favoritism to a single terminal.
+19. **ISOLATED AGENTS PROTOCOL**: Remember that terminal sessions/agents are completely isolated. They do not share memory, context, or terminal history. They cannot communicate, coordinate, or wait for one another. You (the Orchestrator) are the sole dispatcher and data router. If Agent B needs information from Agent A's work, you must wait for Agent A to finish, extract Agent A's output from the chat context, and explicitly paste it into the prompt you send to Agent B. ⚠️ **CRITICAL: NEVER tell an agent to look at the terminal history, console transcripts, or output of another agent. They have NO access to them. You (the Orchestrator) MUST copy the completed text/findings from your context and paste it into the prompt yourself.**
 
 ## Installed Skills
 These are custom agent capabilities installed in the workspace. If any of these are relevant to the user request, you should direct your CLI agents to apply/use them. For example, instruct the spawned CLI agent to follow the instructions in the attached skill block.
@@ -811,7 +824,7 @@ function normalizeMessages(raw: any): Msg[] {
     .filter(msg => msg.agent !== "diff") as Msg[];
 }
 
-function summarySignature(text: string): string {
+export function summarySignature(text: string): string {
   return compactText(
     stripAnsi(text)
       .toLowerCase()
@@ -838,13 +851,16 @@ function extractLocalUrls(outputs: Record<string, string>): string[] {
   ))).slice(0, 4);
 }
 
-function buildAgentsReadySummary(
+export function buildAgentsReadySummary(
   monitor: WorkMonitor,
   sessions: Session[],
   outputs: Record<string, string>,
   changedFiles: ChatDiffFile[],
 ): string {
-  const labels = monitor.labels.length ? monitor.labels.join(", ") : `${monitor.actions} agent action${monitor.actions === 1 ? "" : "s"}`;
+  const labelsList = monitor.sessionIds
+    .map(sid => sessions.find(s => s.sessionId === sid)?.label)
+    .filter(Boolean) as string[];
+  const labels = labelsList.length ? labelsList.join(", ") : `${monitor.actions} agent action${monitor.actions === 1 ? "" : "s"}`;
   const files = changedFiles.slice(0, 10).map(file => `- ${file.status === "new" ? "NEW" : "MOD"} ${file.name}`);
   const urls = extractLocalUrls(outputs).map(url => `- ${url}`);
   const active = sessions.map(s => `- ${s.label} (${s.status || "unknown"})`).slice(0, 8);
@@ -1135,6 +1151,7 @@ export const ChatPanel: React.FC<{
   });
   const [agentQuestions, setAgentQuestions] = useState<AgentQuestion[]>([]);
   const [pendingAgentRequests, setPendingAgentRequests] = useState<PendingAgentRequest[]>([]);
+  const hasRunningTool = toolCalls.some(t => t.status === "running" || t.status === "queued" || t.status === "waiting");
 
   // ── Chat history ─────────────────────────────────────────────────────────────
   const [histories, setHistories] = useState<ChatHistory[]>(() => {
@@ -1147,6 +1164,13 @@ export const ChatPanel: React.FC<{
   });
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyHydrated, setHistoryHydrated] = useState(false);
+  const [lastSeenHistoryCount, setLastSeenHistoryCount] = useState<number>(() => {
+    try {
+      const stored = localStorage.getItem("integraded_chat_default_last_seen_history_count");
+      if (stored !== null) return parseInt(stored, 10);
+    } catch {}
+    return 0;
+  });
   const [currentChatMeta, setCurrentChatMeta] = useState<ChatSessionMeta>(() => createChatMeta());
   const historyRef = useRef<HTMLDivElement>(null);
 
@@ -1253,7 +1277,7 @@ export const ChatPanel: React.FC<{
   const currentTaskSkillFilePathsRef = useRef<string[]>([]);
 
   const seenQuestionKeysRef = useRef<Set<string>>(new Set());
-  const seenSummaryKeysRef = useRef<Set<string>>(new Set());
+  // const seenSummaryKeysRef = useRef<Set<string>>(new Set());
   const lastSummaryBySessionRef = useRef<Record<string, { sig: string; at: number }>>({});
   const lastDiffSignatureRef = useRef("");
   const lastReadySummaryRef = useRef("");
@@ -1261,6 +1285,7 @@ export const ChatPanel: React.FC<{
   const handledExternalPromptRef = useRef<string | null>(null);
   const lastContextMsgIdRef = useRef<string | null>(null);
   const currentChatMetaRef = useRef(currentChatMeta);
+  const pendingDirectActionsCountRef = useRef(0);
   
   onSendPtyCommandRef.current = onSendPtyCommand;
   onAddSessionRef.current = onAddSession;
@@ -1283,6 +1308,13 @@ export const ChatPanel: React.FC<{
   installedSkillsRef.current = installedSkills;
   disabledProvidersRef.current = disabledProviders;
 
+  const decrementPendingDirectActions = useCallback(() => {
+    pendingDirectActionsCountRef.current = Math.max(0, pendingDirectActionsCountRef.current - 1);
+    if (pendingDirectActionsCountRef.current === 0 && !workMonitorRef.current) {
+      setPendingAutoResume(Date.now());
+    }
+  }, []);
+
   const updateChatAtBottom = () => {
     const el = messagesRef.current;
     if (!el) return;
@@ -1302,14 +1334,16 @@ export const ChatPanel: React.FC<{
   // ── Effects ──────────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    if (chatAtBottomRef.current) requestAnimationFrame(() => scrollChatToBottom("smooth"));
+    if (chatAtBottomRef.current || isProcessing || hasRunningTool || !!workMonitor) {
+      requestAnimationFrame(() => scrollChatToBottom("smooth"));
+    }
     requestAnimationFrame(() => {
       const bodies = chatPanelRef.current?.querySelectorAll<HTMLElement>(".chat-thinking.open .chat-thinking-body");
       bodies?.forEach(body => {
         body.scrollTop = body.scrollHeight;
       });
     });
-  }, [msgs]);
+  }, [msgs, isProcessing, hasRunningTool, workMonitor]);
 
   useEffect(() => {
     const last = msgs[msgs.length - 1];
@@ -1371,12 +1405,12 @@ export const ChatPanel: React.FC<{
     setHistoryHydrated(false);
     let active = true;
     (async () => {
+      let loadedHistories: ChatHistory[] = [];
       try {
         // 1. Load the global histories list
         const rawGlobal = await invoke<string | null>("load_chat_history", { scope: "default" });
         if (!active) return;
         
-        let loadedHistories: ChatHistory[] = [];
         if (rawGlobal) {
           const payload = JSON.parse(rawGlobal);
           loadedHistories = Array.isArray(payload.histories)
@@ -1401,7 +1435,7 @@ export const ChatPanel: React.FC<{
         setAgentQuestions([]);
         setPendingAgentRequests([]);
         setWorkMonitor(null);
-        
+
         if (rawWorkspace) {
           const payload = JSON.parse(rawWorkspace);
           if (payload.current_session) {
@@ -1417,7 +1451,8 @@ export const ChatPanel: React.FC<{
               setContextWindow(current.contextWindow || cleanMsgs.reduce((ctx, msg) => appendContextWindow(ctx, msg), ""));
             }
           } else if (Array.isArray(payload.current_msgs)) {
-            setMsgs(normalizeMessages(payload.current_msgs));
+            const cleanMsgs = normalizeMessages(payload.current_msgs);
+            setMsgs(cleanMsgs);
             setContextWindow(typeof payload.current_context === "string" ? payload.current_context : "");
             setCurrentChatMeta(createChatMeta());
           } else {
@@ -1432,7 +1467,8 @@ export const ChatPanel: React.FC<{
             const storedContext = localStorage.getItem(storageKey("context_window"));
             const storedTools = localStorage.getItem(storageKey("tool_calls"));
             
-            setMsgs(storedMsgs ? normalizeMessages(JSON.parse(storedMsgs)) : []);
+            const cleanMsgs = storedMsgs ? normalizeMessages(JSON.parse(storedMsgs)) : [];
+            setMsgs(cleanMsgs);
             setContextWindow(storedContext || "");
             setToolCalls(storedTools ? JSON.parse(storedTools) : []);
             setCurrentChatMeta(createChatMeta());
@@ -1450,13 +1486,32 @@ export const ChatPanel: React.FC<{
         setToolCalls([]);
         setCurrentChatMeta(createChatMeta());
       } finally {
-        if (active) setHistoryHydrated(true);
+        if (active) {
+          const initialCount = loadedHistories.length;
+          setLastSeenHistoryCount(initialCount);
+          try {
+            localStorage.setItem("integraded_chat_default_last_seen_history_count", String(initialCount));
+          } catch {}
+          setHistoryHydrated(true);
+        }
       }
     })();
     return () => {
       active = false;
     };
   }, [chatScopeKey]);
+
+  // Adjust lastSeenHistoryCount downward if history items are deleted or cleared
+  useEffect(() => {
+    if (!historyHydrated) return;
+    const totalCount = histories.length;
+    if (totalCount < lastSeenHistoryCount) {
+      setLastSeenHistoryCount(totalCount);
+      try {
+        localStorage.setItem("integraded_chat_default_last_seen_history_count", String(totalCount));
+      } catch {}
+    }
+  }, [histories.length, lastSeenHistoryCount, historyHydrated]);
 
   // ── Persistence helpers ───────────────────────────────────────────────────────
 
@@ -1734,7 +1789,7 @@ export const ChatPanel: React.FC<{
             id: `wm-${Date.now()}-${request.id}`,
             startedAt: Date.now(),
             actions: 1,
-            labels: [session.label],
+            sessionIds: [session.sessionId],
           });
         }
       }
@@ -1759,9 +1814,44 @@ export const ChatPanel: React.FC<{
     const timer = window.setInterval(() => {
       const transcripts = Object.values(terminalTranscriptsRef.current).flat();
       const relevant = transcripts.filter(entry => entry.ts >= workMonitor.startedAt - 2000);
-      if (!relevant.length) return;
-      const lastActivity = Math.max(...relevant.map(entry => entry.ts), workMonitor.startedAt);
-      if (Date.now() - lastActivity < 9000) return;
+      
+      let lastActivity = workMonitor.startedAt;
+      if (relevant.length > 0) {
+        lastActivity = Math.max(...relevant.map(entry => entry.ts), workMonitor.startedAt);
+      }
+
+      // Check the state of the monitored sessions to dynamically adapt the silence timeout.
+      // If any agent is still booting or actively running without presenting a final summary or question,
+      // we use a long silence timeout (30 seconds) to prevent premature auto-resumes.
+      // If all monitored sessions have either exited, finished (completion summary found), or are waiting
+      // for user input (terminal question found), we can use a snappy 6-second timeout.
+      const monitoredSessions = sessionsRef.current.filter(s =>
+        workMonitor.sessionIds.includes(s.sessionId)
+      );
+
+      let allDoneOrWaiting = monitoredSessions.length > 0;
+      for (const s of monitoredSessions) {
+        if (s.status === "exited") continue;
+        if (!s.status || s.status === "booting") {
+          allDoneOrWaiting = false;
+          break;
+        }
+
+        const sessionTranscripts = terminalTranscriptsRef.current[s.sessionId] || [];
+        const newTranscripts = sessionTranscripts.filter(entry => entry.ts >= workMonitor.startedAt - 2000);
+        const output = newTranscripts.map(entry => entry.text).join("");
+
+        const hasSummary = !!detectAgentCompletionSummary(output);
+        const hasQuestion = !!detectTerminalQuestion(output);
+
+        if (!hasSummary && !hasQuestion) {
+          allDoneOrWaiting = false;
+        }
+      }
+
+      const timeoutMs = allDoneOrWaiting ? 1500 : 60000;
+      
+      if (Date.now() - lastActivity < timeoutMs) return;
       if (agentQuestionsRef.current.some(q => !q.answered)) return;
       if (isProcessingRef.current) return;
 
@@ -1769,8 +1859,10 @@ export const ChatPanel: React.FC<{
       if (lastReadySummaryRef.current === signature) return;
       lastReadySummaryRef.current = signature;
       setWorkMonitor(null);
-      // Trigger auto-resume: the LLM will generate a summary directly.
-      setPendingAutoResume(Date.now());
+      // Trigger auto-resume: the LLM will generate a summary directly if no direct actions are pending.
+      if (pendingDirectActionsCountRef.current === 0) {
+        setPendingAutoResume(Date.now());
+      }
     }, 3000);
     return () => window.clearInterval(timer);
   }, [workMonitor]);
@@ -1835,7 +1927,7 @@ export const ChatPanel: React.FC<{
           .filter(m => (m.role === "user" || m.role === "ai") && !m.streaming)
           .slice(-40)
           .map(m => ({
-            role: m.role === "user" ? "user" as const : "assistant" as const,
+            role: (m.role === "user" || m.agent !== "orchestrator") ? "user" as const : "assistant" as const,
             content: messageForModel(m),
           }));
         const llmMsgs = [
@@ -1877,9 +1969,18 @@ export const ChatPanel: React.FC<{
           if (actions.length) autoDispatchActions(actions);
         }
       } catch (err: any) {
-        // Remove the streaming placeholder if present, then silently drop the error.
-        // We don't surface low-level curl/network errors into the conversation.
-        setMsgs(p => p.filter(m => m.id !== aiMsgId));
+        // Remove the streaming placeholder if present, then display a user-friendly system error.
+        const detail = err?.message || String(err || "Failed to auto-resume.");
+        setMsgs(p => [
+          ...p.filter(m => m.id !== aiMsgId),
+          {
+            id: `e-resume-${Date.now()}`,
+            role: "ai",
+            agent: "system",
+            body: `⚠️ **Auto-resume failed:** ${detail}\n\nPress **Please proceed** or try again to continue.`,
+            ts: ts(),
+          }
+        ]);
         console.warn("[auto-resume] failed:", err?.message || String(err));
       } finally {
         setIsProcessing(false);
@@ -1925,7 +2026,10 @@ export const ChatPanel: React.FC<{
         const history = msgs
           .filter(m => (m.role === "user" || m.role === "ai") && !m.streaming)
           .slice(-30)
-          .map(m => ({ role: m.role === "user" ? "user" as const : "assistant" as const, content: messageForModel(m) }));
+          .map(m => ({
+            role: (m.role === "user" || m.agent !== "orchestrator") ? "user" as const : "assistant" as const,
+            content: messageForModel(m)
+          }));
         const llmMsgs = [
           { role: "system" as const, content: sysPrompt },
           ...history,
@@ -2075,6 +2179,19 @@ export const ChatPanel: React.FC<{
   // keychain via the backend (invoke "get_api_key"). The key is never stored in
   // React state — it is fetched only at call time and used once.
 
+  const mergeConsecutiveRoles = (msgs: { role: string; content: string }[]) => {
+    if (msgs.length === 0) return [];
+    const merged: { role: string; content: string }[] = [];
+    for (const msg of msgs) {
+      if (merged.length > 0 && merged[merged.length - 1].role === msg.role) {
+        merged[merged.length - 1].content += "\n\n" + msg.content;
+      } else {
+        merged.push({ ...msg });
+      }
+    }
+    return merged;
+  };
+
   const buildRequest = async (messages: { role: string; content: string }[], streaming: boolean) => {
     if (!config) throw new Error("No configuration loaded.");
     const model = selectedModel || "gpt-4o";
@@ -2082,13 +2199,15 @@ export const ChatPanel: React.FC<{
     const provType = entry?.type || "cloud";
     const provName = entry?.provider || "openai";
 
+    const normalizedMessages = mergeConsecutiveRoles(messages);
+
     if (provType === "local" && provName === "lmstudio") {
       const base = (config.lmstudio_url || "http://localhost:1234").replace(/\/+$/, "");
-      return { provider: "lmstudio", url: `${base}/v1/chat/completions`, body: JSON.stringify({ model, messages, stream: streaming }), headers: [["Content-Type","application/json"]] as string[][] };
+      return { provider: "lmstudio", url: `${base}/v1/chat/completions`, body: JSON.stringify({ model, messages: normalizedMessages, stream: streaming }), headers: [["Content-Type","application/json"]] as string[][] };
     }
     if (provType === "local" && provName === "ollama") {
       const base = (config.ollama_url || "http://localhost:11434").replace(/\/+$/, "");
-      return { provider: "ollama", url: `${base}/api/chat`, body: JSON.stringify({ model, messages, stream: streaming }), headers: [["Content-Type","application/json"]] as string[][] };
+      return { provider: "ollama", url: `${base}/api/chat`, body: JSON.stringify({ model, messages: normalizedMessages, stream: streaming }), headers: [["Content-Type","application/json"]] as string[][] };
     }
 
     const prov = selectedCloudProvider || config.cloud_provider || "openai";
@@ -2100,8 +2219,8 @@ export const ChatPanel: React.FC<{
     const key = await invoke<string>("get_api_key", { provider: prov });
 
     if (prov === "anthropic") {
-      const aMessages = messages.filter(m => m.role !== "system").map(m => ({ role: m.role as "user"|"assistant", content: m.content }));
-      const sys = messages.find(m => m.role === "system");
+      const aMessages = normalizedMessages.filter(m => m.role !== "system").map(m => ({ role: m.role as "user"|"assistant", content: m.content }));
+      const sys = normalizedMessages.find(m => m.role === "system");
       const body: any = { model, max_tokens: 4096, messages: aMessages };
       if (streaming) body.stream = true;
       if (sys) body.system = sys.content;
@@ -2111,7 +2230,7 @@ export const ChatPanel: React.FC<{
       return {
         provider: "ollama_cloud",
         url: "https://ollama.com/api/chat",
-        body: JSON.stringify({ model, messages, stream: streaming }),
+        body: JSON.stringify({ model, messages: normalizedMessages, stream: streaming }),
         headers: [["Authorization", `Bearer ${key}`], ["Content-Type", "application/json"]] as string[][],
       };
     }
@@ -2120,19 +2239,17 @@ export const ChatPanel: React.FC<{
       openai: "https://api.openai.com/v1/chat/completions",
       deepseek: "https://api.deepseek.com/chat/completions",
       mistral: "https://api.mistral.ai/v1/chat/completions",
-      google: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      google: "https://generativelanguage.googleapis.com/v1beta/openai/v1/chat/completions",
       grok: "https://api.x.ai/v1/chat/completions",
       together: "https://api.together.xyz/v1/chat/completions",
       openrouter: "https://openrouter.ai/api/v1/chat/completions",
+      nvidia: "https://integrate.api.nvidia.com/v1/chat/completions",
     };
     const url = URLS[prov] || URLS.openai;
-    if (prov === "google") {
-      return { provider: prov, url: `${url}?key=${key}`, body: JSON.stringify({ model, messages, max_tokens: 4096, stream: streaming }), headers: [["Content-Type","application/json"]] as string[][] };
-    }
     if (prov === "openrouter") {
-      return { provider: prov, url, body: JSON.stringify({ model, messages, max_tokens: 4096, stream: streaming, include_reasoning: true }), headers: [["Authorization",`Bearer ${key}`],["Content-Type","application/json"]] as string[][] };
+      return { provider: prov, url, body: JSON.stringify({ model, messages: normalizedMessages, max_tokens: 4096, stream: streaming, include_reasoning: true }), headers: [["Authorization",`Bearer ${key}`],["Content-Type","application/json"]] as string[][] };
     }
-    return { provider: prov, url, body: JSON.stringify({ model, messages, max_tokens: 4096, stream: streaming }), headers: [["Authorization",`Bearer ${key}`],["Content-Type","application/json"]] as string[][] };
+    return { provider: prov, url, body: JSON.stringify({ model, messages: normalizedMessages, max_tokens: 4096, stream: streaming }), headers: [["Authorization",`Bearer ${key}`],["Content-Type","application/json"]] as string[][] };
   };
 
   // ── Streaming ─────────────────────────────────────────────────────────────────
@@ -2338,7 +2455,7 @@ export const ChatPanel: React.FC<{
       }
       updateToolLog(logId, "queued", `Restarting ${session.label}…`);
       // Poll for "running" status, retry up to 3 × 4s = 12s
-      const waitAndSend = (attempt: number, targetSessId: string) => {
+      const waitAndSend = (attempt: number) => {
         setTimeout(() => {
           const current = sessionsRef.current.find(s => s.id === session.id);
           if (!current) { updateToolLog(logId, "failed", `${session.label} session gone.`); return; }
@@ -2347,7 +2464,7 @@ export const ChatPanel: React.FC<{
             updateToolLog(logId, "done", `Sent to restarted ${session.label}.`);
           } else if (current.status === "booting" && attempt < 3) {
             updateToolLog(logId, "queued", `Still waiting for ${session.label} (${attempt + 1}/3)…`);
-            waitAndSend(attempt + 1, current.sessionId);
+            waitAndSend(attempt + 1);
           } else {
             // Boot took too long — send anyway
             onSendPtyCommandRef.current?.(current.sessionId, enrichedPrompt);
@@ -2355,7 +2472,7 @@ export const ChatPanel: React.FC<{
           }
         }, 4000);
       };
-      waitAndSend(0, newSessId);
+      waitAndSend(0);
       return;
     }
     if (session.status === "booting") {
@@ -2383,8 +2500,9 @@ export const ChatPanel: React.FC<{
   };
 
   const autoDispatchActions = (actions: AgentAction[]) => {
+    pendingDirectActionsCountRef.current = 0;
     const usedSessionIds = new Set<string>();
-    const monitorLabels: string[] = [];
+    const monitorSessionIds: string[] = [];
 
     for (const action of actions) {
       const logId = addToolLog(action, "queued");
@@ -2406,6 +2524,7 @@ export const ChatPanel: React.FC<{
           updateToolLog(logId, "failed", "Browser bridge is not available.");
           continue;
         }
+        pendingDirectActionsCountRef.current++;
         onOpenBrowserRef.current({
           id: logId,
           url: action.url,
@@ -2414,6 +2533,7 @@ export const ChatPanel: React.FC<{
           mode: action.mode === "web" ? "web" : action.mode === "app" ? "app" : undefined,
         });
         updateToolLog(logId, "done", action.url ? `Opened ${action.url}.` : "Opened integrated browser.");
+        decrementPendingDirectActions();
         continue;
       }
 
@@ -2426,7 +2546,7 @@ export const ChatPanel: React.FC<{
         updateToolLog(logId, "running", `Dispatching to ${targets.length} active agent${targets.length > 1 ? "s" : ""}.`);
         targets.forEach(session => {
           usedSessionIds.add(session.sessionId);
-          monitorLabels.push(session.label);
+          monitorSessionIds.push(session.sessionId);
           sendToSession(session, action.prompt || "", logId);
         });
         updateToolLog(logId, "done", `Sent to ${targets.length} active agent${targets.length > 1 ? "s" : ""}.`);
@@ -2443,7 +2563,7 @@ export const ChatPanel: React.FC<{
         const newSessionId = onChangeSessionAgentRef.current(target.id, action.label, nextCommand, true);
         updateToolLog(logId, "done", `Switched ${target.label} to ${nextCommand}.`);
         if (action.prompt && newSessionId) {
-          monitorLabels.push(target.label);
+          monitorSessionIds.push(newSessionId);
           setTimeout(() => onSendPtyCommandRef.current?.(newSessionId, injectSkillsIntoPrompt(action.prompt || "")), 4000);
         }
         continue;
@@ -2493,14 +2613,14 @@ export const ChatPanel: React.FC<{
 
         if (target) {
           usedSessionIds.add(target.sessionId);
-          monitorLabels.push(target.label);
+          monitorSessionIds.push(target.sessionId);
           updateToolLog(logId, "running", `Dispatching to ${target.label}.`);
           sendToSession(target, promptText, logId);
         } else if (action.type === "spawn" && action.agentType) {
           const spawned = onAddSessionRef.current?.(action.label, action.agentType);
           if (spawned && spawned.sessionId) {
             usedSessionIds.add(spawned.sessionId);
-            monitorLabels.push(spawned.label);
+            monitorSessionIds.push(spawned.sessionId);
             updateToolLog(logId, "running", `Spawned ${spawned.label}.`);
             setTimeout(() => sendToSession(spawned, promptText, logId), 4000);
           } else {
@@ -2515,8 +2635,10 @@ export const ChatPanel: React.FC<{
       if (action.type === "kill") {
         const target = sessionsRef.current.find(s => s.label.toLowerCase() === action.label.toLowerCase());
         if (target) {
+          pendingDirectActionsCountRef.current++;
           onCloseSessionRef.current?.(target.id);
           updateToolLog(logId, "done", `Closed ${target.label}.`);
+          decrementPendingDirectActions();
         } else {
           updateToolLog(logId, "failed", "No matching session found.");
         }
@@ -2528,6 +2650,8 @@ export const ChatPanel: React.FC<{
         const isAbsolute = /^([A-Za-z]:[\\\/]|\/|\\\\)/.test(rawPath);
         const resolvedPath = (!isAbsolute && workspaceDir)
           ? `${workspaceDir}\\${rawPath.replace(/\//g, "\\")}` : rawPath;
+
+        pendingDirectActionsCountRef.current++;
 
         const executeReadFile = () => {
           updateToolLog(logId, "running", `Reading ${rawPath}`);
@@ -2544,7 +2668,12 @@ export const ChatPanel: React.FC<{
                 ts: ts(),
               }]);
             })
-            .catch(err => updateToolLog(logId, "failed", String(err)));
+            .catch(err => {
+              updateToolLog(logId, "failed", String(err));
+            })
+            .finally(() => {
+              decrementPendingDirectActions();
+            });
         };
 
         if (chatToolMode === "bypass") {
@@ -2566,6 +2695,8 @@ export const ChatPanel: React.FC<{
       }
 
       if (action.type === "exec_cmd" && action.cmdString) {
+        pendingDirectActionsCountRef.current++;
+
         const executeCmd = () => {
           updateToolLog(logId, "running", action.cmdString!);
           invoke<string>("run_command_in_dir", { cmd: action.cmdString, dir: workspaceDir || "." })
@@ -2589,6 +2720,9 @@ export const ChatPanel: React.FC<{
                 body: `**$** \`${action.cmdString}\`\n\`\`\`\n${String(err)}\n\`\`\``,
                 ts: ts(),
               }]);
+            })
+            .finally(() => {
+              decrementPendingDirectActions();
             });
         };
 
@@ -2609,12 +2743,12 @@ export const ChatPanel: React.FC<{
         }
       }
     }
-    if (monitorLabels.length) {
+    if (monitorSessionIds.length) {
       setWorkMonitor({
         id: `wm-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         startedAt: Date.now(),
-        actions: monitorLabels.length,
-        labels: Array.from(new Set(monitorLabels)),
+        actions: monitorSessionIds.length,
+        sessionIds: monitorSessionIds,
       });
     }
   };
@@ -2702,7 +2836,7 @@ export const ChatPanel: React.FC<{
 
   const runPlanMode = async (userMsg: Msg) => {
     const history = msgs.filter(m => (m.role === "user" || m.role === "ai") && !m.streaming).slice(-24).map(m => ({
-      role: m.role === "user" ? "user" as const : "assistant" as const,
+      role: (m.role === "user" || m.agent !== "orchestrator") ? "user" as const : "assistant" as const,
       content: messageForModel(m),
     }));
     const llmMsgs = [
@@ -2755,6 +2889,8 @@ export const ChatPanel: React.FC<{
       setComposerAttachments([]);
     }
     setIsProcessing(true);
+    pendingDirectActionsCountRef.current = 0;
+    let aiMsgId = "";
     try {
       if (pendingPlan && !overrideText && !attachments.length && (isAffirmative(text) || isNegative(text))) {
         if (isAffirmative(text)) {
@@ -2854,10 +2990,10 @@ export const ChatPanel: React.FC<{
             : `[Killed: ${a.label}]`
           ).join(", ");
         }
-        return { role: m.role === "user" ? "user" as const : "assistant" as const, content };
+        return { role: (m.role === "user" || m.agent !== "orchestrator") ? "user" as const : "assistant" as const, content };
       });
       const llmMsgs = [{ role:"system", content: sysPrompt }, ...history, { role:"user", content: messageForModel(userMsg) }];
-      const aiMsgId = `a${Date.now()}`;
+      aiMsgId = `a${Date.now()}`;
 
       if (streamingEnabled) {
         setMsgs(p => [...p, {
@@ -2905,13 +3041,16 @@ export const ChatPanel: React.FC<{
     } catch (err: any) {
       const detail = err?.message || String(err || "Failed to get AI response.");
       const modelHint = selectedModelRef.current ? `\n\nModel: \`${selectedModelRef.current}\`` : "";
-      setMsgs(p => [...p, {
-        id:`e${Date.now()}`,
-        role:"ai",
-        agent:"system",
-        body:`**Error:** Failed to get AI response.\n\n${detail}${modelHint}`,
-        ts: ts(),
-      }]);
+      setMsgs(p => [
+        ...p.filter(m => m.id !== aiMsgId),
+        {
+          id:`e${Date.now()}`,
+          role:"ai",
+          agent:"system",
+          body:`**Error:** Failed to get AI response.\n\n${detail}${modelHint}`,
+          ts: ts(),
+        }
+      ]);
     } finally {
       setIsProcessing(false);
     }
@@ -3187,10 +3326,27 @@ export const ChatPanel: React.FC<{
               type="button"
               className={`chat-hdr-btn ${historyOpen ? "active" : ""}`}
               title="Chat history"
-              onClick={() => { setHistoryOpen(o => !o); setTermPickerOpen(false); }}
+              onClick={() => {
+                setHistoryOpen(o => {
+                  const next = !o;
+                  if (next) {
+                    const currentCount = histories.length;
+                    setLastSeenHistoryCount(currentCount);
+                    try {
+                      localStorage.setItem("integraded_chat_default_last_seen_history_count", String(currentCount));
+                    } catch {}
+                  }
+                  return next;
+                });
+                setTermPickerOpen(false);
+              }}
             >
               <i className="bx bx-history" />
-              {(histories.length > 0 || msgs.length > 0) && <span className="chat-hdr-badge">{histories.length + (msgs.length > 0 ? 1 : 0)}</span>}
+              {historyHydrated && histories.length > lastSeenHistoryCount && (
+                <span className="chat-hdr-badge">
+                  {histories.length - lastSeenHistoryCount}
+                </span>
+              )}
             </button>
             {historyOpen && (
               <div className="chat-dropdown chat-history-panel">
@@ -3461,6 +3617,7 @@ export const ChatPanel: React.FC<{
                                 pendingApprovalsRef.current.delete(approvalId);
                                 setMsgs(p => p.map(x => x.id === m.id ? { ...x, pendingApproval: undefined, body: x.body + "\n\n❌ **Denied**" } : x));
                                 updateToolLog(aLogId, "failed", `${denyLabel} denied by user`);
+                                decrementPendingDirectActions();
                               }}
                             >Deny</button>
                           </div>
@@ -3475,18 +3632,9 @@ export const ChatPanel: React.FC<{
         )}
 
         {isProcessing && !msgs.some(m => m.streaming) && (
-          <div className="chat-msg orchestrator">
-            <div className="chat-msg-ai-wrap">
-              <span className="chat-avatar orchestrator"><img src="/logo.png" className="chat-avatar-logo" alt="" /></span>
-              <div className="chat-msg-ai-content">
-                <div className="chat-msg-meta">
-                  <span className="chat-sender">Integraded</span>
-                </div>
-                <div className="chat-bubble-ai">
-                  <div className="chat-typing"><span/><span/><span/></div>
-                </div>
-              </div>
-            </div>
+          <div className="chat-typing-indicator-minimal">
+            <span className="pulse-dot-small" />
+            <span>Thinking...</span>
           </div>
         )}
         <div ref={endRef} />

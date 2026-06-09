@@ -658,7 +658,7 @@ export const FileViewerDialog: React.FC<FileViewerDialogProps> = ({ filePath, fi
                     }
                     return displayLines.map((line, i) => (
                       <div key={i} className={`diff-line ${line.type}`} style={{ height: "20.15px" }}>
-                        <span className="diff-ln diff-ln-old">{!showAsNew ? (line.oldLine ?? "") : ""}</span>
+                        <span className="diff-ln diff-ln-old">{!showAsNew ? ((line as DiffLine).oldLine ?? "") : ""}</span>
                         <span className="diff-ln diff-ln-new">{line.newLine ?? ""}</span>
                         <span style={{ width: "18px", flexShrink: 0, textAlign: "center", color: line.type === "added" ? "var(--ok)" : line.type === "removed" ? "var(--err)" : "var(--text-3)", fontSize: "12px", userSelect: "none" }}>
                           {line.type === "added" ? "+" : line.type === "removed" ? "−" : " "}

@@ -20,13 +20,22 @@ interface WorkspaceLayoutProps {
   onWorkspaceActivity?: () => void;
 }
 
+// ── Helper for scoped localstorage ─────────────────────────────────────────────
+function safeStorageScope(value: string): string {
+  const clean = (value || "default")
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96);
+  return clean || "default";
+}
+
 // ── Agent options for dialog ───────────────────────────────────────────────────
 const AGENT_OPTIONS = [
   { key: "shell",       label: "Shell",       command: "shell",       icon: "bx-terminal",  desc: "Native PowerShell / bash" },
   { key: "opencode",   label: "opencode",    command: "opencode",    icon: "bx-code-alt",  desc: "opencode.ai — AI coding agent" },
   { key: "codex",      label: "Codex CLI",   command: "codex",       icon: "bx-terminal",  desc: "OpenAI Codex CLI agent" },
   { key: "claude",     label: "Claude",      command: "claude",      icon: "bx-bot",       desc: "Anthropic Claude CLI" },
-  { key: "antigravity",label: "Antigravity", command: "antigravity", icon: "bx-rocket",    desc: "Antigravity CLI agent" },
+  { key: "antigravity",label: "Antigravity", command: "agy --dangerously-skip-permissions", icon: "bx-rocket",    desc: "Antigravity CLI agent" },
 ];
 
 // ── New Session Dialog ─────────────────────────────────────────────────────────
@@ -42,6 +51,14 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onC
   const [skipPerms, setSkipPerms] = useState(localStorage.getItem("__integraded_claude_skip_permissions") !== "0");
   const [customLabel, setCustomLabel] = useState("");
   const [customCommand, setCustomCommand] = useState("");
+  const [presets, setPresets] = useState<any[]>(() => {
+    try {
+      const stored = localStorage.getItem("integraded_custom_presets");
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
   const pick = AGENT_OPTIONS.find(a => a.key === selected) ?? AGENT_OPTIONS[0];
   const isCustom = selected === "custom";
   const canLaunch = isCustom ? customCommand.trim().length > 0 : true;
@@ -84,6 +101,29 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onC
 
           {isCustom && (
             <div className="dialog-custom-fields" onClick={e => e.stopPropagation()}>
+              {presets.length > 0 && (
+                <div className="dialog-custom-field">
+                  <label className="dialog-custom-label">Select Preset</label>
+                  <select
+                    className="dialog-custom-input"
+                    value=""
+                    onChange={e => {
+                      const presetId = e.target.value;
+                      const selectedPreset = presets.find(p => p.id === presetId);
+                      if (selectedPreset) {
+                        setCustomLabel(selectedPreset.label);
+                        setCustomCommand(selectedPreset.command);
+                        setCount(Math.min(remainingCount, selectedPreset.count || 1));
+                      }
+                    }}
+                  >
+                    <option value="" disabled>Choose a preset...</option>
+                    {presets.map(p => (
+                      <option key={p.id} value={p.id}>{p.label || p.command}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div className="dialog-custom-field">
                 <label className="dialog-custom-label">Label (optional)</label>
                 <input
@@ -105,6 +145,44 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onC
                   onChange={e => setCustomCommand(e.target.value)}
                   onKeyDown={e => { if (e.key === "Enter" && canLaunch) { onConfirm(customLabel.trim() || customCommand.trim(), customCommand.trim(), count); } }}
                 />
+              </div>
+              <div style={{ display: "flex", gap: "8px", marginTop: "4px" }}>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  disabled={!customCommand.trim()}
+                  onClick={() => {
+                    const label = customLabel.trim() || customCommand.trim();
+                    const newPreset = {
+                      id: Date.now().toString() + Math.random().toString(36).substring(2, 5),
+                      label,
+                      command: customCommand.trim(),
+                      count
+                    };
+                    const updated = [...presets.filter(p => p.label !== label && p.command !== newPreset.command), newPreset];
+                    setPresets(updated);
+                    localStorage.setItem("integraded_custom_presets", JSON.stringify(updated));
+                  }}
+                >
+                  <i className="bx bx-save" /> Save Preset
+                </button>
+                {presets.length > 0 && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    style={{ color: "var(--err)" }}
+                    onClick={() => {
+                      const match = presets.find(p => p.command === customCommand.trim());
+                      if (match) {
+                        const updated = presets.filter(p => p.id !== match.id);
+                        setPresets(updated);
+                        localStorage.setItem("integraded_custom_presets", JSON.stringify(updated));
+                      }
+                    }}
+                  >
+                    <i className="bx bx-trash" /> Delete Preset
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -171,7 +249,6 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({ remainingCount, onC
 // ── Right Panel with tabs ──────────────────────────────────────────────────────
 interface RightPanelProps {
   width: number;
-  workspaceId?: string;
   directory: string;
   sessions: Session[];
   terminalOutputs: Record<string, string>;
@@ -184,11 +261,11 @@ interface RightPanelProps {
   onCloseSession: (id: number) => void;
   onRestartSession?: (id: number) => string;
   onChangeSessionAgent?: (id: number, label: string, command: string, restart?: boolean) => string | void;
+  changesReady?: boolean;
 }
 
 const RightPanel: React.FC<RightPanelProps> = ({
   width,
-  workspaceId,
   directory,
   sessions,
   terminalOutputs,
@@ -201,11 +278,21 @@ const RightPanel: React.FC<RightPanelProps> = ({
   onCloseSession,
   onRestartSession,
   onChangeSessionAgent,
+  changesReady,
 }) => {
   const [tab, setTab] = useState<"chat" | "file">("chat");
   const [browserOpen, setBrowserOpen] = useState(false);
   const [browserRequest, setBrowserRequest] = useState<BrowserOpenRequest | null>(null);
   const [externalPrompt, setExternalPrompt] = useState<ExternalChatPrompt | null>(null);
+  const [lastSeenChangesCount, setLastSeenChangesCount] = useState(() => {
+    try {
+      const key = `integraded_chat_${safeStorageScope(directory)}_last_seen_changes_count`;
+      const stored = localStorage.getItem(key);
+      return stored ? parseInt(stored, 10) : 0;
+    } catch {
+      return 0;
+    }
+  });
 
   const suggestedUrls = React.useMemo(() => {
     const urls = new Set<string>();
@@ -227,6 +314,49 @@ const RightPanel: React.FC<RightPanelProps> = ({
     }
     return Array.from(map.values());
   }, [baselineSnapshot, changedFiles]);
+
+  // Reset hydration ref on directory change
+  const initialChangesHydrationRef = React.useRef(true);
+  useEffect(() => {
+    initialChangesHydrationRef.current = true;
+  }, [directory]);
+
+  // Effect 0: Sync initial changes count on first load/hydration
+  useEffect(() => {
+    if (!changesReady) return;
+    if (initialChangesHydrationRef.current) {
+      setLastSeenChangesCount(changedFiles.length);
+      try {
+        const key = `integraded_chat_${safeStorageScope(directory)}_last_seen_changes_count`;
+        localStorage.setItem(key, String(changedFiles.length));
+      } catch {}
+      initialChangesHydrationRef.current = false;
+    }
+  }, [changesReady, changedFiles.length, directory]);
+
+  // Effect 1: Mark seen changes when the tab is "file" (viewing Changes)
+  useEffect(() => {
+    if (!changesReady) return;
+    if (tab === "file") {
+      setLastSeenChangesCount(changedFiles.length);
+      try {
+        const key = `integraded_chat_${safeStorageScope(directory)}_last_seen_changes_count`;
+        localStorage.setItem(key, String(changedFiles.length));
+      } catch {}
+    }
+  }, [tab, changedFiles.length, changesReady, directory]);
+
+  // Effect 2: Dynamically adjust the seen count downward if changes are discarded/saved
+  useEffect(() => {
+    if (!changesReady) return;
+    if (changedFiles.length < lastSeenChangesCount) {
+      setLastSeenChangesCount(changedFiles.length);
+      try {
+        const key = `integraded_chat_${safeStorageScope(directory)}_last_seen_changes_count`;
+        localStorage.setItem(key, String(changedFiles.length));
+      } catch {}
+    }
+  }, [changedFiles.length, lastSeenChangesCount, changesReady, directory]);
 
   const openBrowser = (request?: Omit<BrowserOpenRequest, "id"> | BrowserOpenRequest) => {
     setBrowserRequest({
@@ -254,7 +384,7 @@ const RightPanel: React.FC<RightPanelProps> = ({
         >
           <i className="bx bx-git-branch" />
           Changes
-          {changedFiles.length > 0 && <span className="rp-tab-badge">{changedFiles.length}</span>}
+          {changedFiles.length > lastSeenChangesCount && <span className="rp-tab-badge">{changedFiles.length - lastSeenChangesCount}</span>}
         </button>
         <button
           className={`rp-tab ${browserOpen ? "active" : ""}`}
@@ -266,11 +396,11 @@ const RightPanel: React.FC<RightPanelProps> = ({
       </div>
 
       <div className="right-panel-body">
-        {tab === "chat" ? (
+        <div style={{ display: tab === "chat" ? "flex" : "none", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden" }}>
           <ChatPanel
             embedded
             workspaceDir={directory}
-            chatStorageScope={workspaceId || directory}
+            chatStorageScope={directory}
             sessions={sessions}
             terminalOutputs={terminalOutputs}
             terminalTranscripts={terminalTranscripts}
@@ -285,14 +415,15 @@ const RightPanel: React.FC<RightPanelProps> = ({
             onOpenBrowser={openBrowser}
             onOpenDiffFile={(path, name) => onFileSelect(path, name, baselineSnapshot[path])}
           />
-        ) : (
-        <ChangesViewer
+        </div>
+        <div style={{ display: tab === "file" ? "flex" : "none", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden" }}>
+          <ChangesViewer
             changedFiles={changedFiles}
             baselineSnapshot={baselineSnapshot}
             onFileSelect={onFileSelect}
             workspaceDir={directory}
           />
-        )}
+        </div>
       </div>
       <BrowserOverlay
         open={browserOpen}
@@ -315,7 +446,7 @@ let globalSessionCounter = 0;
 
 // ── Main Component ─────────────────────────────────────────────────────────────
 export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
-  workspaceId,
+  workspaceId: _workspaceId,
   directory,
   initialSessions,
   isActive = true,
@@ -339,6 +470,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const [baselineSnapshot, setBaselineSnapshot] = useState<Record<string, string>>({});
   const [baselineReady, setBaselineReady] = useState(false);
   const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([]);
+  const [changesReady, setChangesReady] = useState(false);
   const [terminalOutputs, setTerminalOutputs] = useState<Record<string, string>>({});
   const [terminalTranscripts, setTerminalTranscripts] = useState<Record<string, TerminalTranscriptEntry[]>>({});
 
@@ -431,7 +563,10 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   // scan on a 10 000-file project costs ~0 bytes of heap vs. the old approach
   // which read every file on every tick.
   useEffect(() => {
-    if (!directory || !baselineReady || !isActive) return;
+    if (!directory || !baselineReady || !isActive) {
+      setChangesReady(false);
+      return;
+    }
 
     const scan = async () => {
       try {
@@ -449,11 +584,13 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
           }
         }
         setChangedFiles(changes);
+        setChangesReady(true);
       } catch (err) {
         console.error("Error scanning files for changes:", err);
       }
     };
 
+    setChangesReady(false);
     scan();
     const id = setInterval(scan, 5000);
     return () => clearInterval(id);
@@ -646,7 +783,10 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const sendPtyCommand = (sessId: string, cmd: string) => {
     const session = sessions.find(s => s.sessionId === sessId);
     if (session) appendTerminalTranscript(session, "input", cmd);
-    invoke("pty_write", { sessionId: sessId, data: cmd + "\r" }).catch(() => {});
+    invoke("pty_write", { sessionId: sessId, data: cmd }).catch(() => {});
+    setTimeout(() => {
+      invoke("pty_write", { sessionId: sessId, data: "\r" }).catch(() => {});
+    }, 600);
   };
 
 
@@ -779,7 +919,6 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
             <div className="resize-handle h" onMouseDown={resizeRight} />
             <RightPanel
               width={rightW}
-              workspaceId={workspaceId}
               directory={directory}
               sessions={sessions}
               terminalOutputs={terminalOutputs}
@@ -792,6 +931,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
               onCloseSession={closeSession}
               onRestartSession={restartSession}
               onChangeSessionAgent={changeSessionAgent}
+              changesReady={changesReady}
             />
           </>
         )}

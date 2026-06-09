@@ -2,14 +2,80 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+// ─── Windows helper: suppress console windows for spawned processes ─────────
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+macro_rules! cmd {
+    ($prog:expr, $($arg:expr),+ $(,)?) => {{
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = std::process::Command::new($prog);
+            $(c.arg($arg);)*
+            c.creation_flags(CREATE_NO_WINDOW);
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut c = std::process::Command::new($prog);
+            $(c.arg($arg);)*
+            c
+        }
+    }};
+    ($prog:expr) => {{
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = std::process::Command::new($prog);
+            c.creation_flags(CREATE_NO_WINDOW);
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::process::Command::new($prog)
+        }
+    }};
+}
+
+macro_rules! tokio_cmd {
+    ($prog:expr, $($arg:expr),+ $(,)?) => {{
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = tokio::process::Command::new($prog);
+            $(c.arg($arg);)*
+            c.creation_flags(CREATE_NO_WINDOW);
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut c = tokio::process::Command::new($prog);
+            $(c.arg($arg);)*
+            c
+        }
+    }};
+    ($prog:expr) => {{
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = tokio::process::Command::new($prog);
+            c.creation_flags(CREATE_NO_WINDOW);
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            tokio::process::Command::new($prog)
+        }
+    }};
+}
 
 // ─── File system types ────────────────────────────────────────────────────────
 
@@ -126,8 +192,8 @@ fn pty_create(
 
     // Build the command
     // Known TUI/CLI tools that need to run directly (not through a shell wrapper)
-    let tui_tools = ["opencode", "codex", "claude", "antigravity", "aider", "continue"];
-    let is_tui = tui_tools.iter().any(|t| command.starts_with(t));
+    let tui_tools = ["opencode", "codex", "claude", "antigravity", "aider", "continue", "cline", "cline-tui"];
+    let is_tui = tui_tools.iter().any(|t| command.contains(t));
 
     let mut cmd = if cfg!(target_os = "windows") {
         if command == "shell" || command.is_empty() {
@@ -420,7 +486,49 @@ fn list_files(dir_path: &str, state: State<'_, WorkspaceState>) -> Result<Vec<Fi
 fn read_file_content(file_path: &str, state: State<'_, WorkspaceState>) -> Result<String, String> {
     let roots = workspace_roots(&state)?;
     let canonical_file = validate_in_workspace(file_path, &roots)?;
-    fs::read_to_string(canonical_file).map_err(|e| e.to_string())
+    let bytes = fs::read(&canonical_file).map_err(|e| e.to_string())?;
+    
+    // Check for UTF-16 LE BOM
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let u16_bytes: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        if let Ok(s) = String::from_utf16(&u16_bytes) {
+            return Ok(s);
+        }
+    }
+    
+    // Check for UTF-16 BE BOM
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        let u16_bytes: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        if let Ok(s) = String::from_utf16(&u16_bytes) {
+            return Ok(s);
+        }
+    }
+
+    // Try decoding as UTF-8 first
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            // If UTF-8 fails, let's try decoding as UTF-16 LE anyway without BOM
+            let raw_bytes = e.into_bytes();
+            let u16_bytes: Vec<u16> = raw_bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            if let Ok(s) = String::from_utf16(&u16_bytes) {
+                if s.chars().take(100).any(|c| c.is_alphanumeric() || c.is_whitespace()) {
+                    return Ok(s);
+                }
+            }
+            // Fallback to lossy UTF-8 so the file is readable
+            Ok(String::from_utf8_lossy(&raw_bytes).into_owned())
+        }
+    }
 }
 
 /// Lightweight file metadata scan — returns path + mtime + size for every file
@@ -628,9 +736,7 @@ fn get_clipboard_file_paths() -> Vec<String> {
         let utf8_prefix = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; ";
         // Try Get-Clipboard -Format FileDropList (PowerShell 5.1+)
         let cmd1 = format!("{}try {{ $files = Get-Clipboard -Format FileDropList -ErrorAction Stop; if ($files) {{ $files | ForEach-Object {{ $_.FullName }} }} }} catch {{ }}", utf8_prefix);
-        let ps = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &cmd1])
-            .output();
+        let ps = cmd!("powershell", "-NoProfile", "-NonInteractive", "-Command", &cmd1).output();
         if let Ok(out) = ps {
             let raw = strip_utf8_bom(&out.stdout);
             let text = String::from_utf8_lossy(raw);
@@ -644,9 +750,7 @@ fn get_clipboard_file_paths() -> Vec<String> {
         }
         // Fallback: Add-Type approach
         let cmd2 = format!("{}Add-Type -AssemblyName System.Windows.Forms; $files = [System.Windows.Forms.Clipboard]::GetFileDropList(); $files | ForEach-Object {{ $_ }}", utf8_prefix);
-        let ps2 = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &cmd2])
-            .output();
+        let ps2 = cmd!("powershell", "-NoProfile", "-NonInteractive", "-Command", &cmd2).output();
         if let Ok(out) = ps2 {
             let raw = strip_utf8_bom(&out.stdout);
             let text = String::from_utf8_lossy(raw);
@@ -662,11 +766,9 @@ fn get_clipboard_file_paths() -> Vec<String> {
 #[tauri::command]
 fn run_command_in_dir(cmd: String, dir: String) -> Result<String, String> {
     #[cfg(target_os = "windows")]
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
-        .current_dir(&dir)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let mut ps_cmd = cmd!("powershell", "-NoProfile", "-NonInteractive", "-Command", &cmd);
+    ps_cmd.current_dir(&dir);
+    let output = ps_cmd.output().map_err(|e| e.to_string())?;
     #[cfg(not(target_os = "windows"))]
     let output = std::process::Command::new("sh")
         .args(["-c", &cmd])
@@ -795,13 +897,152 @@ fn save_chat_history(json_data: String, scope: Option<String>, app: AppHandle) -
     Ok(())
 }
 
+fn collect_all_sessions(root: &Path) -> Vec<serde_json::Value> {
+    let mut sessions = Vec::new();
+
+    // 1. Direct subdirectories of root (e.g. root/2026-06-08-06-44-58_98814-fi82)
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name != "workspaces" {
+                    let file = path.join("chat_history.json");
+                    if file.is_file() {
+                        if let Ok(content) = fs::read_to_string(&file) {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                                if val.get("msgs").and_then(|m| m.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
+                                    sessions.push(val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Subdirectories of root/workspaces/<workspace-id>/<session-folder>
+    let workspaces_dir = root.join("workspaces");
+    if let Ok(entries) = fs::read_dir(workspaces_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Ok(sub_entries) = fs::read_dir(&path) {
+                    for sub_entry in sub_entries.flatten() {
+                        let sub_path = sub_entry.path();
+                        if sub_path.is_dir() {
+                            let file = sub_path.join("chat_history.json");
+                            if file.is_file() {
+                                if let Ok(content) = fs::read_to_string(&file) {
+                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                                        if val.get("msgs").and_then(|m| m.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
+                                            sessions.push(val);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Deduplicate by ID
+    let mut seen = std::collections::HashSet::new();
+    sessions.retain(|val| {
+        if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
+            seen.insert(id.to_string())
+        } else {
+            false
+        }
+    });
+
+    // Sort sessions by createdAt (newest first)
+    sessions.sort_by(|a, b| {
+        let t_a = a.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
+        let t_b = b.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
+        t_b.cmp(&t_a)
+    });
+
+    sessions
+}
+
+#[tauri::command]
+fn delete_chat_session(id: String, app: AppHandle) -> Result<(), String> {
+    let root = chat_history_root(&app)?;
+
+    // Scan direct subfolders of root
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name != "workspaces" {
+                    let file = path.join("chat_history.json");
+                    if file.is_file() {
+                        if let Ok(content) = fs::read_to_string(&file) {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                                if val.get("id").and_then(|v| v.as_str()) == Some(&id) {
+                                    let _ = fs::remove_dir_all(&path);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Scan workspaces subfolders
+    let workspaces_dir = root.join("workspaces");
+    if let Ok(entries) = fs::read_dir(workspaces_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Ok(sub_entries) = fs::read_dir(&path) {
+                    for sub_entry in sub_entries.flatten() {
+                        let sub_path = sub_entry.path();
+                        if sub_path.is_dir() {
+                            let file = sub_path.join("chat_history.json");
+                            if file.is_file() {
+                                if let Ok(content) = fs::read_to_string(&file) {
+                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                                        if val.get("id").and_then(|v| v.as_str()) == Some(&id) {
+                                            let _ = fs::remove_dir_all(&sub_path);
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 fn load_chat_history(scope: Option<String>, app: AppHandle) -> Result<Option<String>, String> {
     let is_scoped = scope.as_ref().map(|s| {
         let safe = safe_chat_folder_name(s);
         !safe.is_empty() && safe != "default"
     }).unwrap_or(false);
-    let chat_dir = scoped_chat_history_root(&app, scope)?;
+    let chat_dir = scoped_chat_history_root(&app, scope.clone())?;
+
+    if scope.as_deref() == Some("default") {
+        let sessions = collect_all_sessions(&chat_dir);
+        let payload = serde_json::json!({
+            "histories": sessions
+        });
+        return Ok(Some(payload.to_string()));
+    }
+
     let new_path = chat_dir.join("chat_history.json");
 
     if !new_path.exists() && !is_scoped {
@@ -851,7 +1092,7 @@ fn check_agent_installed(agent_name: &str) -> bool {
     };
 
     let check_cmd = if cfg!(target_os = "windows") { "where" } else { "which" };
-    match Command::new(check_cmd).arg(check_binary).output() {
+    match cmd!(check_cmd, check_binary).output() {
         Ok(out) => out.status.success(),
         Err(_) => false,
     }
@@ -867,6 +1108,8 @@ pub struct AppConfig {
     pub streaming: bool,
     #[serde(default = "default_true")]
     pub thinking_preview: bool,
+    #[serde(default = "default_true")]
+    pub auto_turns_limit_enabled: bool,
     pub api_keys: HashMap<String, String>,
     #[serde(default)]
     pub disabled_providers: Vec<String>,
@@ -889,6 +1132,7 @@ impl Default for AppConfig {
             active_model: String::new(),
             streaming: true,
             thinking_preview: true,
+            auto_turns_limit_enabled: true,
             api_keys: HashMap::new(),
             disabled_providers: Vec::new(),
             chat_tool_mode: "ask".into(),
@@ -909,8 +1153,7 @@ pub struct ModelInfo {
 /// Make an authenticated GET request and return the raw response body.
 async fn authed_get(url: &str, headers: &[(&str, &str)]) -> Result<String, String> {
     validate_url(url)?;
-    let mut cmd = tokio::process::Command::new("curl");
-    cmd.args(["-s", "-f", "--max-time", "15", url]);
+    let mut cmd = tokio_cmd!("curl", "-s", "-f", "--max-time", "15", url);
     for (name, value) in headers {
         cmd.args(["-H", &format!("{}: {}", name, value)]);
     }
@@ -1124,6 +1367,31 @@ async fn fetch_provider_models(provider: String) -> Result<Vec<ModelInfo>, Strin
             &[("Authorization", &format!("Bearer {}", key))],
         ).await?,
 
+        "nvidia" => {
+            match authed_get(
+                "https://integrate.api.nvidia.com/v1/models",
+                &[("Authorization", &format!("Bearer {}", key))],
+            ).await {
+                Ok(res) => res,
+                Err(e) => {
+                    println!("[nvidia] fetch failed, using fallback list: {}", e);
+                    r#"{
+                        "data": [
+                            {"id": "meta/llama-3.1-405b-instruct", "object": "model"},
+                            {"id": "meta/llama-3.1-70b-instruct", "object": "model"},
+                            {"id": "meta/llama-3.1-8b-instruct", "object": "model"},
+                            {"id": "nvidia/llama-3.1-nemotron-51b-instruct", "object": "model"},
+                            {"id": "qwen/qwen2.5-coder-32b-instruct", "object": "model"},
+                            {"id": "mistralai/mistral-large-2-instruct", "object": "model"},
+                            {"id": "google/gemma-2-27b-it", "object": "model"},
+                            {"id": "kimi-k2.6", "object": "model"}
+                        ]
+                    }"#.to_string()
+                }
+            }
+        }
+
+
         // Ollama Cloud (ollama.com hosted service) — same /api/tags format as local Ollama
         "ollama_cloud" => authed_get(
             "https://ollama.com/api/tags",
@@ -1152,7 +1420,7 @@ const KEYCHAIN_SERVICE: &str = "integraded";
 /// All cloud provider IDs known to the application.
 const KNOWN_PROVIDERS: &[&str] = &[
     "openai", "anthropic", "deepseek", "mistral",
-    "google", "grok", "together", "openrouter", "ollama_cloud",
+    "google", "grok", "together", "openrouter", "ollama_cloud", "nvidia",
 ];
 
 /// Store a secret in the OS keychain under service="integraded", account=provider.
@@ -1279,12 +1547,15 @@ fn save_config(config: AppConfig) -> Result<(), String> {
     for (provider, key_val) in &config.api_keys {
         if key_val == "••••••••••••••••" {
             // Unchanged masked placeholder — keychain entry already correct; do nothing.
-        } else if key_val.is_empty() {
-            // User explicitly cleared this key — remove it from the keychain.
-            keychain_delete(provider);
         } else {
-            // New or updated plaintext key — store in OS keychain.
-            keychain_set(provider, key_val)?;
+            let trimmed = key_val.trim();
+            if trimmed.is_empty() {
+                // User explicitly cleared this key — remove it from the keychain.
+                keychain_delete(provider);
+            } else {
+                // New or updated plaintext key — store in OS keychain.
+                keychain_set(provider, trimmed)?;
+            }
         }
     }
 
@@ -1436,6 +1707,7 @@ fn validate_url(url: &str) -> Result<(), String> {
         "www.skills.sh",
         "raw.githubusercontent.com",
         "api.github.com",
+        "integrate.api.nvidia.com",
     ];
     let is_cloud = scheme == "https" && allowed_https_hosts.iter().any(|&h| host == h);
 
@@ -1452,9 +1724,7 @@ async fn curl_get(url: String) -> Result<String, String> {
 
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        tokio::process::Command::new("curl")
-            .args(&["-s", &url])
-            .output(),
+        tokio_cmd!("curl", "-s", &url).output(),
     )
     .await
     .map_err(|_| "Request timed out after 30 seconds.".to_string())?
@@ -1571,17 +1841,28 @@ async fn browser_set_webview_bounds(
 async fn curl_post(url: String, body: String, headers: Vec<Vec<String>>) -> Result<String, String> {
     validate_url(&url)?;
     
-    let mut cmd = tokio::process::Command::new("curl");
-    cmd.args(&["-s", "-N", "-X", "POST", "-d", &body, &url]);
+    let mut cmd = tokio_cmd!("curl", "-s", "-N", "--compressed", "-X", "POST", "-d", "@-", &url);
     for h in headers {
         if h.len() >= 2 {
             cmd.args(&["-H", &format!("{}: {}", h[0], h[1])]);
         }
     }
     
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn curl: {}", e))?;
+    
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(body.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write request body to stdin: {}", e))?;
+    }
+    
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300), // 5 min timeout for LLM responses
-        cmd.output(),
+        child.wait_with_output(),
     )
     .await
     .map_err(|_| "Request timed out after 5 minutes.".to_string())?
@@ -1604,9 +1885,7 @@ fn cancel_stream(session_id: String, state: State<'_, StreamState>) -> Result<()
     if let Some(pid) = streams.remove(&session_id) {
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("taskkill")
-                .args(&["/F", "/PID", &pid.to_string()])
-                .output();
+            let _ = cmd!("taskkill", "/F", "/PID", &pid.to_string()).output();
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -1630,17 +1909,24 @@ async fn curl_post_stream(
 ) -> Result<(), String> {
     validate_url(&url)?;
     
-    let mut cmd = tokio::process::Command::new("curl");
-    cmd.args(&["-s", "-N", "-X", "POST", "-d", &body, &url]);
+    let mut cmd = tokio_cmd!("curl", "-s", "-N", "--compressed", "-X", "POST", "-d", "@-", &url);
     for h in &headers {
         if h.len() >= 2 {
             cmd.args(&["-H", &format!("{}: {}", h[0], h[1])]);
         }
     }
+    cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     
     let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn curl: {}", e))?;
+    
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(body.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write request body to stdin: {}", e))?;
+    }
+    
     let pid = child.id().unwrap_or(0);
     
     // Register the stream PID
@@ -1659,6 +1945,10 @@ async fn curl_post_stream(
     let chunk_event = format!("stream-chunk-{}", session_id);
     let done_event  = format!("stream-done-{}", session_id);
 
+    let mut is_sse = false;
+    let mut first = true;
+    let mut accumulated = String::new();
+
     loop {
         let timeout_result = tokio::time::timeout(
             std::time::Duration::from_secs(300),
@@ -1669,8 +1959,19 @@ async fn curl_post_stream(
             Ok(Ok(Some(line))) => {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
-                    // Emit &str directly — no extra String allocation per token.
-                    let _ = app_clone.emit(&chunk_event, trimmed);
+                    if first {
+                        first = false;
+                        if trimmed.starts_with("data:") {
+                            is_sse = true;
+                        }
+                    }
+                    if is_sse {
+                        // Emit &str directly — no extra String allocation per token.
+                        let _ = app_clone.emit(&chunk_event, trimmed);
+                    } else {
+                        accumulated.push_str(trimmed);
+                        accumulated.push(' ');
+                    }
                 }
             }
             Ok(Ok(None)) => break, // EOF
@@ -1686,8 +1987,41 @@ async fn curl_post_stream(
     }
     let _ = app.emit(&done_event, ());
     
-    // Wait for curl to finish (ignore errors – we already got the data)
-    let _ = child.wait().await;
+    // If it was a non-SSE response, attempt to parse the accumulated string as JSON to extract a clean API error
+    if !is_sse && !accumulated.is_empty() {
+        let json_err: Result<serde_json::Value, _> = serde_json::from_str(&accumulated);
+        if let Ok(json) = json_err {
+            let error_obj = if json.is_array() {
+                json.get(0).and_then(|v| v.get("error"))
+            } else {
+                json.get("error")
+            };
+            if let Some(err) = error_obj {
+                let msg = err.get("message")
+                    .or_else(|| err.get("msg"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown API error");
+                return Err(format!("API Error: {}", msg));
+            }
+        }
+        return Err(format!("API returned non-SSE response: {}", accumulated.trim()));
+    }
+
+    // Wait for curl to finish and check status
+    let status = child.wait().await.map_err(|e| format!("Failed to wait for curl: {}", e))?;
+    if !status.success() {
+        let mut stderr_str = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            use tokio::io::AsyncReadExt;
+            let _ = stderr.read_to_string(&mut stderr_str).await;
+        }
+        let err_msg = if stderr_str.trim().is_empty() {
+            format!("curl stream exited with status: {}", status)
+        } else {
+            format!("curl stream error: {}", stderr_str.trim())
+        };
+        return Err(err_msg);
+    }
     
     Ok(())
 }
@@ -1706,7 +2040,7 @@ const SKILLS_BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Apple
 async fn scrape_skills_sh_description(skill_id: &str) -> Option<String> {
     let url = format!("https://www.skills.sh/{}", skill_id);
     if validate_url(&url).is_err() { return None; }
-    let mut cmd = tokio::process::Command::new("curl");
+    let mut cmd = tokio_cmd!("curl");
     cmd.args([
         "-s", "-L", "--max-time", "15",
         "-H", &format!("User-Agent: {}", SKILLS_BROWSER_UA),
@@ -1899,7 +2233,7 @@ async fn skill_install(
     let mut found = false;
     for url in &candidate_urls {
         if validate_url(url).is_err() { continue; }
-        let mut cmd = tokio::process::Command::new("curl");
+        let mut cmd = tokio_cmd!("curl");
         cmd.args([
             "-s", "-L", "--max-time", "15",
             "-H", &format!("User-Agent: {}", SKILLS_BROWSER_UA),
@@ -1960,7 +2294,7 @@ async fn skill_install(
                             );
                             if let Ok(Ok(out)) = tokio::time::timeout(
                                 std::time::Duration::from_secs(10),
-                                tokio::process::Command::new("curl")
+                                tokio_cmd!("curl")
                                     .args(["-s", "-L", "--max-time", "10",
                                            "-H", &format!("User-Agent: {}", SKILLS_BROWSER_UA),
                                            &raw_url])
@@ -2200,8 +2534,7 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
 #[tauri::command]
 fn start_dev_server_background(dir: String, command: String, state: State<'_, DevServerState>) -> Result<(), String> {
     let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = std::process::Command::new("cmd.exe");
-        c.args(["/c", &command]);
+        let c = cmd!("cmd.exe", "/c", &command);
         c
     } else {
         let mut c = std::process::Command::new("sh");
@@ -2214,12 +2547,6 @@ fn start_dev_server_background(dir: String, command: String, state: State<'_, De
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
     cmd.stdin(std::process::Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     let child = cmd.spawn().map_err(|e| format!("Failed to start dev server in background: {}", e))?;
     let pid = child.id();
     std::mem::forget(child);
@@ -2234,8 +2561,7 @@ fn stop_dev_server_background(port: u16, state: State<'_, DevServerState>) -> Re
     if let Some(pid) = guard.take() {
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
+            let _ = cmd!("taskkill", "/F", "/T", "/PID", &pid.to_string())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn();
@@ -2251,10 +2577,9 @@ fn stop_dev_server_background(port: u16, state: State<'_, DevServerState>) -> Re
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("cmd.exe")
-            .args(["/c", &format!(
+        let _ = cmd!("cmd.exe", "/c", &format!(
                 "for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :{port} ^| findstr LISTENING') do taskkill /F /PID %a"
-            )])
+            ))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
@@ -2289,7 +2614,7 @@ fn check_port_open(port: u16) -> bool {
 /// Fetch JSON from a URL with optional headers (used for GitHub API / raw content).
 async fn github_get(url: &str, accept: &str) -> Result<String, String> {
     validate_url(url)?;
-    let mut cmd = tokio::process::Command::new("curl");
+    let mut cmd = tokio_cmd!("curl");
     cmd.args([
         "-s", "-L", "--max-time", "15",
         "-H", &format!("Accept: {}", accept),
@@ -2325,7 +2650,7 @@ fn parse_installs_str(s: &str) -> u64 {
 async fn skills_fetch_list(query: String, page: u32) -> Result<String, String> {
     // Scrape the skills.sh homepage which is server-side rendered
     let url = "https://www.skills.sh/";
-    let mut cmd = tokio::process::Command::new("curl");
+    let mut cmd = tokio_cmd!("curl");
     cmd.args([
         "-s", "-L", "--max-time", "20",
         "-H", &format!("User-Agent: {}", SKILLS_BROWSER_UA),
@@ -2486,6 +2811,7 @@ pub fn run() {
             get_clipboard_file_paths,
             save_chat_history,
             load_chat_history,
+            delete_chat_session,
             clear_chat_history,
             browser_create_webview,
             browser_close_webview,
@@ -2521,3 +2847,5 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+

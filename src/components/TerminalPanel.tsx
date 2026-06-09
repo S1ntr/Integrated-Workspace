@@ -440,7 +440,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     { label: "Shell", command: "shell", icon: "bx-terminal" },
     { label: "opencode", command: "opencode", icon: "bx-code-alt" },
     { label: "Claude", command: "claude", icon: "bx-bot" },
-    { label: "Antigravity", command: "antigravity", icon: "bx-rocket" },
+    { label: "Antigravity", command: "agy --dangerously-skip-permissions", icon: "bx-rocket" },
   ];
 
   const dragCounter = useRef(0);

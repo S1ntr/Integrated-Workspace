@@ -15,7 +15,10 @@ interface AppConfig {
   active_model: string;
   streaming: boolean;
   thinking_preview: boolean;
+  auto_turns_limit_enabled?: boolean;
   api_keys?: Record<string, string>;
+  chat_tool_mode?: string;
+  disabled_providers?: string[];
 }
 
 // ── Provider validation defs ──
@@ -30,7 +33,7 @@ interface CloudProviderDef extends ProviderIdentity {
   baseUrl: string;
   keyPlaceholder: string;
   docsUrl: string;
-  authScheme: "bearer" | "anthropic" | "gemini" | "ollama";
+  authScheme: "bearer" | "anthropic" | "ollama";
 }
 
 const CLOUD_PROVIDERS: CloudProviderDef[] = [
@@ -74,10 +77,10 @@ const CLOUD_PROVIDERS: CloudProviderDef[] = [
     id: "google", name: "Google Gemini",
     iconUrl: "https://www.google.com/s2/favicons?domain=aistudio.google.com&sz=64",
     short: "G",
-    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/v1/chat/completions",
     keyPlaceholder: "AIza...",
     docsUrl: "https://aistudio.google.com/apikey",
-    authScheme: "gemini",
+    authScheme: "bearer",
   },
   {
     id: "grok", name: "Grok (xAI)",
@@ -104,6 +107,15 @@ const CLOUD_PROVIDERS: CloudProviderDef[] = [
     baseUrl: "https://openrouter.ai/api/v1/chat/completions",
     keyPlaceholder: "sk-or-...",
     docsUrl: "https://openrouter.ai/settings/keys",
+    authScheme: "bearer",
+  },
+  {
+    id: "nvidia", name: "NVIDIA NIM",
+    iconUrl: "https://www.google.com/s2/favicons?domain=nvidia.com&sz=64",
+    short: "NV",
+    baseUrl: "https://integrate.api.nvidia.com/v1/chat/completions",
+    keyPlaceholder: "nvapi-...",
+    docsUrl: "https://build.nvidia.com",
     authScheme: "bearer",
   },
   {
@@ -260,6 +272,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
     active_model: "",
     streaming: true,
     thinking_preview: true,
+    auto_turns_limit_enabled: true,
     api_keys: {},
     chat_tool_mode: "ask",
   });
@@ -318,6 +331,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
           active_model: loaded.active_model || "",
           streaming: loaded.streaming ?? true,
           thinking_preview: loaded.thinking_preview ?? true,
+          auto_turns_limit_enabled: (loaded as any).auto_turns_limit_enabled ?? true,
           api_keys: loaded.api_keys || {},
           chat_tool_mode: (loaded as any).chat_tool_mode || "ask",
         } as any);
@@ -375,7 +389,16 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
       const provDef = CLOUD_PROVIDERS.find(d => d.id === cloudProv);
       if (!provDef) return true;
 
-      const body = JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "ping" }], max_tokens: 1 });
+      let testModel = "gpt-4o-mini";
+      if (cloudProv === "deepseek") testModel = "deepseek-chat";
+      if (cloudProv === "mistral") testModel = "mistral-tiny";
+      if (cloudProv === "google") testModel = "gemini-2.0-flash";
+      if (cloudProv === "grok") testModel = "grok-2-1212";
+      if (cloudProv === "together") testModel = "meta/llama-3-8b-instruct-turbo";
+      if (cloudProv === "openrouter") testModel = "google/gemma-2-9b-it:free";
+      if (cloudProv === "nvidia") testModel = "meta/llama-3.1-8b-instruct";
+
+      const body = JSON.stringify({ model: testModel, messages: [{ role: "user", content: "ping" }], max_tokens: 1 });
 
       let url: string;
       let headers: string[][];
@@ -383,9 +406,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
       if (provDef.authScheme === "anthropic") {
         url = provDef.baseUrl;
         headers = [["x-api-key", key], ["anthropic-version", "2023-06-01"], ["Content-Type", "application/json"]];
-      } else if (provDef.authScheme === "gemini") {
-        url = `${provDef.baseUrl}?key=${key}`;
-        headers = [["Content-Type", "application/json"]];
       } else if (provDef.authScheme === "ollama") {
         url = provDef.baseUrl;
         headers = [["Authorization", `Bearer ${key}`], ["Content-Type", "application/json"]];
@@ -398,8 +418,25 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
         ? JSON.stringify({ model: "gpt-oss:120b", messages: [{ role: "user", content: "ping" }], stream: false })
         : body;
       const res = await invoke<string>("curl_post", { url, body: requestBody, headers });
-      const data = JSON.parse(res);
-      if (data.error) throw new Error(data.error.message || "Invalid key");
+      let data = JSON.parse(res);
+      if (Array.isArray(data) && data.length > 0) {
+        data = data[0];
+      }
+      if (data.error) {
+        const msg = (data.error.message || "").toLowerCase();
+        const isValidKeyButMissingModel = msg.includes("not found") || msg.includes("does not exist") || msg.includes("unknown model") || msg.includes("unsupported model");
+        if (!isValidKeyButMissingModel) {
+          throw new Error(data.error.message || "Invalid key");
+        }
+      } else if (data.status && data.status >= 400) {
+        const msg = (data.detail || data.title || "").toLowerCase();
+        const isAuthError = data.status === 401 || data.status === 403 || msg.includes("auth") || msg.includes("unauthorized") || msg.includes("forbidden") || msg.includes("invalid key") || msg.includes("key is invalid");
+        const isValidKeyButMissingModel = msg.includes("not found") || msg.includes("does not exist") || msg.includes("unknown model") || msg.includes("unsupported model");
+        
+        if (isAuthError || !isValidKeyButMissingModel) {
+          throw new Error(data.detail || data.title || `Error ${data.status}`);
+        }
+      }
 
       // ── Auto-save verified key to OS keychain immediately ──────────────────
       const newConfig = {
@@ -723,6 +760,12 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                     desc="Show the model thinking phase as a collapsible live preview while streaming"
                     checked={config.thinking_preview}
                     onChange={v => setConfig(prev => ({ ...prev, thinking_preview: v }))}
+                  />
+                  <Toggle
+                    label="Orchestrator auto-turn limit"
+                    desc="Stop automatic prompting after 5 consecutive turns to prevent token burn"
+                    checked={!!(config as any).auto_turns_limit_enabled}
+                    onChange={v => setConfig(prev => ({ ...prev, auto_turns_limit_enabled: v } as any))}
                   />
                 </div>
               </div>

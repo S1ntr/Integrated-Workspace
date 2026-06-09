@@ -6,6 +6,13 @@ export interface AgentSession {
   command: string;
 }
 
+export interface CustomPreset {
+  id: string;
+  label: string;
+  command: string;
+  count: number;
+}
+
 export interface OnboardingConfig {
   directory: string;
   sessions: AgentSession[]; // ordered flat list — WorkspaceLayout creates PTYs from this
@@ -18,7 +25,7 @@ interface OnboardingProps {
 
 const AGENTS = [
   { key: "open_code",  label: "opencode",  command: "opencode",    icon: "bx-code-alt", color: "#c084fc", desc: "opencode.ai — AI coding agent" },
-  { key: "antigravity",label: "Antigravity",command: "antigravity", icon: "bx-rocket",   color: "#60a5fa", desc: "Antigravity CLI" },
+  { key: "antigravity",label: "Antigravity",command: "agy --dangerously-skip-permissions", icon: "bx-rocket",   color: "#60a5fa", desc: "Antigravity CLI" },
   { key: "codex",      label: "Codex CLI", command: "codex",       icon: "bx-terminal",  color: "#34d399", desc: "OpenAI Codex CLI" },
   { key: "claude",     label: "Claude",    command: "claude",      icon: "bx-bot",       color: "#818cf8", desc: "Anthropic Claude CLI" },
 ] as const;
@@ -29,7 +36,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
   const [selectedDir, setSelectedDir] = useState("");
   // Per-agent count (0 = not selected, 1+ = how many terminals)
   const [counts, setCounts] = useState<Record<AgentKey, number>>({
-    open_code:   1,  // selected by default
+    open_code:   0,  // selected by default
     antigravity: 0,
     codex:       0,
     claude:      0,
@@ -37,6 +44,14 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
   const [skipClaudePerms, setSkipClaudePerms] = useState(true);
   const [customEntries, setCustomEntries] = useState<{ id: number; label: string; command: string; count: number }[]>([]);
   const [nextCustomId, setNextCustomId] = useState(1);
+  const [presets, setPresets] = useState<CustomPreset[]>(() => {
+    try {
+      const stored = localStorage.getItem("integraded_custom_presets");
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
 
   const pickDir = async () => {
     try {
@@ -199,6 +214,29 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
           {customEntries.map(entry => (
             <div key={entry.id} className="ob-custom-entry" onClick={e => e.stopPropagation()}>
               <i className="bx bx-code-curly ob-custom-icon" />
+              {presets.length > 0 && (
+                <select
+                  className="ob-custom-preset-select"
+                  value=""
+                  onChange={e => {
+                    const presetId = e.target.value;
+                    const selectedPreset = presets.find(p => p.id === presetId);
+                    if (selectedPreset) {
+                      setCustomEntries(prev => prev.map(item => item.id === entry.id ? {
+                        ...item,
+                        label: selectedPreset.label,
+                        command: selectedPreset.command,
+                        count: selectedPreset.count
+                      } : item));
+                    }
+                  }}
+                >
+                  <option value="" disabled>Presets...</option>
+                  {presets.map(p => (
+                    <option key={p.id} value={p.id}>{p.label || p.command}</option>
+                  ))}
+                </select>
+              )}
               <input
                 className="ob-custom-input"
                 type="text"
@@ -226,6 +264,43 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete, onCancel }) 
                   disabled={totalCount >= 16}
                 >+</button>
               </div>
+              <button
+                className="ob-custom-action-btn"
+                type="button"
+                title="Save Preset"
+                disabled={!entry.command.trim()}
+                onClick={() => {
+                  const label = entry.label.trim() || entry.command.trim();
+                  const newPreset: CustomPreset = {
+                    id: Date.now().toString() + Math.random().toString(36).substring(2, 5),
+                    label,
+                    command: entry.command.trim(),
+                    count: entry.count
+                  };
+                  const updated = [...presets.filter(p => p.label !== label && p.command !== newPreset.command), newPreset];
+                  setPresets(updated);
+                  localStorage.setItem("integraded_custom_presets", JSON.stringify(updated));
+                }}
+              >
+                <i className="bx bx-save" />
+              </button>
+              {presets.length > 0 && (
+                <button
+                  className="ob-custom-action-btn delete"
+                  type="button"
+                  title="Delete Preset"
+                  onClick={() => {
+                    const match = presets.find(p => p.command === entry.command);
+                    if (match) {
+                      const updated = presets.filter(p => p.id !== match.id);
+                      setPresets(updated);
+                      localStorage.setItem("integraded_custom_presets", JSON.stringify(updated));
+                    }
+                  }}
+                >
+                  <i className="bx bx-trash" />
+                </button>
+              )}
               <button className="ob-custom-remove" onClick={() => removeCustomEntry(entry.id)} title="Remove">
                 <i className="bx bx-x" />
               </button>

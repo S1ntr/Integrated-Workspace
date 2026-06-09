@@ -391,7 +391,6 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   function startResizeDrag(e: React.MouseEvent, dir: "e" | "s" | "se" | "w" | "n" | "nw" | "ne" | "sw") {
     e.preventDefault();
     e.stopPropagation();
-    const stageRect = stageRef.current?.getBoundingClientRect();
     const stageEl = stageRef.current;
     // Stage padding: 14px left+right = 28px total, 14px top + 38px bottom = 52px total
     const currentW = responsiveSize?.w ?? (stageEl ? stageEl.clientWidth - 28 : 800);
@@ -754,10 +753,6 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     } catch {
       return { info: undefined, rect: null };
     }
-  }
-
-  function readElementInfo(x: number, y: number): string | undefined {
-    return readElementBounds(x, y).info;
   }
 
   function pointFromEvent(event: React.MouseEvent<HTMLDivElement>) {
