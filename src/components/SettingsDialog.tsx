@@ -115,6 +115,15 @@ const CLOUD_PROVIDERS: CloudProviderDef[] = [
     docsUrl: "https://ollama.com/settings/keys",
     authScheme: "ollama",
   },
+  {
+    id: "nvidia", name: "NVIDIA NIM",
+    iconUrl: "https://www.google.com/s2/favicons?domain=nvidia.com&sz=64",
+    short: "NV",
+    baseUrl: "https://integrate.api.nvidia.com/v1/chat/completions",
+    keyPlaceholder: "nvapi-...",
+    docsUrl: "https://build.nvidia.com/settings/api-keys",
+    authScheme: "bearer",
+  },
 ];
 
 const LOCAL_PROVIDERS: Record<"lmstudio" | "ollama", ProviderIdentity> = {

@@ -257,6 +257,7 @@ const PROVIDER_NAMES: Record<string, string> = {
   openai: "OpenAI", anthropic: "Anthropic", deepseek: "DeepSeek",
   mistral: "Mistral", google: "Google", grok: "Grok",
   together: "Together AI", openrouter: "OpenRouter", ollama_cloud: "Ollama Cloud",
+  nvidia: "NVIDIA NIM",
 };
 
 // ─── Markdown helpers ─────────────────────────────────────────────────────────
@@ -2124,6 +2125,7 @@ export const ChatPanel: React.FC<{
       grok: "https://api.x.ai/v1/chat/completions",
       together: "https://api.together.xyz/v1/chat/completions",
       openrouter: "https://openrouter.ai/api/v1/chat/completions",
+      nvidia: "https://integrate.api.nvidia.com/v1/chat/completions",
     };
     const url = URLS[prov] || URLS.openai;
     if (prov === "google") {

@@ -1039,7 +1039,7 @@ fn parse_models(body: &str, provider: &str) -> Result<Vec<ModelInfo>, String> {
             }).collect()
         }
 
-        // ── OpenAI + DeepSeek + Grok (OpenAI-compatible /v1/models) ──────────
+        // ── OpenAI + DeepSeek + Grok + NVIDIA NIM (OpenAI-compatible /v1/models) ─
         // {"data":[{"id":"gpt-4o","object":"model"}]}
         _ => {
             let arr = json["data"].as_array().ok_or("missing data array")?;
@@ -1057,6 +1057,15 @@ fn parse_models(body: &str, provider: &str) -> Result<Vec<ModelInfo>, String> {
                 list.retain(|m| openai_is_chat_model(&m.id));
                 // Sort: newest first (by rough version heuristic)
                 list.sort_by(|a, b| b.id.cmp(&a.id));
+            }
+
+            // For NVIDIA NIM, filter to chat/language models only (skip reranking, embedding, etc.)
+            if provider == "nvidia" {
+                list.retain(|m| {
+                    let id = m.id.to_lowercase();
+                    !id.contains("embed") && !id.contains("rerank") && !id.contains("clip")
+                });
+                list.sort_by(|a, b| a.id.cmp(&b.id));
             }
 
             list
@@ -1130,6 +1139,12 @@ async fn fetch_provider_models(provider: String) -> Result<Vec<ModelInfo>, Strin
             &[("Authorization", &format!("Bearer {}", key))],
         ).await?,
 
+        // NVIDIA NIM — OpenAI-compatible /v1/models endpoint
+        "nvidia" => authed_get(
+            "https://integrate.api.nvidia.com/v1/models",
+            &[("Authorization", &format!("Bearer {}", key))],
+        ).await?,
+
         other => return Err(format!("Unsupported provider: '{}'", other)),
     };
 
@@ -1152,7 +1167,7 @@ const KEYCHAIN_SERVICE: &str = "integraded";
 /// All cloud provider IDs known to the application.
 const KNOWN_PROVIDERS: &[&str] = &[
     "openai", "anthropic", "deepseek", "mistral",
-    "google", "grok", "together", "openrouter", "ollama_cloud",
+    "google", "grok", "together", "openrouter", "ollama_cloud", "nvidia",
 ];
 
 /// Store a secret in the OS keychain under service="integraded", account=provider.
@@ -1432,6 +1447,7 @@ fn validate_url(url: &str) -> Result<(), String> {
         "api.together.xyz",
         "openrouter.ai",
         "ollama.com",
+        "integrate.api.nvidia.com",
         "skills.sh",
         "www.skills.sh",
         "raw.githubusercontent.com",
