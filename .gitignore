@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# pnpm is the package manager — ignore npm/yarn lockfiles
+package-lock.json
+yarn.lock
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -22,3 +26,4 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+desktop.ini
