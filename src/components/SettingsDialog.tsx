@@ -31,6 +31,7 @@ interface CloudProviderDef extends ProviderIdentity {
   keyPlaceholder: string;
   docsUrl: string;
   authScheme: "bearer" | "anthropic" | "gemini" | "ollama";
+  skipValidation?: boolean;
 }
 
 const CLOUD_PROVIDERS: CloudProviderDef[] = [
@@ -123,6 +124,7 @@ const CLOUD_PROVIDERS: CloudProviderDef[] = [
     keyPlaceholder: "nvapi-...",
     docsUrl: "https://build.nvidia.com/settings/api-keys",
     authScheme: "bearer",
+    skipValidation: true,
   },
 ];
 
@@ -384,45 +386,45 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
       const provDef = CLOUD_PROVIDERS.find(d => d.id === cloudProv);
       if (!provDef) return true;
 
-      const body = JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "ping" }], max_tokens: 1 });
+      if (!provDef.skipValidation) {
+        const body = JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "ping" }], max_tokens: 1 });
 
-      let url: string;
-      let headers: string[][];
+        let url: string;
+        let headers: string[][];
 
-      if (provDef.authScheme === "anthropic") {
-        url = provDef.baseUrl;
-        headers = [["x-api-key", key], ["anthropic-version", "2023-06-01"], ["Content-Type", "application/json"]];
-      } else if (provDef.authScheme === "gemini") {
-        url = `${provDef.baseUrl}?key=${key}`;
-        headers = [["Content-Type", "application/json"]];
-      } else if (provDef.authScheme === "ollama") {
-        url = provDef.baseUrl;
-        headers = [["Authorization", `Bearer ${key}`], ["Content-Type", "application/json"]];
-      } else {
-        url = provDef.baseUrl;
-        headers = [["Authorization", `Bearer ${key}`], ["Content-Type", "application/json"]];
+        if (provDef.authScheme === "anthropic") {
+          url = provDef.baseUrl;
+          headers = [["x-api-key", key], ["anthropic-version", "2023-06-01"], ["Content-Type", "application/json"]];
+        } else if (provDef.authScheme === "gemini") {
+          url = `${provDef.baseUrl}?key=${key}`;
+          headers = [["Content-Type", "application/json"]];
+        } else if (provDef.authScheme === "ollama") {
+          url = provDef.baseUrl;
+          headers = [["Authorization", `Bearer ${key}`], ["Content-Type", "application/json"]];
+        } else {
+          url = provDef.baseUrl;
+          headers = [["Authorization", `Bearer ${key}`], ["Content-Type", "application/json"]];
+        }
+
+        const requestBody = provDef.authScheme === "ollama"
+          ? JSON.stringify({ model: "gpt-oss:120b", messages: [{ role: "user", content: "ping" }], stream: false })
+          : body;
+        const res = await invoke<string>("curl_post", { url, body: requestBody, headers });
+        const data = JSON.parse(res);
+        if (data.error) throw new Error(data.error.message || "Invalid key");
       }
 
-      const requestBody = provDef.authScheme === "ollama"
-        ? JSON.stringify({ model: "gpt-oss:120b", messages: [{ role: "user", content: "ping" }], stream: false })
-        : body;
-      const res = await invoke<string>("curl_post", { url, body: requestBody, headers });
-      const data = JSON.parse(res);
-      if (data.error) throw new Error(data.error.message || "Invalid key");
-
-      // ── Auto-save verified key to OS keychain immediately ──────────────────
+      // ── Auto-save key to OS keychain ──────────────────────────────────────
       const newConfig = {
         ...config,
         api_keys: { ...config.api_keys, [cloudProv]: key },
       };
       await invoke("save_config", { config: newConfig });
-      // Update local state: key is now stored (show masked placeholder)
       setConfig(prev => ({
         ...prev,
         api_keys: { ...prev.api_keys, [cloudProv]: "••••••••••••••••" },
       }));
       setKeyStatus(prev => ({ ...prev, [cloudProv]: "ok" }));
-      // Notify ChatPanel so models from this provider appear immediately
       window.dispatchEvent(new CustomEvent("__integradedConfigUpdated"));
       return true;
     } catch (err: any) {
@@ -536,7 +538,11 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ onClose }) => {
                   <p className="stng-section-desc">
                     Keys are encrypted at rest. Click <strong>Verify</strong> to test a key before saving.
                   </p>
-                  {CLOUD_PROVIDERS.map(prov => {
+                  {[...CLOUD_PROVIDERS].sort((a, b) => {
+                    const aHas = (config.api_keys ?? {})[a.id] === "••••••••••••••••";
+                    const bHas = (config.api_keys ?? {})[b.id] === "••••••••••••••••";
+                    return (bHas ? 1 : 0) - (aHas ? 1 : 0);
+                  }).map(prov => {
                     const keyVal = (config.api_keys ?? {})[prov.id] || "";
                     const isSaved = keyVal === "••••••••••••••••";
                     const status = keyStatus[prov.id];
