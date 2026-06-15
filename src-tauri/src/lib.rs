@@ -2158,12 +2158,27 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
         let pkg: serde_json::Value = serde_json::from_str(&pkg_str)
             .map_err(|e| format!("Failed to parse package.json: {}", e))?;
 
-        // Detect package manager from lockfiles (most specific first)
-        let pm = if path.join("bun.lockb").exists() || path.join("bun.lock").exists() {
+        // ── Package manager: check lockfiles AND packageManager field ────────
+        // Also check node_modules/.modules.yaml which pnpm always writes,
+        // and .yarn/releases which Yarn Berry writes — these survive in
+        // sub-project directories that may not have their own lockfile.
+        let pm_field = pkg.get("packageManager")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let pm = if path.join("bun.lockb").exists() || path.join("bun.lock").exists()
+            || pm_field.starts_with("bun")
+        {
             "bun"
-        } else if path.join("pnpm-lock.yaml").exists() {
+        } else if path.join("pnpm-lock.yaml").exists()
+            || path.join("pnpm-workspace.yaml").exists()
+            || path.join("node_modules").join(".modules.yaml").exists()
+            || pm_field.starts_with("pnpm")
+        {
             "pnpm"
-        } else if path.join("yarn.lock").exists() {
+        } else if path.join("yarn.lock").exists()
+            || path.join(".yarn").join("releases").is_dir()
+            || pm_field.starts_with("yarn")
+        {
             "yarn"
         } else {
             "npm"
@@ -2176,7 +2191,7 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
                 || dev_deps.map(|d| d.contains_key(name)).unwrap_or(false)
         };
 
-        // Detect expected port based on framework
+        // ── Port heuristics ──────────────────────────────────────────────────
         let port: u16 = if has_dep("vite")
             || path.join("vite.config.ts").exists()
             || path.join("vite.config.js").exists()
@@ -2196,11 +2211,15 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
             8000
         } else if has_dep("@angular/core") || has_dep("@angular/cli") {
             4200
+        } else if has_dep("astro") {
+            4321
+        } else if has_dep("@remix-run/dev") || has_dep("@remix-run/react") {
+            3000
         } else {
             3000
         };
 
-        // Pick the script to run
+        // ── Script selection ─────────────────────────────────────────────────
         let scripts = pkg.get("scripts").and_then(|v| v.as_object());
         let script = if scripts.map(|s| s.contains_key("dev")).unwrap_or(false) {
             "dev"
@@ -2217,15 +2236,17 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
             );
         };
 
+        // ── Command construction ─────────────────────────────────────────────
+        // npm requires "run" sub-command; pnpm/yarn/bun accept script name directly.
         let command = if pm == "npm" {
             format!("npm run {}", script)
         } else {
-            format!("{} {}", pm, script)
+            format!("{} run {}", pm, script)
         };
 
         return Ok(DevProjectInfo {
             project_type: "node".to_string(),
-            label: format!("{} {}", pm, script),
+            label: format!("{} run {} :{}", pm, script, port),
             command,
             port,
             package_manager: pm.to_string(),
@@ -2240,7 +2261,7 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
     {
         return Ok(DevProjectInfo {
             project_type: "node".to_string(),
-            label: "npx vite".to_string(),
+            label: "npx vite :5173".to_string(),
             command: "npx vite".to_string(),
             port: 5173,
             package_manager: "npx".to_string(),
@@ -2251,7 +2272,7 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
     if path.join("index.html").exists() {
         return Ok(DevProjectInfo {
             project_type: "static".to_string(),
-            label: "Static server".to_string(),
+            label: "serve :3000".to_string(),
             command: "npx --yes serve . --listen 3000".to_string(),
             port: 3000,
             package_manager: "npx".to_string(),
@@ -2296,6 +2317,53 @@ fn list_sub_projects(dir: String) -> Vec<SubProjectInfo> {
     results
 }
 
+/// Extend PATH with common Node.js binary locations so npm/pnpm/yarn/bun
+/// are found even when the Tauri app was launched from a GUI shortcut or
+/// file manager (which gives a minimal environment without shell rc files).
+fn node_extended_path() -> String {
+    let base = std::env::var("PATH").unwrap_or_default();
+
+    #[cfg(target_os = "windows")]
+    {
+        let appdata  = std::env::var("APPDATA").unwrap_or_default();
+        let local    = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let profile  = std::env::var("USERPROFILE").unwrap_or_default();
+        let extras = [
+            format!("{local}\\pnpm"),                     // pnpm (modern)
+            format!("{appdata}\\npm"),                    // npm global
+            format!("{profile}\\.bun\\bin"),              // bun
+            format!("{profile}\\.volta\\bin"),            // volta
+            format!("{local}\\Volta\\bin"),               // volta (alt)
+            "C:\\Program Files\\nodejs".to_string(),
+            "C:\\Program Files (x86)\\nodejs".to_string(),
+        ];
+        let extra: Vec<&str> = extras.iter()
+            .filter(|p| Path::new(p.as_str()).exists())
+            .map(|p| p.as_str())
+            .collect();
+        if extra.is_empty() { return base; }
+        format!("{};{}", extra.join(";"), base)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let extras = [
+            format!("{home}/.bun/bin"),
+            format!("{home}/.volta/bin"),
+            format!("{home}/.nvm/versions/node/current/bin"),
+            "/usr/local/bin".to_string(),
+            "/opt/homebrew/bin".to_string(),    // macOS Apple Silicon
+        ];
+        let extra: Vec<&str> = extras.iter()
+            .filter(|p| Path::new(p.as_str()).exists())
+            .map(|p| p.as_str())
+            .collect();
+        if extra.is_empty() { return base; }
+        format!("{}:{}", extra.join(":"), base)
+    }
+}
+
 /// Start the dev server as a detached background process.
 #[tauri::command]
 fn start_dev_server_background(dir: String, command: String, state: State<'_, DevServerState>) -> Result<(), String> {
@@ -2308,6 +2376,8 @@ fn start_dev_server_background(dir: String, command: String, state: State<'_, De
         c.args(["-c", &command]);
         c
     };
+    // Ensure Node.js package managers are discoverable even from a GUI launch.
+    cmd.env("PATH", node_extended_path());
     if !dir.is_empty() && Path::new(&dir).exists() {
         cmd.current_dir(&dir);
     }
