@@ -341,6 +341,17 @@ fn select_directory(state: State<'_, WorkspaceState>) -> Option<String> {
     dir.map(|p| p.to_string_lossy().to_string())
 }
 
+/// Open a native folder picker starting from `start_dir` and return the chosen path.
+/// Used by the integrated browser to let the user manually pick a project subfolder.
+#[tauri::command]
+fn pick_project_folder(start_dir: Option<String>) -> Option<String> {
+    let mut dialog = rfd::FileDialog::new().set_title("Select Project Folder");
+    if let Some(ref dir) = start_dir {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.pick_folder().map(|p| p.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn set_active_workspace(dir_path: String, state: State<'_, WorkspaceState>) -> Result<(), String> {
     register_workspace_root(Path::new(&dir_path), &state).map(|_| ())
@@ -2616,6 +2627,7 @@ pub fn run() {
             cancel_stream,
             detect_dev_project,
             list_sub_projects,
+            pick_project_folder,
             check_port_open,
             start_dev_server_background,
             stop_dev_server_background,

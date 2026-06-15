@@ -751,6 +751,12 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     }
   }
 
+  async function browseAndOpenProject() {
+    const picked = await invoke<string | null>("pick_project_folder", { startDir: directory || null });
+    if (!picked) return;
+    void openCurrentProject(picked);
+  }
+
   async function stopDevServer() {
     devAbortRef.current = true;
     setDevRunning(false);
@@ -1041,6 +1047,10 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
             <i className="bx bx-code-block" />
             <span>Current project</span>
           </button>
+          <button type="button" className="browser-current-project-btn" onClick={() => void browseAndOpenProject()} title="Browse and select a project folder">
+            <i className="bx bx-folder-open" />
+            <span>Browse</span>
+          </button>
 
           <div className="browser-tool-group" aria-label="Browser tools">
             <button type="button" className={`browser-tool-btn ${tool === "browse" ? "active" : ""}`} onClick={() => setTool("browse")} title="Interact with page">
@@ -1209,10 +1219,16 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                       <button type="submit"><i className="bx bx-right-arrow-alt" /></button>
                     </form>
                     {mode === "app" && subProjects.length === 0 && (
-                      <button type="button" className="browser-start-project" onClick={() => void openCurrentProject()}>
-                        <i className="bx bx-code-block" />
-                        {currentProjectUrl ? "Current project" : "Start dev server"}
-                      </button>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center" }}>
+                        <button type="button" className="browser-start-project" onClick={() => void openCurrentProject()}>
+                          <i className="bx bx-code-block" />
+                          {currentProjectUrl ? "Current project" : "Start dev server"}
+                        </button>
+                        <button type="button" className="browser-start-project" onClick={() => void browseAndOpenProject()}>
+                          <i className="bx bx-folder-open" />
+                          Browse folder…
+                        </button>
+                      </div>
                     )}
                     {mode === "app" && subProjects.length > 0 && (
                       <div className="browser-project-picker">
@@ -1233,9 +1249,14 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                             </button>
                           ))}
                         </div>
-                        <button type="button" className="browser-start-project" style={{ marginTop: 8 }} onClick={() => { setSubProjects([]); void openCurrentProject(); }}>
-                          <i className="bx bx-refresh" /> Rescan
-                        </button>
+                        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                          <button type="button" className="browser-start-project" onClick={() => { setSubProjects([]); void openCurrentProject(); }}>
+                            <i className="bx bx-refresh" /> Rescan
+                          </button>
+                          <button type="button" className="browser-start-project" onClick={() => void browseAndOpenProject()}>
+                            <i className="bx bx-folder-open" /> Browse…
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
