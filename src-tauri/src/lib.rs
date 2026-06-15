@@ -2150,54 +2150,6 @@ fn list_dir_shallow(dir: String) -> Vec<DirEntry> {
 fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
     let path = Path::new(&dir);
 
-    // ── Tauri desktop app ───────────────────────────────────────────────────
-    let tauri_conf = path.join("src-tauri").join("tauri.conf.json");
-    let tauri_cargo = path.join("src-tauri").join("Cargo.toml");
-    if tauri_conf.exists() || tauri_cargo.exists() {
-        let pm = if path.join("bun.lockb").exists() || path.join("bun.lock").exists() {
-            "bun"
-        } else if path.join("pnpm-lock.yaml").exists() {
-            "pnpm"
-        } else if path.join("yarn.lock").exists() {
-            "yarn"
-        } else if path.join("package.json").exists() {
-            "npm"
-        } else {
-            "cargo"
-        };
-
-        // Try to read devUrl / devPath from tauri.conf.json to get port
-        let port: u16 = if let Ok(conf_str) = fs::read_to_string(&tauri_conf) {
-            if let Ok(conf) = serde_json::from_str::<serde_json::Value>(&conf_str) {
-                let dev_url = conf.get("build")
-                    .and_then(|b| b.get("devUrl").or_else(|| b.get("devPath")))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if let Some(port_str) = dev_url.split(':').last().and_then(|s| s.split('/').next()) {
-                    port_str.parse::<u16>().unwrap_or(5173)
-                } else {
-                    5173
-                }
-            } else { 5173 }
-        } else { 5173 };
-
-        let (command, label) = if pm == "cargo" {
-            ("cargo tauri dev".to_string(), "Tauri (Rust)".to_string())
-        } else if pm == "npm" {
-            ("npm run tauri -- dev".to_string(), format!("Tauri (npm) :{}",  port))
-        } else {
-            (format!("{} tauri dev", pm), format!("Tauri ({}) :{}", pm, port))
-        };
-
-        return Ok(DevProjectInfo {
-            project_type: "tauri".to_string(),
-            label,
-            command,
-            port,
-            package_manager: pm.to_string(),
-        });
-    }
-
     // ── Node.js / npm / pnpm / yarn / bun project ──────────────────────────
     let pkg_path = path.join("package.json");
     if pkg_path.exists() {
