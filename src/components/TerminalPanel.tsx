@@ -42,6 +42,8 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   const lastSentSize   = useRef({ rows: 0, cols: 0 });
 
   const [status, setStatus] = useState<"booting" | "running" | "exited">("booting");
+  const [autoScroll, setAutoScroll] = useState(true);
+  const autoScrollRef = useRef(true);
 
   const updateStatus = (newStatus: "booting" | "running" | "exited") => {
     setStatus(newStatus);
@@ -250,7 +252,10 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
 
       // ── 4. PTY events ─────────────────────────────────────────────────────
       listen<string>(`pty-data-${sessionId}`, (e) => {
-        if (active && !destroyed.current) term.write(e.payload);
+        if (active && !destroyed.current) {
+          term.write(e.payload);
+          if (autoScrollRef.current) term.scrollToBottom();
+        }
       }).then(fn => {
         if (active) {
           cleanupData = fn;
@@ -573,6 +578,18 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
         <span className="term-badge">#{id + 1}</span>
         {status === "exited" && <span className="term-exited-label">exited</span>}
         <span className="term-path">{dirShort}</span>
+        <button
+          className={`term-close-btn${autoScroll ? " term-autoscroll-active" : ""}`}
+          title={autoScroll ? "Auto-scroll: ON — click to disable" : "Auto-scroll: OFF — click to enable"}
+          onClick={() => {
+            const next = !autoScroll;
+            setAutoScroll(next);
+            autoScrollRef.current = next;
+            if (next) termRef.current?.scrollToBottom();
+          }}
+        >
+          <i className={`bx ${autoScroll ? "bx-down-arrow-circle" : "bx-pause-circle"}`} />
+        </button>
         <button
           className="term-close-btn"
           title={fullscreened ? "Exit fullscreen (Esc)" : "Fullscreen"}

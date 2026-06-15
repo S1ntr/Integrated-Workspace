@@ -15,6 +15,12 @@ interface DevProjectInfo {
   package_manager: string;
 }
 
+interface SubProjectInfo {
+  dir: string;
+  name: string;
+  project: DevProjectInfo;
+}
+
 interface BrowserSelection {
   kind: "element" | "region";
   x: number;
@@ -138,6 +144,12 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
   const [devInfo, setDevInfo] = useState<DevProjectInfo | null>(null);
   const [devRunning, setDevRunning] = useState(false);
   const devAbortRef = useRef(false);
+
+  // Multi-project picker state
+  const [subProjects, setSubProjects] = useState<SubProjectInfo[]>([]);
+
+  // Pointer-lock pan indicator
+  const [isPanning, setIsPanning] = useState(false);
 
   const preset = useMemo(
     () => DEVICE_PRESETS.find(item => item.key === device) || DEVICE_PRESETS[0],
@@ -424,24 +436,43 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
 
   function startPanDrag(e: React.MouseEvent) {
     if (e.button !== 0) return;
-    panDragRef.current = { startX: e.clientX, startY: e.clientY, startPanX: pan.x, startPanY: pan.y };
+    const el = e.currentTarget as HTMLElement;
+
     const onMove = (mv: MouseEvent) => {
-      const drag = panDragRef.current;
-      if (!drag) return;
-      const stageRect = stageRef.current?.getBoundingClientRect();
-      if (!stageRect) return;
-      const maxX = Math.max(0, (responsiveSize?.w ?? stageRect.width) / 2);
-      const maxY = Math.max(0, (responsiveSize?.h ?? stageRect.height) / 2);
-      setPan({
-        x: Math.max(-maxX, Math.min(maxX, drag.startPanX + (mv.clientX - drag.startX))),
-        y: Math.max(-maxY, Math.min(maxY, drag.startPanY + (mv.clientY - drag.startY))),
-      });
+      const stage = stageRef.current;
+      const maxX = Math.max(0, (responsiveSize?.w ?? stage?.clientWidth ?? 800));
+      const maxY = Math.max(0, (responsiveSize?.h ?? stage?.clientHeight ?? 600));
+      setPan(prev => ({
+        x: Math.max(-maxX, Math.min(maxX, prev.x + mv.movementX)),
+        y: Math.max(-maxY, Math.min(maxY, prev.y + mv.movementY)),
+      }));
     };
+
     const onUp = () => {
-      panDragRef.current = null;
+      if (document.pointerLockElement) document.exitPointerLock();
+      setIsPanning(false);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
+
+    const onLockChange = () => {
+      if (!document.pointerLockElement) {
+        setIsPanning(false);
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        document.removeEventListener("pointerlockchange", onLockChange);
+      }
+    };
+
+    try {
+      el.requestPointerLock();
+      setIsPanning(true);
+      document.addEventListener("pointerlockchange", onLockChange);
+    } catch {
+      // Fallback: absolute-position drag if pointer lock unavailable
+      panDragRef.current = { startX: e.clientX, startY: e.clientY, startPanX: pan.x, startPanY: pan.y };
+    }
+
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   }
@@ -632,16 +663,18 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     );
   }
 
-  async function openCurrentProject() {
+  async function openCurrentProject(dirOverride?: string) {
+    const targetDir = dirOverride || directory;
+
     // If a URL is already known (dev server already running), just navigate.
-    if (currentProjectUrl) {
+    if (!dirOverride && currentProjectUrl) {
       setActiveTabId("project");
       setMode("app");
       navigateTo(currentProjectUrl, "push", "project", "project");
       return;
     }
 
-    if (!directory) {
+    if (!targetDir) {
       setBrowserHint("No project directory available.");
       setTimeout(() => setBrowserHint(""), 2600);
       return;
@@ -654,11 +687,32 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
 
     setDevError("");
     setDevInfo(null);
+    setSubProjects([]);
     setDevStatus("detecting");
 
     try {
       // Step 1 — detect project type
-      const info = await invoke<DevProjectInfo>("detect_dev_project", { dir: directory });
+      let info: DevProjectInfo;
+      try {
+        info = await invoke<DevProjectInfo>("detect_dev_project", { dir: targetDir });
+      } catch (detectionErr) {
+        // Detection failed — scan subdirectories for projects
+        if (devAbortRef.current) return;
+        const subs = await invoke<SubProjectInfo[]>("list_sub_projects", { dir: targetDir });
+        if (devAbortRef.current) return;
+        if (subs.length === 1) {
+          // Only one sub-project found — auto-select it
+          setDevStatus("idle");
+          void openCurrentProject(subs[0].dir);
+          return;
+        }
+        if (subs.length > 1) {
+          setSubProjects(subs);
+          setDevStatus("idle");
+          return;
+        }
+        throw detectionErr;
+      }
       if (devAbortRef.current) return;
       setDevInfo(info);
 
@@ -676,7 +730,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
 
       // Step 3 — start the dev server silently in the background
       setDevStatus("starting");
-      await invoke("start_dev_server_background", { dir: directory, command: info.command });
+      await invoke("start_dev_server_background", { dir: targetDir, command: info.command });
       if (devAbortRef.current) return;
 
       // Step 4 — wait up to 60s for the port to open
@@ -1154,11 +1208,35 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                       <input value={address} onChange={event => setAddress(event.target.value)} placeholder="google.com, search text, or localhost:3000" />
                       <button type="submit"><i className="bx bx-right-arrow-alt" /></button>
                     </form>
-                    {mode === "app" && (
+                    {mode === "app" && subProjects.length === 0 && (
                       <button type="button" className="browser-start-project" onClick={() => void openCurrentProject()}>
                         <i className="bx bx-code-block" />
                         {currentProjectUrl ? "Current project" : "Start dev server"}
                       </button>
+                    )}
+                    {mode === "app" && subProjects.length > 0 && (
+                      <div className="browser-project-picker">
+                        <span className="browser-project-picker-title">
+                          <i className="bx bx-folder-open" /> Multiple projects found — choose one:
+                        </span>
+                        <div className="browser-project-picker-list">
+                          {subProjects.map(sp => (
+                            <button
+                              key={sp.dir}
+                              type="button"
+                              className="browser-project-card"
+                              onClick={() => { setSubProjects([]); void openCurrentProject(sp.dir); }}
+                            >
+                              <i className={`bx ${sp.project.project_type === "tauri" ? "bx-desktop" : "bx-code-block"}`} />
+                              <span className="browser-project-card-name">{sp.name}</span>
+                              <span className="browser-project-card-meta">{sp.project.label}</span>
+                            </button>
+                          ))}
+                        </div>
+                        <button type="button" className="browser-start-project" style={{ marginTop: 8 }} onClick={() => { setSubProjects([]); void openCurrentProject(); }}>
+                          <i className="bx bx-refresh" /> Rescan
+                        </button>
+                      </div>
                     )}
                   </div>
                 )}
@@ -1235,9 +1313,14 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                       ref={viewportRef}
                       className={`browser-viewport device-fluid tool-${tool} ${responsiveSize && tool === "browse" ? "is-pannable" : ""}`}
                       onMouseDown={responsiveSize && tool === "browse" ? startPanDrag : undefined}
-                      style={responsiveSize && tool === "browse" ? { cursor: "grab" } : undefined}
+                      style={responsiveSize && tool === "browse" ? { cursor: isPanning ? "none" : "grab" } : undefined}
                     >
                       {viewportContent}
+                      {isPanning && (
+                        <div className="browser-pan-indicator">
+                          <i className="bx bx-move" /> Panning — release to stop
+                        </div>
+                      )}
                     </div>
 
                     {/* Always-visible resize handles (when sized) */}

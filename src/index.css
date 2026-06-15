@@ -1028,6 +1028,7 @@ input, textarea { font-family: var(--font-ui); }
   font-size: 13px; margin-left: auto; transition: all 0.1s; flex-shrink: 0; cursor: pointer;
 }
 .term-close-btn:hover { color: var(--err); background: var(--err-dim); }
+.term-autoscroll-active { color: var(--accent) !important; }
 .term-path { font-family: var(--font-mono); font-size: 9px; color: var(--text-3); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .term-exited-label { font-family: var(--font-mono); font-size: 9px; color: var(--err); flex-shrink: 0; }
 
@@ -1868,6 +1869,39 @@ input, textarea { font-family: var(--font-ui); }
 }
 .browser-start-project:hover,
 .browser-webview-status button:hover { background: var(--bg-3); }
+
+/* ── Multi-project picker ── */
+.browser-project-picker {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  margin-top: 10px; width: min(520px, 100%);
+}
+.browser-project-picker-title {
+  font-size: 11px; color: var(--text-2); display: flex; align-items: center; gap: 5px;
+}
+.browser-project-picker-list {
+  display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; width: 100%;
+}
+.browser-project-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 3px;
+  padding: 10px 14px; border-radius: var(--radius-sm);
+  background: var(--bg-2); border: 1px solid var(--border-1);
+  cursor: pointer; min-width: 130px; max-width: 200px; text-align: left;
+  transition: background 0.12s, border-color 0.12s;
+}
+.browser-project-card:hover { background: var(--bg-3); border-color: var(--accent-border); }
+.browser-project-card > i { font-size: 18px; color: var(--accent); margin-bottom: 2px; }
+.browser-project-card-name { font-size: 12px; font-weight: 600; color: var(--text-1); }
+.browser-project-card-meta { font-size: 10px; color: var(--text-3); font-family: var(--font-mono); }
+
+/* ── Pointer-lock pan indicator ── */
+.browser-pan-indicator {
+  position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+  background: rgba(0,0,0,0.75); color: #fff; font-size: 11px;
+  padding: 5px 12px; border-radius: 20px; pointer-events: none;
+  display: flex; align-items: center; gap: 6px; z-index: 20;
+  backdrop-filter: blur(4px);
+}
+
 .browser-webview-host {
   width: 100%;
   height: 100%;

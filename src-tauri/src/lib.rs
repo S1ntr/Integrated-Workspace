@@ -2091,11 +2091,66 @@ pub struct DevProjectInfo {
     pub package_manager: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SubProjectInfo {
+    pub dir: String,
+    pub name: String,
+    pub project: DevProjectInfo,
+}
+
 /// Inspect the workspace directory and return the command + port needed to start
 /// a dev server, with no AI involved — pure file-based heuristics.
 #[tauri::command]
 fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
     let path = Path::new(&dir);
+
+    // ── Tauri desktop app ───────────────────────────────────────────────────
+    let tauri_conf = path.join("src-tauri").join("tauri.conf.json");
+    let tauri_cargo = path.join("src-tauri").join("Cargo.toml");
+    if tauri_conf.exists() || tauri_cargo.exists() {
+        let pm = if path.join("bun.lockb").exists() || path.join("bun.lock").exists() {
+            "bun"
+        } else if path.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else if path.join("yarn.lock").exists() {
+            "yarn"
+        } else if path.join("package.json").exists() {
+            "npm"
+        } else {
+            "cargo"
+        };
+
+        // Try to read devUrl / devPath from tauri.conf.json to get port
+        let port: u16 = if let Ok(conf_str) = fs::read_to_string(&tauri_conf) {
+            if let Ok(conf) = serde_json::from_str::<serde_json::Value>(&conf_str) {
+                let dev_url = conf.get("build")
+                    .and_then(|b| b.get("devUrl").or_else(|| b.get("devPath")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(port_str) = dev_url.split(':').last().and_then(|s| s.split('/').next()) {
+                    port_str.parse::<u16>().unwrap_or(5173)
+                } else {
+                    5173
+                }
+            } else { 5173 }
+        } else { 5173 };
+
+        let (command, label) = if pm == "cargo" {
+            ("cargo tauri dev".to_string(), "Tauri (Rust)".to_string())
+        } else if pm == "npm" {
+            ("npm run tauri -- dev".to_string(), format!("Tauri (npm) :{}",  port))
+        } else {
+            (format!("{} tauri dev", pm), format!("Tauri ({}) :{}", pm, port))
+        };
+
+        return Ok(DevProjectInfo {
+            project_type: "tauri".to_string(),
+            label,
+            command,
+            port,
+            package_manager: pm.to_string(),
+        });
+    }
 
     // ── Node.js / npm / pnpm / yarn / bun project ──────────────────────────
     let pkg_path = path.join("package.json");
@@ -2210,6 +2265,37 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
          vite.config.*, or index.html in the workspace directory."
             .to_string(),
     )
+}
+
+/// Scan one level of subdirectories and return those that contain a recognisable project.
+#[tauri::command]
+fn list_sub_projects(dir: String) -> Vec<SubProjectInfo> {
+    let path = Path::new(&dir);
+    let mut results = Vec::new();
+
+    let Ok(entries) = fs::read_dir(path) else { return results; };
+    let mut dirs: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .collect();
+    dirs.sort_by_key(|e| e.file_name());
+
+    for entry in dirs {
+        let sub = entry.path();
+        let name = sub.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        // Skip dot-dirs and build artifacts
+        if name.starts_with('.') || matches!(name.as_str(), "node_modules" | "target" | "dist" | ".git" | "__pycache__") {
+            continue;
+        }
+        let sub_str = sub.to_string_lossy().to_string();
+        if let Ok(project) = detect_dev_project(sub_str.clone()) {
+            results.push(SubProjectInfo { dir: sub_str, name, project });
+        }
+    }
+    results
 }
 
 /// Start the dev server as a detached background process.
@@ -2529,6 +2615,7 @@ pub fn run() {
             curl_post_stream,
             cancel_stream,
             detect_dev_project,
+            list_sub_projects,
             check_port_open,
             start_dev_server_background,
             stop_dev_server_background,
