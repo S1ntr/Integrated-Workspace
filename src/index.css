@@ -1893,6 +1893,79 @@ input, textarea { font-family: var(--font-ui); }
 .browser-project-card-name { font-size: 12px; font-weight: 600; color: var(--text-1); }
 .browser-project-card-meta { font-size: 10px; color: var(--text-3); font-family: var(--font-mono); }
 
+/* ── In-app file browser ── */
+.browser-filebrowser {
+  position: absolute; inset: 0; z-index: 15;
+  background: var(--bg-base);
+  display: flex; flex-direction: column;
+  font-size: 12px;
+}
+.browser-filebrowser-header {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 8px; border-bottom: 1px solid var(--border-1);
+  background: var(--bg-1); flex-shrink: 0;
+}
+.browser-fb-btn {
+  width: 24px; height: 24px; border: none; background: transparent;
+  color: var(--text-2); border-radius: var(--radius-xs);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; font-size: 15px; flex-shrink: 0;
+}
+.browser-fb-btn:hover { background: var(--bg-3); color: var(--text-1); }
+.browser-fb-breadcrumb {
+  display: flex; align-items: center; gap: 2px; flex: 1; min-width: 0; overflow: hidden;
+  font-size: 11px;
+}
+.browser-fb-crumb {
+  border: none; background: transparent; color: var(--text-2);
+  cursor: pointer; padding: 2px 4px; border-radius: 3px;
+  white-space: nowrap; max-width: 120px; overflow: hidden; text-overflow: ellipsis;
+}
+.browser-fb-crumb:hover { background: var(--bg-3); color: var(--text-1); }
+.browser-fb-crumb.active { color: var(--text-1); font-weight: 600; cursor: default; }
+.browser-fb-sep { color: var(--text-3); flex-shrink: 0; }
+.browser-filebrowser-list {
+  flex: 1; overflow-y: auto; padding: 4px;
+  display: flex; flex-direction: column; gap: 1px;
+}
+.browser-fb-empty { color: var(--text-3); padding: 20px; text-align: center; font-size: 11px; }
+.browser-fb-item {
+  display: flex; align-items: center; border-radius: var(--radius-xs);
+  transition: background 0.08s;
+}
+.browser-fb-item:hover { background: var(--bg-2); }
+.browser-fb-item-main {
+  flex: 1; display: flex; align-items: center; gap: 7px;
+  padding: 5px 7px; border: none; background: transparent;
+  cursor: pointer; text-align: left; min-width: 0;
+  color: var(--text-1);
+}
+.browser-fb-item.file .browser-fb-item-main { cursor: default; color: var(--text-2); }
+.browser-fb-item-main > i { font-size: 14px; color: var(--text-2); flex-shrink: 0; }
+.browser-fb-item.has-project .browser-fb-item-main > i { color: var(--accent); }
+.browser-fb-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.browser-fb-badge {
+  font-size: 9px; padding: 1px 5px; border-radius: 4px;
+  background: var(--accent-subtle); color: var(--accent);
+  border: 1px solid var(--accent-border); white-space: nowrap; flex-shrink: 0;
+  font-family: var(--font-mono);
+}
+.browser-fb-detecting {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-3); flex-shrink: 0;
+  animation: browser-fb-pulse 1s ease-in-out infinite;
+}
+@keyframes browser-fb-pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
+.browser-fb-start {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 8px; margin-right: 6px; border-radius: var(--radius-xs);
+  background: var(--accent-subtle); color: var(--accent);
+  border: 1px solid var(--accent-border); cursor: pointer;
+  font-size: 10px; font-weight: 600; flex-shrink: 0;
+  transition: background 0.1s;
+}
+.browser-fb-start:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+
 /* ── Pointer-lock pan indicator ── */
 .browser-pan-indicator {
   position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);

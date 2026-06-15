@@ -2109,6 +2109,41 @@ pub struct SubProjectInfo {
     pub project: DevProjectInfo,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DirEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
+
+/// List immediate children of `dir` (no recursion) for the in-app file browser.
+/// Skips hidden dirs and build artifacts, shows files too.
+#[tauri::command]
+fn list_dir_shallow(dir: String) -> Vec<DirEntry> {
+    let path = Path::new(&dir);
+    let blocked: &[&str] = &[
+        "node_modules", "target", "dist", "build", ".git",
+        ".next", ".nuxt", "__pycache__", ".svelte-kit",
+    ];
+    let Ok(entries) = fs::read_dir(path) else { return Vec::new(); };
+    let mut items: Vec<DirEntry> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let is_dir = e.path().is_dir();
+            if is_dir && (name.starts_with('.') || blocked.contains(&name.as_str())) {
+                return None;
+            }
+            Some(DirEntry { name, path: e.path().to_string_lossy().to_string(), is_dir })
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        if a.is_dir != b.is_dir { b.is_dir.cmp(&a.is_dir) }
+        else { a.name.to_lowercase().cmp(&b.name.to_lowercase()) }
+    });
+    items
+}
+
 /// Inspect the workspace directory and return the command + port needed to start
 /// a dev server, with no AI involved — pure file-based heuristics.
 #[tauri::command]
@@ -2627,6 +2662,7 @@ pub fn run() {
             cancel_stream,
             detect_dev_project,
             list_sub_projects,
+            list_dir_shallow,
             pick_project_folder,
             check_port_open,
             start_dev_server_background,

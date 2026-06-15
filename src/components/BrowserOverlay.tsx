@@ -21,6 +21,18 @@ interface SubProjectInfo {
   project: DevProjectInfo;
 }
 
+interface DirEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+}
+
+interface FileBrowserState {
+  path: string;
+  items: DirEntry[];
+  stack: string[]; // paths visited before this one, for back navigation
+}
+
 interface BrowserSelection {
   kind: "element" | "region";
   x: number;
@@ -150,6 +162,10 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
 
   // Pointer-lock pan indicator
   const [isPanning, setIsPanning] = useState(false);
+
+  // In-app file browser
+  const [fileBrowser, setFileBrowser] = useState<FileBrowserState | null>(null);
+  const [fileBrowserProjects, setFileBrowserProjects] = useState<Record<string, DevProjectInfo | null>>({});
 
   const preset = useMemo(
     () => DEVICE_PRESETS.find(item => item.key === device) || DEVICE_PRESETS[0],
@@ -757,6 +773,65 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     void openCurrentProject(picked);
   }
 
+  // ── In-app file browser ──────────────────────────────────────────────────
+
+  async function detectProjectsForEntries(entries: DirEntry[]) {
+    const dirs = entries.filter(e => e.is_dir);
+    await Promise.all(dirs.map(async e => {
+      try {
+        const proj = await invoke<DevProjectInfo>("detect_dev_project", { dir: e.path });
+        setFileBrowserProjects(prev => ({ ...prev, [e.path]: proj }));
+      } catch {
+        setFileBrowserProjects(prev => ({ ...prev, [e.path]: null }));
+      }
+    }));
+  }
+
+  async function openFileBrowser() {
+    const startPath = directory;
+    if (!startPath) return;
+    const items = await invoke<DirEntry[]>("list_dir_shallow", { dir: startPath });
+    setFileBrowser({ path: startPath, items, stack: [] });
+    void detectProjectsForEntries(items);
+  }
+
+  async function navigateFileBrowser(entry: DirEntry) {
+    if (!entry.is_dir || !fileBrowser) return;
+    const items = await invoke<DirEntry[]>("list_dir_shallow", { dir: entry.path });
+    setFileBrowser({ path: entry.path, items, stack: [...fileBrowser.stack, fileBrowser.path] });
+    void detectProjectsForEntries(items);
+  }
+
+  async function goBackFileBrowser() {
+    if (!fileBrowser) return;
+    if (fileBrowser.stack.length === 0) { setFileBrowser(null); return; }
+    const prevPath = fileBrowser.stack[fileBrowser.stack.length - 1];
+    const items = await invoke<DirEntry[]>("list_dir_shallow", { dir: prevPath });
+    setFileBrowser({ path: prevPath, items, stack: fileBrowser.stack.slice(0, -1) });
+    void detectProjectsForEntries(items);
+  }
+
+  function fileBrowserBreadcrumb(): Array<{ label: string; path: string }> {
+    if (!fileBrowser) return [];
+    const allPaths = [...fileBrowser.stack, fileBrowser.path];
+    return allPaths.map((p, i) => ({
+      label: i === 0
+        ? (directory ? directory.split(/[\\/]/).pop() || p : p.split(/[\\/]/).pop() || p)
+        : p.split(/[\\/]/).pop() || p,
+      path: p,
+    }));
+  }
+
+  async function jumpFileBrowser(targetPath: string) {
+    if (!fileBrowser) return;
+    const allPaths = [...fileBrowser.stack, fileBrowser.path];
+    const idx = allPaths.indexOf(targetPath);
+    if (idx < 0) return;
+    const items = await invoke<DirEntry[]>("list_dir_shallow", { dir: targetPath });
+    setFileBrowser({ path: targetPath, items, stack: allPaths.slice(0, idx) });
+    void detectProjectsForEntries(items);
+  }
+
   async function stopDevServer() {
     devAbortRef.current = true;
     setDevRunning(false);
@@ -1047,7 +1122,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
             <i className="bx bx-code-block" />
             <span>Current project</span>
           </button>
-          <button type="button" className="browser-current-project-btn" onClick={() => void browseAndOpenProject()} title="Browse and select a project folder">
+          <button type="button" className="browser-current-project-btn" onClick={() => void openFileBrowser()} title="Browse workspace folders to pick a project">
             <i className="bx bx-folder-open" />
             <span>Browse</span>
           </button>
@@ -1224,7 +1299,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                           <i className="bx bx-code-block" />
                           {currentProjectUrl ? "Current project" : "Start dev server"}
                         </button>
-                        <button type="button" className="browser-start-project" onClick={() => void browseAndOpenProject()}>
+                        <button type="button" className="browser-start-project" onClick={() => void openFileBrowser()}>
                           <i className="bx bx-folder-open" />
                           Browse folder…
                         </button>
@@ -1253,7 +1328,7 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                           <button type="button" className="browser-start-project" onClick={() => { setSubProjects([]); void openCurrentProject(); }}>
                             <i className="bx bx-refresh" /> Rescan
                           </button>
-                          <button type="button" className="browser-start-project" onClick={() => void browseAndOpenProject()}>
+                          <button type="button" className="browser-start-project" onClick={() => void openFileBrowser()}>
                             <i className="bx bx-folder-open" /> Browse…
                           </button>
                         </div>
@@ -1310,6 +1385,80 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
                     <div className="browser-popover-actions">
                       <button type="button" className="browser-popover-ghost" onClick={() => setSelection(null)}>Clear</button>
                       <button type="button" className="browser-send-chat" onClick={sendToChat}><i className="bx bx-send" />Send</button>
+                    </div>
+                  </div>
+                )}
+
+                {/* ── In-app file browser overlay ── */}
+                {fileBrowser && (
+                  <div className="browser-filebrowser" onMouseDown={e => e.stopPropagation()}>
+                    <div className="browser-filebrowser-header">
+                      <button
+                        type="button"
+                        className="browser-fb-btn"
+                        onClick={() => void goBackFileBrowser()}
+                        title={fileBrowser.stack.length === 0 ? "Close" : "Back"}
+                      >
+                        <i className={`bx ${fileBrowser.stack.length === 0 ? "bx-x" : "bx-arrow-back"}`} />
+                      </button>
+                      <div className="browser-fb-breadcrumb">
+                        {fileBrowserBreadcrumb().map((seg, i, arr) => (
+                          <React.Fragment key={seg.path}>
+                            {i > 0 && <span className="browser-fb-sep">/</span>}
+                            <button
+                              type="button"
+                              className={`browser-fb-crumb ${i === arr.length - 1 ? "active" : ""}`}
+                              onClick={() => i < arr.length - 1 ? void jumpFileBrowser(seg.path) : undefined}
+                            >
+                              {seg.label}
+                            </button>
+                          </React.Fragment>
+                        ))}
+                      </div>
+                      <button type="button" className="browser-fb-btn" onClick={() => setFileBrowser(null)} title="Close browser">
+                        <i className="bx bx-x" />
+                      </button>
+                    </div>
+                    <div className="browser-filebrowser-list">
+                      {fileBrowser.items.length === 0 && (
+                        <div className="browser-fb-empty">Empty folder</div>
+                      )}
+                      {fileBrowser.items.map(entry => {
+                        const proj = fileBrowserProjects[entry.path];
+                        const hasProject = proj !== undefined && proj !== null;
+                        return (
+                          <div
+                            key={entry.path}
+                            className={`browser-fb-item ${entry.is_dir ? "dir" : "file"} ${hasProject ? "has-project" : ""}`}
+                          >
+                            <button
+                              type="button"
+                              className="browser-fb-item-main"
+                              onClick={() => entry.is_dir ? void navigateFileBrowser(entry) : undefined}
+                              title={entry.path}
+                            >
+                              <i className={`bx ${entry.is_dir ? (hasProject ? "bx-code-block" : "bx-folder") : "bx-file-blank"}`} />
+                              <span className="browser-fb-name">{entry.name}</span>
+                              {hasProject && (
+                                <span className="browser-fb-badge">{proj!.label}</span>
+                              )}
+                              {entry.is_dir && fileBrowserProjects[entry.path] === undefined && (
+                                <span className="browser-fb-detecting" />
+                              )}
+                            </button>
+                            {hasProject && (
+                              <button
+                                type="button"
+                                className="browser-fb-start"
+                                onClick={() => { setFileBrowser(null); void openCurrentProject(entry.path); }}
+                                title={`Start dev server for ${entry.name}`}
+                              >
+                                <i className="bx bx-play" /> Start
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 )}
