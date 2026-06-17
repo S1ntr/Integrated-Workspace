@@ -2144,10 +2144,161 @@ fn list_dir_shallow(dir: String) -> Vec<DirEntry> {
     items
 }
 
+/// Scan ports starting from `preferred` for the first one not in use.
+/// Uses TCP connect (same strategy as `check_port_open`) so it works on both
+/// IPv4 and IPv6 — critical on Windows where Vite binds to ::1, not 127.0.0.1.
+/// Tries up to 64 consecutive ports; returns `preferred + 64` as last resort.
+fn find_free_port(preferred: u16) -> u16 {
+    use std::net::{TcpStream, SocketAddr};
+    use std::time::Duration;
+    let timeout = Duration::from_millis(50);
+    let in_use = |p: u16| -> bool {
+        TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], p)), timeout).is_ok()
+            || TcpStream::connect_timeout(&SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], p)), timeout).is_ok()
+    };
+    for p in preferred..preferred.saturating_add(64) {
+        if !in_use(p) {
+            return p;
+        }
+    }
+    preferred.saturating_add(64)
+}
+
+/// Rewrite `command` so the dev server binds to `port` instead of its default.
+/// Returns the command unchanged for project types where injection is not possible.
+fn inject_port(command: &str, project_type: &str, port: u16) -> String {
+    let cmd = command.trim().to_string();
+    let ps = port.to_string();
+
+    // Generic helper: replace numeric value that follows a flag like "--port " or "--listen "
+    let replace_flag = |c: &str, flag: &str, val: &str| -> String {
+        let search = format!("{} ", flag);
+        if let Some(idx) = c.find(&search) {
+            let after = idx + search.len();
+            let end = after + c[after..].find(|ch: char| !ch.is_ascii_digit()).unwrap_or(c[after..].len());
+            format!("{}{} {}{}", &c[..idx], flag, val, &c[end..])
+        } else {
+            // try "--port=NNNN" form (artisan, symfony)
+            let eq_search = format!("{}=", flag);
+            if let Some(idx) = c.find(&eq_search) {
+                let after = idx + eq_search.len();
+                let end = after + c[after..].find(|ch: char| !ch.is_ascii_digit()).unwrap_or(c[after..].len());
+                format!("{}{}={}{}", &c[..idx], flag, val, &c[end..])
+            } else {
+                format!("{} {} {}", c, flag, val)
+            }
+        }
+    };
+
+    match project_type {
+        "tauri" | "node" => {
+            if cmd.starts_with("vite") || cmd.starts_with("npx vite") {
+                format!("{} --port {}", cmd, ps)
+            } else if cmd.contains(" run ") {
+                // npm/pnpm/yarn/bun run <script> — forward flags via '--'
+                format!("{} -- --port {}", cmd, ps)
+            } else {
+                cmd
+            }
+        }
+        "python" => {
+            if cmd.contains("runserver") {
+                // Django: replace/append the port positional argument
+                let mut parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
+                if parts.last().and_then(|p| p.parse::<u16>().ok()).is_some() {
+                    *parts.last_mut().unwrap() = ps;
+                } else {
+                    parts.push(ps);
+                }
+                parts.join(" ")
+            } else {
+                replace_flag(&cmd, "--port", &ps)
+            }
+        }
+        "ruby" => {
+            let flag = " -p ";
+            if let Some(idx) = cmd.find(flag) {
+                let after = idx + flag.len();
+                let end = after + cmd[after..].find(|c: char| !c.is_ascii_digit()).unwrap_or(cmd[after..].len());
+                format!("{} -p {}{}", &cmd[..idx], ps, &cmd[end..])
+            } else {
+                format!("{} -p {}", cmd, ps)
+            }
+        }
+        "php" => {
+            // php -S localhost:PORT or artisan serve --port=8000
+            if let Some(idx) = cmd.find("localhost:") {
+                let after = idx + "localhost:".len();
+                let end = after + cmd[after..].find(|c: char| !c.is_ascii_digit()).unwrap_or(cmd[after..].len());
+                format!("{}localhost:{}{}", &cmd[..idx], ps, &cmd[end..])
+            } else {
+                replace_flag(&cmd, "--port", &ps)
+            }
+        }
+        "static" => replace_flag(&cmd, "--listen", &ps),
+        "dotnet" => format!("{} --urls=http://localhost:{}", cmd, ps),
+        // go, rust: port is defined in application code — cannot inject via CLI
+        _ => cmd,
+    }
+}
+
+/// Adjust a DevProjectInfo so it uses a free port on the current machine,
+/// rewriting the start command accordingly.
+fn finalize_dev_info(mut info: DevProjectInfo) -> DevProjectInfo {
+    let free = find_free_port(info.port);
+    if free != info.port {
+        info.label = info.label.replacen(&format!(":{}", info.port), &format!(":{}", free), 1);
+        info.command = inject_port(&info.command, &info.project_type, free);
+        info.port = free;
+    }
+    info
+}
+
+/// Read `server.port` from a vite.config.{ts,js,mts,mjs} file if explicitly set.
+/// Returns None when the config is absent or no bare `port: <number>` is found.
+/// Guards against false matches like `strictPort:` by requiring a non-word char before "port:".
+fn vite_config_port(base: &Path) -> Option<u16> {
+    for name in &["vite.config.ts", "vite.config.js", "vite.config.mts", "vite.config.mjs"] {
+        let Ok(src) = fs::read_to_string(base.join(name)) else { continue };
+        let bytes = src.as_bytes();
+        let needle = b"port:";
+        let mut i = 0;
+        while i + needle.len() <= bytes.len() {
+            if bytes[i..].starts_with(needle) {
+                // Reject if immediately preceded by an alphanumeric char or underscore
+                // (catches strictPort:, devPort:, etc.)
+                let prev_ok = i == 0
+                    || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+                if prev_ok {
+                    let after = &src[i + needle.len()..];
+                    let num: String = after
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if let Ok(p) = num.parse::<u16>() {
+                        if p > 0 {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
 /// Inspect the workspace directory and return the command + port needed to start
 /// a dev server, with no AI involved — pure file-based heuristics.
+/// Always adjusts to a free port so the browser preview never collides with the
+/// host application or any other already-running server.
 #[tauri::command]
 fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
+    detect_dev_project_inner(dir).map(finalize_dev_info)
+}
+
+fn detect_dev_project_inner(dir: String) -> Result<DevProjectInfo, String> {
     let path = Path::new(&dir);
 
     // ── Node.js / npm / pnpm / yarn / bun project ──────────────────────────
@@ -2159,9 +2310,6 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
             .map_err(|e| format!("Failed to parse package.json: {}", e))?;
 
         // ── Package manager: check lockfiles AND packageManager field ────────
-        // Also check node_modules/.modules.yaml which pnpm always writes,
-        // and .yarn/releases which Yarn Berry writes — these survive in
-        // sub-project directories that may not have their own lockfile.
         let pm_field = pkg.get("packageManager")
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -2184,6 +2332,46 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
             "npm"
         };
 
+        // ── Tauri project — detected before port/script logic ────────────────
+        // Tauri wraps a web frontend.  We start only the frontend dev server
+        // (not `tauri dev`) so it can be previewed inside the integrated browser.
+        // Read the correct port from tauri.conf.json devUrl; use beforeDevCommand
+        // as the start command when available.
+        let tauri_conf_path = path.join("src-tauri").join("tauri.conf.json");
+        if tauri_conf_path.exists() {
+            let tauri_conf: serde_json::Value = fs::read_to_string(&tauri_conf_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+
+            // Parse port from devUrl (e.g. "http://localhost:1420")
+            let port = tauri_conf["build"]["devUrl"].as_str()
+                .and_then(|url| {
+                    url.split(':').last()
+                        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+                })
+                .or_else(|| vite_config_port(path))
+                .unwrap_or(1420);
+
+            // Use beforeDevCommand if set; otherwise fall back to the dev script.
+            let command = tauri_conf["build"]["beforeDevCommand"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    if pm == "npm" { "npm run dev".to_string() }
+                    else           { format!("{} run dev", pm) }
+                });
+
+            return Ok(DevProjectInfo {
+                project_type: "tauri".to_string(),
+                label: format!("tauri frontend :{}", port),
+                command,
+                port,
+                package_manager: pm.to_string(),
+            });
+        }
+
         let deps     = pkg.get("dependencies").and_then(|v| v.as_object());
         let dev_deps = pkg.get("devDependencies").and_then(|v| v.as_object());
         let has_dep  = |name: &str| -> bool {
@@ -2191,14 +2379,14 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
                 || dev_deps.map(|d| d.contains_key(name)).unwrap_or(false)
         };
 
-        // ── Port heuristics ──────────────────────────────────────────────────
+        // ── Port heuristics — prefer explicit vite.config port when available ─
         let port: u16 = if has_dep("vite")
             || path.join("vite.config.ts").exists()
             || path.join("vite.config.js").exists()
             || path.join("vite.config.mts").exists()
             || path.join("vite.config.mjs").exists()
         {
-            5173
+            vite_config_port(path).unwrap_or(5173)
         } else if has_dep("@sveltejs/kit") {
             5173
         } else if has_dep("next") {
@@ -2259,12 +2447,176 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
         || path.join("vite.config.mts").exists()
         || path.join("vite.config.mjs").exists()
     {
+        let port = vite_config_port(path).unwrap_or(5173);
         return Ok(DevProjectInfo {
             project_type: "node".to_string(),
-            label: "npx vite :5173".to_string(),
+            label: format!("npx vite :{}", port),
             command: "npx vite".to_string(),
-            port: 5173,
+            port,
             package_manager: "npx".to_string(),
+        });
+    }
+
+    // ── Python project ─────────────────────────────────────────────────────
+    let has_py_file = fs::read_dir(path).ok()
+        .map(|rd| rd.flatten().any(|e| {
+            e.path().extension().and_then(|x| x.to_str()) == Some("py")
+        }))
+        .unwrap_or(false);
+    let pyproject = path.join("pyproject.toml");
+    let requirements = path.join("requirements.txt");
+    if pyproject.exists() || requirements.exists() || has_py_file {
+        let deps_text = fs::read_to_string(&requirements).ok().unwrap_or_default()
+            + &fs::read_to_string(&pyproject).ok().unwrap_or_default();
+        let deps_lower = deps_text.to_lowercase();
+
+        let (framework, port, command) = if deps_lower.contains("django") || path.join("manage.py").exists() {
+            ("django".to_string(), 8000u16, "python manage.py runserver 8000".to_string())
+        } else if deps_lower.contains("fastapi") || deps_lower.contains("uvicorn") {
+            let app_file = ["main.py", "app.py", "server.py", "api.py"].iter()
+                .find(|&&f| path.join(f).exists())
+                .copied()
+                .unwrap_or("main.py");
+            let module = app_file.trim_end_matches(".py");
+            (
+                "fastapi".to_string(),
+                8000u16,
+                format!("uvicorn {}:app --reload --port 8000", module),
+            )
+        } else if deps_lower.contains("flask") {
+            ("flask".to_string(), 5000u16, "flask run --port 5000".to_string())
+        } else if deps_lower.contains("starlette") || deps_lower.contains("litestar") {
+            ("starlette".to_string(), 8000u16, "uvicorn app:app --reload --port 8000".to_string())
+        } else if deps_lower.contains("tornado") {
+            ("tornado".to_string(), 8888u16, "python main.py".to_string())
+        } else if deps_lower.contains("aiohttp") {
+            ("aiohttp".to_string(), 8080u16, "python -m aiohttp.web -H 0.0.0.0 -P 8080 app:app".to_string())
+        } else {
+            let entry = ["main.py", "app.py", "server.py", "run.py"].iter()
+                .find(|&&f| path.join(f).exists())
+                .copied()
+                .unwrap_or("main.py");
+            ("python".to_string(), 8000u16, format!("python {}", entry))
+        };
+
+        return Ok(DevProjectInfo {
+            project_type: "python".to_string(),
+            label: format!("{} :{}", framework, port),
+            command,
+            port,
+            package_manager: "python".to_string(),
+        });
+    }
+
+    // ── Go project ─────────────────────────────────────────────────────────
+    if path.join("go.mod").exists() {
+        let go_mod = fs::read_to_string(path.join("go.mod")).unwrap_or_default();
+        let port: u16 = 8080;
+        let framework = if go_mod.contains("gin-gonic/gin") {
+            "gin"
+        } else if go_mod.contains("gofiber/fiber") {
+            "fiber"
+        } else if go_mod.contains("labstack/echo") {
+            "echo"
+        } else if go_mod.contains("gorilla/mux") {
+            "gorilla"
+        } else {
+            "go"
+        };
+        return Ok(DevProjectInfo {
+            project_type: "go".to_string(),
+            label: format!("{} :{}", framework, port),
+            command: "go run .".to_string(),
+            port,
+            package_manager: "go".to_string(),
+        });
+    }
+
+    // ── Rust (non-Tauri) server project ────────────────────────────────────
+    let cargo_path = path.join("Cargo.toml");
+    if cargo_path.exists() && !path.join("src-tauri").exists() {
+        let cargo_str = fs::read_to_string(&cargo_path).unwrap_or_default();
+        let (framework, port) = if cargo_str.contains("actix-web") {
+            ("actix-web", 8080u16)
+        } else if cargo_str.contains("axum") {
+            ("axum", 3000u16)
+        } else if cargo_str.contains("rocket") {
+            ("rocket", 8000u16)
+        } else if cargo_str.contains("warp") {
+            ("warp", 3030u16)
+        } else {
+            ("rust", 8080u16)
+        };
+        return Ok(DevProjectInfo {
+            project_type: "rust".to_string(),
+            label: format!("{} :{}", framework, port),
+            command: "cargo run".to_string(),
+            port,
+            package_manager: "cargo".to_string(),
+        });
+    }
+
+    // ── Ruby project ───────────────────────────────────────────────────────
+    if path.join("Gemfile").exists() {
+        let gemfile = fs::read_to_string(path.join("Gemfile")).unwrap_or_default();
+        let (framework, port, cmd) = if gemfile.contains("rails") {
+            ("rails", 3000u16, "bundle exec rails server -p 3000".to_string())
+        } else if gemfile.contains("sinatra") {
+            ("sinatra", 4567u16, "bundle exec ruby app.rb".to_string())
+        } else if gemfile.contains("hanami") {
+            ("hanami", 2300u16, "bundle exec hanami server".to_string())
+        } else {
+            ("ruby", 3000u16, "bundle exec ruby app.rb".to_string())
+        };
+        return Ok(DevProjectInfo {
+            project_type: "ruby".to_string(),
+            label: format!("{} :{}", framework, port),
+            command: cmd,
+            port,
+            package_manager: "bundler".to_string(),
+        });
+    }
+
+    // ── PHP project ────────────────────────────────────────────────────────
+    let composer = path.join("composer.json");
+    let has_php = fs::read_dir(path).ok()
+        .map(|rd| rd.flatten().any(|e| {
+            e.path().extension().and_then(|x| x.to_str()) == Some("php")
+        }))
+        .unwrap_or(false);
+    if composer.exists() || has_php {
+        let composer_str = fs::read_to_string(&composer).unwrap_or_default();
+        let (framework, port, cmd) = if composer_str.contains("laravel/framework") {
+            ("laravel", 8000u16, "php artisan serve --port=8000".to_string())
+        } else if composer_str.contains("symfony/") {
+            ("symfony", 8000u16, "symfony server:start --port=8000 --no-tls".to_string())
+        } else if composer_str.contains("slim/slim") {
+            ("slim", 8080u16, "php -S localhost:8080 -t public".to_string())
+        } else {
+            ("php", 8080u16, "php -S localhost:8080".to_string())
+        };
+        return Ok(DevProjectInfo {
+            project_type: "php".to_string(),
+            label: format!("{} :{}", framework, port),
+            command: cmd,
+            port,
+            package_manager: "composer".to_string(),
+        });
+    }
+
+    // ── .NET / C# project ──────────────────────────────────────────────────
+    let has_csproj = fs::read_dir(path).ok()
+        .map(|rd| rd.flatten().any(|e| {
+            e.path().extension().and_then(|x| x.to_str()) == Some("csproj")
+        }))
+        .unwrap_or(false);
+    if has_csproj || path.join("Program.cs").exists() {
+        return Ok(DevProjectInfo {
+            project_type: "dotnet".to_string(),
+            label: "dotnet :5000".to_string(),
+            command: "dotnet run".to_string(),
+            port: 5000,
+            package_manager: "dotnet".to_string(),
         });
     }
 
@@ -2280,8 +2632,9 @@ fn detect_dev_project(dir: String) -> Result<DevProjectInfo, String> {
     }
 
     Err(
-        "No recognizable project found. Expected package.json, \
-         vite.config.*, or index.html in the workspace directory."
+        "No recognizable project found. Expected package.json, vite.config.*, \
+         index.html, requirements.txt, pyproject.toml, go.mod, Cargo.toml, \
+         Gemfile, composer.json, or .csproj in the directory."
             .to_string(),
     )
 }

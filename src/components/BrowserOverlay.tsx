@@ -701,6 +701,18 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
     await new Promise(resolve => setTimeout(resolve, 0));
     devAbortRef.current = false;
 
+    // When the user explicitly picks a project from the file browser, stop any
+    // previously tracked dev server before starting the new one.  Without this,
+    // the "already running" port check below would navigate to whatever happens
+    // to be on that port (e.g. the Integraded dev server, or a different project).
+    if (dirOverride) {
+      const prevPort = devInfo?.port;
+      setDevRunning(false);
+      if (prevPort) {
+        try { await invoke("stop_dev_server_background", { port: prevPort }); } catch {}
+      }
+    }
+
     setDevError("");
     setDevInfo(null);
     setSubProjects([]);
@@ -732,16 +744,21 @@ export const BrowserOverlay: React.FC<BrowserOverlayProps> = ({
       if (devAbortRef.current) return;
       setDevInfo(info);
 
-      // Step 2 — check if already running
-      const alreadyUp = await invoke<boolean>("check_port_open", { port: info.port });
-      if (devAbortRef.current) return;
-      if (alreadyUp) {
-        const url = `http://localhost:${info.port}`;
-        setDevStatus("idle");
-        setDevRunning(true);
-        setActiveTabId("project");
-        navigateTo(url, "push", "project", "project");
-        return;
+      // Step 2 — check if already running.
+      // Skip this when the user explicitly picked a project (dirOverride): another
+      // project or the host app could be on the same port, which would cause
+      // navigation to the wrong server.
+      if (!dirOverride) {
+        const alreadyUp = await invoke<boolean>("check_port_open", { port: info.port });
+        if (devAbortRef.current) return;
+        if (alreadyUp) {
+          const url = `http://localhost:${info.port}`;
+          setDevStatus("idle");
+          setDevRunning(true);
+          setActiveTabId("project");
+          navigateTo(url, "push", "project", "project");
+          return;
+        }
       }
 
       // Step 3 — start the dev server silently in the background

@@ -1291,6 +1291,7 @@ input, textarea { font-family: var(--font-ui); }
 .browser-current-project-btn:hover { color: var(--text-1); background: var(--bg-3); border-color: var(--bg-5); }
 .browser-icon-btn:disabled { opacity: 0.35; cursor: default; }
 .browser-icon-btn .spin { animation: spin 0.8s linear infinite; }
+.spin { animation: spin 0.8s linear infinite; }
 .browser-address {
   height: 30px;
   display: flex; align-items: center; gap: 7px;
